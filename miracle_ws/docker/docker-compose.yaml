@@ -1,0 +1,165 @@
+# =============================================================================
+# MIRACLE Docker Compose Orchestration
+# =============================================================================
+# Spins up the full MIRACLE stack:
+#   - ros2_miracle     : Main ROS2 MIRACLE system
+#   - microros_agent   : micro-ROS agent for MCU bridging
+#   - dashboard        : Web-based monitoring dashboard
+#   - mqtt_broker      : Eclipse Mosquitto MQTT broker
+#   - zookeeper        : Apache ZooKeeper (Kafka dependency)
+#   - kafka            : Apache Kafka event streaming
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yaml up -d
+#   docker compose -f docker/docker-compose.yaml logs -f
+#   docker compose -f docker/docker-compose.yaml down
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # ROS2 MIRACLE -- Main system
+  # ---------------------------------------------------------------------------
+  ros2_miracle:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ros2
+    container_name: miracle_ros2
+    hostname: miracle-ros2
+    environment:
+      - ROS_DOMAIN_ID=42
+      - ROS_LOG_DIR=/miracle_ws/log
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/miracle_ws/docker/fastdds_profile.xml
+    ports:
+      - "10000:10000"   # Unity ROS-TCP-Endpoint bridge
+    volumes:
+      - miracle_data:/miracle_ws/data
+      - miracle_logs:/miracle_ws/log
+    networks:
+      - miracle_net
+    depends_on:
+      mqtt_broker:
+        condition: service_started
+      kafka:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # micro-ROS Agent -- MCU bridge
+  # ---------------------------------------------------------------------------
+  microros_agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.microros
+    container_name: miracle_microros
+    hostname: miracle-microros
+    environment:
+      - ROS_DOMAIN_ID=42
+    ports:
+      - "8888:8888/udp"
+    networks:
+      - miracle_net
+    depends_on:
+      - ros2_miracle
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Dashboard -- Web monitoring UI
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: miracle_dashboard
+    hostname: miracle-dashboard
+    ports:
+      - "3000:80"
+    networks:
+      - miracle_net
+    depends_on:
+      - ros2_miracle
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # MQTT Broker -- Eclipse Mosquitto
+  # ---------------------------------------------------------------------------
+  mqtt_broker:
+    image: eclipse-mosquitto:2
+    container_name: miracle_mqtt
+    hostname: miracle-mqtt
+    ports:
+      - "1883:1883"   # MQTT
+      - "9001:9001"   # WebSocket
+    volumes:
+      - miracle_data:/mosquitto/data
+      - miracle_logs:/mosquitto/log
+    networks:
+      - miracle_net
+    command: >
+      sh -c '
+        echo "listener 1883"              >  /mosquitto/config/mosquitto.conf &&
+        echo "listener 9001"              >> /mosquitto/config/mosquitto.conf &&
+        echo "protocol websockets"        >> /mosquitto/config/mosquitto.conf &&
+        echo "allow_anonymous true"       >> /mosquitto/config/mosquitto.conf &&
+        echo "persistence true"           >> /mosquitto/config/mosquitto.conf &&
+        echo "persistence_location /mosquitto/data/" >> /mosquitto/config/mosquitto.conf &&
+        echo "log_dest file /mosquitto/log/mosquitto.log" >> /mosquitto/config/mosquitto.conf &&
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+      '
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ZooKeeper -- Kafka dependency
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: miracle_zookeeper
+    hostname: miracle-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - miracle_net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kafka -- Event streaming platform
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: miracle_kafka
+    hostname: miracle-kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    networks:
+      - miracle_net
+    depends_on:
+      - zookeeper
+    restart: unless-stopped
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  miracle_net:
+    driver: bridge
+    name: miracle_net
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  miracle_data:
+    name: miracle_data
+  miracle_logs:
+    name: miracle_logs

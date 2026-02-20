@@ -1,0 +1,6 @@
+string node_name
+string checkpoint_id
+---
+bool success
+string message
+builtin_interfaces/Time checkpoint_timestamp

@@ -1,0 +1,33 @@
+{
+    "description": "Pre-computed stability lobe data for Bantam Explorer + 1/4 HSS + 6061-T6",
+    "machine": {
+        "naturalFrequency_Hz": 800,
+        "dampingRatio": 0.03,
+        "stiffness_N_m": 5000000,
+        "maxRPM": 23000,
+        "minRPM": 10000
+    },
+    "tool": {
+        "diameter_mm": 6.35,
+        "fluteCount": 2,
+        "Ktc_N_mm2": 796
+    },
+    "lobes": [
+        {"rpm": 10000, "apLimit_mm": 1.2},
+        {"rpm": 11000, "apLimit_mm": 1.4},
+        {"rpm": 12000, "apLimit_mm": 2.8},
+        {"rpm": 13000, "apLimit_mm": 1.8},
+        {"rpm": 14000, "apLimit_mm": 1.1},
+        {"rpm": 15000, "apLimit_mm": 1.3},
+        {"rpm": 16000, "apLimit_mm": 3.5},
+        {"rpm": 17000, "apLimit_mm": 2.2},
+        {"rpm": 18000, "apLimit_mm": 1.5},
+        {"rpm": 19000, "apLimit_mm": 1.2},
+        {"rpm": 20000, "apLimit_mm": 4.2},
+        {"rpm": 21000, "apLimit_mm": 2.8},
+        {"rpm": 22000, "apLimit_mm": 1.8},
+        {"rpm": 23000, "apLimit_mm": 1.4}
+    ],
+    "optimalSpeeds_rpm": [12000, 16000, 20000],
+    "notes": "Lobe peaks correspond to N*60*fn/z where N=integer, fn=800Hz, z=2"
+}

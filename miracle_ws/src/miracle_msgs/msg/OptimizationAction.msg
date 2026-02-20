@@ -1,0 +1,9 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string action_type
+string parameter_name
+float64 old_value
+float64 new_value
+float64 expected_improvement
+string reasoning
+float64 confidence

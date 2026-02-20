@@ -1,0 +1,21 @@
+# Goal
+string job_id
+string machine_id
+string program_name
+string material
+string priority
+---
+# Result
+bool success
+string message
+float64 total_time_sec
+float64 oee_achieved
+float64[] quality_metrics
+---
+# Feedback
+float64 progress
+string current_phase
+string current_operation
+float64 elapsed_sec
+float64 estimated_remaining_sec
+miracle_msgs/MachineState machine_state

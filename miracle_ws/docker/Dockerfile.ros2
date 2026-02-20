@@ -1,0 +1,124 @@
+# =============================================================================
+# MIRACLE ROS2 Multi-Stage Docker Build
+# =============================================================================
+# Builds the full MIRACLE ROS2 workspace inside a containerised environment.
+#
+# Build:
+#   docker build -f docker/Dockerfile.ros2 -t miracle_ros2:latest ..
+#
+# Run:
+#   docker run --rm -it miracle_ros2:latest
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder -- install deps & compile the workspace
+# ---------------------------------------------------------------------------
+FROM ros:jazzy AS builder
+
+# Avoid interactive prompts during apt installs
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+        python3-colcon-common-extensions \
+        python3-rosdep \
+        python3-vcstool \
+        build-essential \
+        cmake \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+RUN pip3 install --no-cache-dir --break-system-packages \
+        numpy \
+        scipy \
+        scikit-learn \
+        opcua \
+        paho-mqtt \
+        pymodbus \
+        kafka-python
+
+# Create workspace directory
+WORKDIR /miracle_ws
+
+# Copy source tree first (for better layer caching)
+COPY src/ src/
+
+# Clone Unity ROS-TCP-Endpoint (required by miracle_unity_bridge)
+RUN git clone --depth 1 -b main-ros2 \
+    https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git \
+    src/ros_tcp_endpoint
+
+# rosdep install
+RUN . /opt/ros/jazzy/setup.sh \
+    && rosdep update --rosdistro=jazzy \
+    && rosdep install --from-paths src --ignore-src --rosdistro=jazzy -y \
+    || true
+
+# Build miracle_msgs first (message generation)
+RUN . /opt/ros/jazzy/setup.sh \
+    && colcon build \
+        --packages-up-to miracle_msgs \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# Build all remaining packages
+RUN . /opt/ros/jazzy/setup.sh \
+    && . install/setup.sh \
+    && colcon build \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime -- slim image with only build artefacts
+# ---------------------------------------------------------------------------
+FROM ros:jazzy AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Runtime Python dependencies
+RUN pip3 install --no-cache-dir --break-system-packages \
+        numpy \
+        scipy \
+        scikit-learn \
+        opcua \
+        paho-mqtt \
+        pymodbus \
+        kafka-python
+
+# Copy built workspace from builder stage
+WORKDIR /miracle_ws
+COPY --from=builder /miracle_ws/install/ install/
+COPY --from=builder /miracle_ws/src/ src/
+
+# Patch ros_tcp_endpoint: MultiThreadedExecutor has a race-condition crash
+# with ROS2 Jazzy rclpy (InvalidHandle on destruction). Use SingleThreadedExecutor.
+RUN SERVER_PY=$(find install/ -path '*/ros_tcp_endpoint/server.py' -print -quit) \
+    && if [ -n "$SERVER_PY" ]; then \
+        sed -i 's/from rclpy.executors import MultiThreadedExecutor/from rclpy.executors import SingleThreadedExecutor/' "$SERVER_PY" \
+        && sed -i 's/executor = MultiThreadedExecutor(num_threads)/executor = SingleThreadedExecutor()/' "$SERVER_PY" \
+        && echo "Patched ros_tcp_endpoint to use SingleThreadedExecutor"; \
+    fi
+
+# Copy scripts and configuration
+COPY scripts/ scripts/
+COPY docker/ docker/
+
+# Environment
+ENV ROS_DOMAIN_ID=42
+ENV ROS_LOG_DIR=/miracle_ws/log
+
+# Entrypoint: source ROS2 + workspace overlay, then launch the system
+COPY docker/ros2_entrypoint.sh /ros2_entrypoint.sh
+RUN chmod +x /ros2_entrypoint.sh
+
+ENTRYPOINT ["/ros2_entrypoint.sh"]
+CMD ["ros2", "launch", "miracle_bringup", "miracle_full_system.launch.py", "simulation_mode:=true"]
+
+# Healthcheck: verify the ROS2 daemon is responsive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD bash -c 'source /opt/ros/jazzy/setup.bash && source /miracle_ws/install/setup.bash && ros2 topic list > /dev/null 2>&1' || exit 1

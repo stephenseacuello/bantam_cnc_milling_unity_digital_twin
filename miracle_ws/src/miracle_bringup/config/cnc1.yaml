@@ -1,0 +1,36 @@
+# =============================================================================
+# MIRACLE System - CNC Machine 1 Parameter Overrides
+# =============================================================================
+# Machine-specific overrides for CNC1 (3-axis vertical milling center).
+# These values override the defaults in miracle_params.yaml.
+# =============================================================================
+
+state_publisher:
+  ros__parameters:
+    machine_id: "cnc1"
+    publish_rate_hz: 50.0
+    simulation_mode: true
+
+gcode_executor:
+  ros__parameters:
+    machine_id: "cnc1"
+    max_feed_rate: 10000.0
+    max_spindle_speed: 24000.0
+
+sensor_fusion:
+  ros__parameters:
+    machine_id: "cnc1"
+
+local_watchdog:
+  ros__parameters:
+    machine_id: "cnc1"
+
+spc_monitor:
+  ros__parameters:
+    machine_id: "cnc1"
+    window_size: 100
+
+rosbag_trigger:
+  ros__parameters:
+    machine_id: "cnc1"
+    output_directory: "/tmp/miracle_bags/cnc1"

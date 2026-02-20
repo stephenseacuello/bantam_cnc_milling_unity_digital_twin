@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<BehaviorTree ID="AnomalyResponse">
+  <Sequence name="respond">
+    <Action ID="PauseOperation"/>
+    <Action ID="ClassifyAnomaly"/>
+    <Fallback name="resolve">
+      <Sequence name="auto_fix">
+        <Condition ID="IsAutoFixable"/>
+        <Action ID="ApplyFix"/>
+        <Action ID="VerifyFix"/>
+        <Action ID="ResumeOperation"/>
+      </Sequence>
+      <Sequence name="adapt">
+        <Condition ID="IsAdaptable"/>
+        <Action ID="ComputeNewParams"/>
+        <Action ID="ApplyNewParams"/>
+        <Action ID="ResumeOperation"/>
+      </Sequence>
+      <Action ID="EscalateToHuman"/>
+    </Fallback>
+  </Sequence>
+</BehaviorTree>

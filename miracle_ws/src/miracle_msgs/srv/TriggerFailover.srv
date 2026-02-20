@@ -1,0 +1,6 @@
+string failed_node
+string strategy
+---
+bool success
+string backup_node
+string message

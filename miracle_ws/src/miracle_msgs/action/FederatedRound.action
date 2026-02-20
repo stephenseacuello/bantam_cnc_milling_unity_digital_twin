@@ -1,0 +1,17 @@
+# Goal
+string model_id
+uint32 round_number
+uint32 min_participants
+float64 timeout_sec
+---
+# Result
+bool success
+uint32 num_participants
+float64 global_loss
+float64 convergence_metric
+---
+# Feedback
+uint32 updates_received
+uint32 updates_expected
+float64 elapsed_sec
+string current_phase

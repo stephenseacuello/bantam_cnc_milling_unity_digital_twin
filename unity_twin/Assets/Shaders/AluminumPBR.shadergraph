@@ -1,0 +1,84 @@
+{
+    "m_SGVersion": 3,
+    "m_Type": "UnityEditor.ShaderGraph.GraphData",
+    "m_ObjectId": "a1b2c3d4e5f6789012345678abcdef01",
+    "m_Properties": [
+        {
+            "m_Id": "prop_basecolor",
+            "m_Name": "_BaseColor",
+            "m_DefaultReferenceName": "_BaseColor",
+            "m_Type": "UnityEditor.ShaderGraph.ColorShaderProperty",
+            "m_Value": { "r": 0.85, "g": 0.87, "b": 0.89, "a": 1.0 },
+            "m_ColorMode": 0
+        },
+        {
+            "m_Id": "prop_metallic",
+            "m_Name": "_Metallic",
+            "m_DefaultReferenceName": "_Metallic",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.95,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1
+        },
+        {
+            "m_Id": "prop_smoothness",
+            "m_Name": "_Smoothness",
+            "m_DefaultReferenceName": "_Smoothness",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.7,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1
+        },
+        {
+            "m_Id": "prop_normalmap",
+            "m_Name": "_BrushedNormalMap",
+            "m_DefaultReferenceName": "_BrushedNormalMap",
+            "m_Type": "UnityEditor.ShaderGraph.Texture2DShaderProperty",
+            "m_Value": { "m_SerializedTexture": "" },
+            "m_DefaultType": 3
+        },
+        {
+            "m_Id": "prop_normalstrength",
+            "m_Name": "_NormalStrength",
+            "m_DefaultReferenceName": "_NormalStrength",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 1.0,
+            "m_RangeValues": { "x": 0.0, "y": 2.0 },
+            "m_FloatType": 1
+        },
+        {
+            "m_Id": "prop_aniso_direction",
+            "m_Name": "_AnisotropyDirection",
+            "m_DefaultReferenceName": "_AnisotropyDirection",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.0,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1,
+            "m_Description": "0=U direction, 1=V direction for brushed highlight"
+        },
+        {
+            "m_Id": "prop_aniso_intensity",
+            "m_Name": "_AnisotropyIntensity",
+            "m_DefaultReferenceName": "_AnisotropyIntensity",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.5,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1,
+            "m_Description": "Intensity of the brushed aluminum anisotropic highlight"
+        }
+    ],
+    "m_SubGraphs": [],
+    "m_Path": "MIRACLE/Materials",
+    "m_GraphPrecision": 1,
+    "m_PreviewMode": 2,
+    "m_ActiveTargets": [
+        {
+            "m_Type": "UnityEditor.Rendering.Universal.UniversalTarget",
+            "m_SurfaceType": 0,
+            "m_AlphaMode": 0,
+            "m_RenderFace": 2,
+            "m_WorkflowMode": 1
+        }
+    ],
+    "m_Notes": "AluminumPBR - Brushed aluminum material for CNC workpieces and machine surfaces. Uses anisotropic highlight approximation for brushed metal look. Metallic: 0.95, Smoothness: 0.7. Requires a brushed normal map texture for full effect. Fallback shader: MIRACLE/AluminumPBR (hand-written HLSL)."
+}

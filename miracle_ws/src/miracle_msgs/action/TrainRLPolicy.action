@@ -1,0 +1,17 @@
+# Goal
+string policy_name
+string environment_id
+uint32 num_episodes
+float64 learning_rate
+---
+# Result
+bool success
+float64 final_reward
+float64[] reward_history
+string model_path
+---
+# Feedback
+uint32 current_episode
+uint32 total_episodes
+float64 current_reward
+float64 average_reward

@@ -1,0 +1,9 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string sensor_type
+string sensor_id
+float64[] values
+string[] labels
+float64 sample_rate
+uint32 sequence_number
+float64 quality

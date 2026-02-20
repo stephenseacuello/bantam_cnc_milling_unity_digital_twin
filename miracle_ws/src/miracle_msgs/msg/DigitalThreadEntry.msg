@@ -1,0 +1,9 @@
+builtin_interfaces/Time timestamp
+string entry_id
+string job_id
+string entry_type
+string source_node
+string data_json
+string[] tags
+string previous_entry_id
+string hash_value

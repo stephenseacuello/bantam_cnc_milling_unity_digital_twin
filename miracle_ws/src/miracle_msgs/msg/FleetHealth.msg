@@ -1,0 +1,10 @@
+builtin_interfaces/Time timestamp
+uint32 total_nodes
+uint32 healthy_nodes
+uint32 degraded_nodes
+uint32 failed_nodes
+uint32 critical_healthy
+uint32 critical_total
+float64 health_score
+string[] failed_node_names
+string[] degraded_node_names

@@ -1,0 +1,23 @@
+# =============================================================================
+# MIRACLE micro-ROS Agent Docker Build
+# =============================================================================
+# Runs the micro-ROS agent for bridging micro-controllers (e.g. ESP32, STM32)
+# running micro-ROS to the main ROS2 network.
+#
+# Uses the official micro-ROS agent image which is pre-built and tested.
+#
+# Build:
+#   docker build -f docker/Dockerfile.microros -t miracle_microros:latest ..
+#
+# Run:
+#   docker run --rm -it -p 8888:8888/udp miracle_microros:latest
+# =============================================================================
+
+FROM microros/micro-ros-agent:jazzy
+
+ENV ROS_DOMAIN_ID=42
+
+EXPOSE 8888/udp
+
+# Default: run micro-ROS agent on UDP port 8888
+CMD ["udp4", "--port", "8888"]

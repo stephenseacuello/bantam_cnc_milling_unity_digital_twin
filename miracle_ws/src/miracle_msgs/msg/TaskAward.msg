@@ -1,0 +1,7 @@
+builtin_interfaces/Time timestamp
+string auction_id
+string task_type
+string awarded_agent_id
+string job_id
+float64 agreed_cost
+float64 agreed_completion_time

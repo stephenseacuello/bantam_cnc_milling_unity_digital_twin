@@ -1,0 +1,275 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <model name="cnc_machine">
+    <static>false</static>
+
+    <!-- ========================================================== -->
+    <!-- Base Frame  (1.5 x 1.0 x 1.2 m)                           -->
+    <!-- ========================================================== -->
+    <link name="base_link">
+      <pose>0 0 0.6 0 0 0</pose>
+      <inertial>
+        <mass>500.0</mass>
+        <inertia>
+          <ixx>73.33</ixx>  <!-- m/12*(h^2+d^2) -->
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>61.88</iyy>
+          <iyz>0</iyz>
+          <izz>27.08</izz>
+        </inertia>
+      </inertial>
+      <collision name="base_collision">
+        <geometry>
+          <box>
+            <size>1.5 1.0 1.2</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="base_visual">
+        <geometry>
+          <box>
+            <size>1.5 1.0 1.2</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.35 0.37 0.38 1.0</ambient>
+          <diffuse>0.45 0.47 0.48 1.0</diffuse>
+          <specular>0.25 0.25 0.25 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <!-- ========================================================== -->
+    <!-- X-Axis Carriage                                            -->
+    <!-- ========================================================== -->
+    <link name="x_carriage">
+      <pose>0 0 1.25 0 0 0</pose>
+      <inertial>
+        <mass>30.0</mass>
+        <inertia>
+          <ixx>0.55</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>2.53</iyy>
+          <iyz>0</iyz>
+          <izz>2.28</izz>
+        </inertia>
+      </inertial>
+      <collision name="x_carriage_collision">
+        <geometry>
+          <box>
+            <size>1.0 0.6 0.1</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="x_carriage_visual">
+        <geometry>
+          <box>
+            <size>1.0 0.6 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.3 0.32 0.35 1.0</ambient>
+          <diffuse>0.4 0.42 0.45 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="x_axis_joint" type="prismatic">
+      <parent>base_link</parent>
+      <child>x_carriage</child>
+      <axis>
+        <xyz>1 0 0</xyz>
+        <limit>
+          <lower>-0.5</lower>
+          <upper>0.5</upper>
+          <effort>500</effort>
+          <velocity>0.5</velocity>
+        </limit>
+        <dynamics>
+          <damping>50.0</damping>
+          <friction>5.0</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Y-Axis Carriage                                            -->
+    <!-- ========================================================== -->
+    <link name="y_carriage">
+      <pose>0 0 1.40 0 0 0</pose>
+      <inertial>
+        <mass>20.0</mass>
+        <inertia>
+          <ixx>0.27</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>1.07</iyy>
+          <iyz>0</iyz>
+          <izz>1.0</izz>
+        </inertia>
+      </inertial>
+      <collision name="y_carriage_collision">
+        <geometry>
+          <box>
+            <size>0.6 0.5 0.1</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="y_carriage_visual">
+        <geometry>
+          <box>
+            <size>0.6 0.5 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.3 0.32 0.35 1.0</ambient>
+          <diffuse>0.4 0.42 0.45 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="y_axis_joint" type="prismatic">
+      <parent>x_carriage</parent>
+      <child>y_carriage</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <limit>
+          <lower>-0.3</lower>
+          <upper>0.3</upper>
+          <effort>400</effort>
+          <velocity>0.5</velocity>
+        </limit>
+        <dynamics>
+          <damping>40.0</damping>
+          <friction>4.0</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Z-Axis Carriage                                            -->
+    <!-- ========================================================== -->
+    <link name="z_carriage">
+      <pose>0 0 1.55 0 0 0</pose>
+      <inertial>
+        <mass>15.0</mass>
+        <inertia>
+          <ixx>0.35</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.35</iyy>
+          <iyz>0</iyz>
+          <izz>0.08</izz>
+        </inertia>
+      </inertial>
+      <collision name="z_carriage_collision">
+        <geometry>
+          <box>
+            <size>0.2 0.2 0.3</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="z_carriage_visual">
+        <geometry>
+          <box>
+            <size>0.2 0.2 0.3</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.28 0.30 0.33 1.0</ambient>
+          <diffuse>0.38 0.40 0.43 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="z_axis_joint" type="prismatic">
+      <parent>y_carriage</parent>
+      <child>z_carriage</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>-0.3</lower>
+          <upper>0.3</upper>
+          <effort>300</effort>
+          <velocity>0.3</velocity>
+        </limit>
+        <dynamics>
+          <damping>30.0</damping>
+          <friction>3.0</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Spindle Assembly  (cylinder on top of Z carriage)          -->
+    <!-- ========================================================== -->
+    <link name="spindle">
+      <pose>0 0 1.85 0 0 0</pose>
+      <inertial>
+        <mass>8.0</mass>
+        <inertia>
+          <ixx>0.087</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.087</iyy>
+          <iyz>0</iyz>
+          <izz>0.01</izz>
+        </inertia>
+      </inertial>
+      <collision name="spindle_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.3</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="spindle_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.3</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.6 0.6 0.6 1.0</ambient>
+          <diffuse>0.75 0.75 0.75 1.0</diffuse>
+          <specular>0.8 0.8 0.8 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="spindle_joint" type="revolute">
+      <parent>z_carriage</parent>
+      <child>spindle</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>-1e16</lower>
+          <upper>1e16</upper>
+          <effort>20</effort>
+          <velocity>628.32</velocity>  <!-- ~6000 RPM -->
+        </limit>
+        <dynamics>
+          <damping>0.01</damping>
+          <friction>0.005</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- Joint state publisher plugin -->
+    <plugin filename="gz-sim-joint-state-publisher-system"
+            name="gz::sim::systems::JointStatePublisher">
+      <joint_name>x_axis_joint</joint_name>
+      <joint_name>y_axis_joint</joint_name>
+      <joint_name>z_axis_joint</joint_name>
+      <joint_name>spindle_joint</joint_name>
+    </plugin>
+
+  </model>
+</sdf>

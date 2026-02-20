@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UXML xmlns="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements">
+    <Style src="Dashboard.uss" />
+
+    <VisualElement name="dashboard-root" class="dashboard">
+        <!-- Header -->
+        <VisualElement name="header" class="header-bar">
+            <Label name="title" text="MIRACLE Digital Twin" class="title" />
+            <DropdownField name="machine-dropdown" class="machine-dropdown" />
+            <Label name="connection-status" text="Disconnected" class="connection-badge" />
+        </VisualElement>
+
+        <VisualElement name="main-content" class="main-row">
+            <!-- Left Sidebar -->
+            <VisualElement name="left-sidebar" class="sidebar">
+                <!-- Machine Status -->
+                <VisualElement class="panel">
+                    <Label text="Machine" class="panel-title" />
+                    <VisualElement class="data-row">
+                        <Label text="Status:" class="data-label" />
+                        <Label name="status-value" text="IDLE" class="data-value status-idle" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Program:" class="data-label" />
+                        <Label name="program-value" text="--" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="RPM:" class="data-label" />
+                        <Label name="rpm-value" text="0" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Feed:" class="data-label" />
+                        <Label name="feed-value" text="0" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Load:" class="data-label" />
+                        <Label name="load-value" text="0%" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Line:" class="data-label" />
+                        <Label name="line-value" text="0" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Pos X:" class="data-label" />
+                        <Label name="pos-x-value" text="0.0" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Pos Y:" class="data-label" />
+                        <Label name="pos-y-value" text="0.0" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Pos Z:" class="data-label" />
+                        <Label name="pos-z-value" text="0.0" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+
+                <!-- Forces -->
+                <VisualElement class="panel">
+                    <Label text="Forces (N)" class="panel-title" />
+                    <VisualElement class="data-row">
+                        <Label text="Fx:" class="data-label force-x" />
+                        <Label name="fx-value" text="0.0 N" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Fy:" class="data-label force-y" />
+                        <Label name="fy-value" text="0.0 N" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Fz:" class="data-label force-z" />
+                        <Label name="fz-value" text="0.0 N" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+
+                <!-- Tool Wear -->
+                <VisualElement class="panel">
+                    <Label text="Tool Wear" class="panel-title" />
+                    <ProgressBar name="wear-bar" title="Wear" low-value="0" high-value="100" class="wear-progress" />
+                    <VisualElement class="data-row">
+                        <Label text="VB:" class="data-label" />
+                        <Label name="vb-value" text="0.020 mm" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Wear:" class="data-label" />
+                        <Label name="wear-pct-value" text="0%" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Life:" class="data-label" />
+                        <Label name="wear-life-value" text="45 min" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+
+                <!-- Temperature -->
+                <VisualElement class="panel">
+                    <Label text="Temperature" class="panel-title" />
+                    <VisualElement class="data-row">
+                        <Label text="Tool:" class="data-label" />
+                        <Label name="tool-temp-value" text="20.0 C" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Interface:" class="data-label" />
+                        <Label name="interface-temp-value" text="20.0 C" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+
+                <!-- Surface Roughness -->
+                <VisualElement class="panel">
+                    <Label text="Surface Roughness" class="panel-title" />
+                    <VisualElement class="data-row">
+                        <Label text="Ra:" class="data-label" />
+                        <Label name="roughness-ra-value" text="-- µm" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Grade:" class="data-label" />
+                        <Label name="roughness-grade-value" text="--" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+
+                <!-- Raw Sensors (micro-ROS) -->
+                <VisualElement class="panel">
+                    <Label text="Sensors" class="panel-title" />
+                    <VisualElement class="data-row">
+                        <Label text="Vib:" class="data-label" />
+                        <Label name="sensor-vibration-value" text="-- mm/s²" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Current:" class="data-label" />
+                        <Label name="sensor-current-value" text="-- A" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Temp:" class="data-label" />
+                        <Label name="sensor-temp-value" text="-- °C" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Acoustic:" class="data-label" />
+                        <Label name="sensor-acoustic-value" text="--" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Coolant:" class="data-label" />
+                        <Label name="sensor-coolant-value" text="-- L/min" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Link:" class="data-label" />
+                        <Label name="sensor-status-value" text="No Data" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+
+                <!-- OEE -->
+                <VisualElement class="panel">
+                    <Label text="OEE" class="panel-title" />
+                    <VisualElement class="data-row">
+                        <Label text="OEE:" class="data-label" />
+                        <Label name="oee-value" text="0%" class="data-value oee-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Avail:" class="data-label" />
+                        <Label name="avail-value" text="0%" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Perf:" class="data-label" />
+                        <Label name="perf-value" text="0%" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
+                        <Label text="Qual:" class="data-label" />
+                        <Label name="qual-value" text="0%" class="data-value" />
+                    </VisualElement>
+                </VisualElement>
+            </VisualElement>
+
+            <!-- 3D Viewport (transparent pass-through) -->
+            <VisualElement name="viewport" class="viewport" />
+        </VisualElement>
+
+        <!-- Bottom Control Bar -->
+        <VisualElement name="control-bar" class="control-bar">
+            <Button name="play-btn" text="Play" class="control-btn play" />
+            <Button name="pause-btn" text="Pause" class="control-btn" />
+            <Button name="stop-btn" text="Stop" class="control-btn" />
+            <Slider name="speed-slider" label="Speed" low-value="0.1" high-value="100" value="1" class="speed-slider" />
+            <Label name="speed-label" text="1.0x" class="speed-text" />
+            <DropdownField name="mode-dropdown" label="Mode" class="mode-dropdown" />
+            <Button name="load-gcode-btn" text="Load G-code" class="control-btn" />
+            <Label name="sim-time-value" text="00:00:00.0" class="sim-time" />
+            <VisualElement class="spacer" />
+            <Label name="ned2-status" text="Ned2: IDLE" class="robot-status" />
+            <Label name="xarm6-status" text="xArm6: IDLE" class="robot-status" />
+            <Button name="estop-btn" text="E-STOP" class="estop-btn" />
+        </VisualElement>
+    </VisualElement>
+</UXML>

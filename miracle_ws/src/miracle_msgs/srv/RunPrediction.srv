@@ -1,0 +1,15 @@
+# RunPrediction - Synchronous prediction service for dashboard use.
+#
+# Lightweight service wrapper around the RunPrediction action,
+# designed for web dashboard calls via rosbridge.
+
+# Request
+string machine_id                    # Target machine
+string scenario_type                 # "what_if", "failure", "maintenance"
+float64 prediction_horizon_hours     # Lookahead horizon (0 = default)
+---
+# Response
+bool success                         # Prediction completed
+string summary                       # Human-readable result summary
+float64 confidence                   # Prediction confidence (0.0-1.0)
+string detailed_report_json          # Full results as JSON

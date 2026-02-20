@@ -1,0 +1,186 @@
+# =============================================================================
+# MIRACLE System - QoS Profile Configuration Reference
+# =============================================================================
+# Defines Quality of Service profiles used across the MIRACLE system.
+# These profiles map to RMW QoS policy settings for DDS communication.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Profile: sensor_data
+# Purpose:  High-frequency sensor streams (vibration, temperature, force)
+# Usage:    miracle_cnc sensor_fusion, state_publisher
+# -----------------------------------------------------------------------------
+sensor_data:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+  deadline_ms: 20
+  lifespan_ms: 100
+  liveliness: automatic
+  liveliness_lease_ms: 1000
+
+# -----------------------------------------------------------------------------
+# Profile: machine_state
+# Purpose:  Machine state updates (position, status, mode)
+# Usage:    miracle_cnc state_publisher, miracle_twin sync_engine
+# -----------------------------------------------------------------------------
+machine_state:
+  history: keep_last
+  depth: 5
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 50
+  lifespan_ms: 500
+  liveliness: automatic
+  liveliness_lease_ms: 2000
+
+# -----------------------------------------------------------------------------
+# Profile: command
+# Purpose:  Control commands (G-code, setpoints, mode changes)
+# Usage:    miracle_cnc gcode_executor, miracle_mes job_scheduler
+# -----------------------------------------------------------------------------
+command:
+  history: keep_all
+  depth: 100
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 100
+  lifespan_ms: 5000
+  liveliness: manual_by_topic
+  liveliness_lease_ms: 3000
+
+# -----------------------------------------------------------------------------
+# Profile: alarm
+# Purpose:  Alarm and safety-critical notifications
+# Usage:    miracle_scada alarm_manager, miracle_cnc local_watchdog
+# -----------------------------------------------------------------------------
+alarm:
+  history: keep_all
+  depth: 200
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 10
+  lifespan_ms: 60000
+  liveliness: automatic
+  liveliness_lease_ms: 1000
+
+# -----------------------------------------------------------------------------
+# Profile: diagnostic
+# Purpose:  Diagnostic and health data
+# Usage:    miracle_resiliency heartbeat_aggregator, local_watchdog
+# -----------------------------------------------------------------------------
+diagnostic:
+  history: keep_last
+  depth: 20
+  reliability: reliable
+  durability: volatile
+  deadline_ms: 1000
+  lifespan_ms: 5000
+  liveliness: automatic
+  liveliness_lease_ms: 5000
+
+# -----------------------------------------------------------------------------
+# Profile: heartbeat
+# Purpose:  Node liveness heartbeats
+# Usage:    miracle_resiliency heartbeat_aggregator
+# -----------------------------------------------------------------------------
+heartbeat:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+  deadline_ms: 1000
+  lifespan_ms: 2000
+  liveliness: automatic
+  liveliness_lease_ms: 2000
+
+# -----------------------------------------------------------------------------
+# Profile: bulk_data
+# Purpose:  Large payload transfers (models, images, point clouds)
+# Usage:    miracle_ai model_manager, miracle_twin scenario_manager
+# -----------------------------------------------------------------------------
+bulk_data:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 5000
+  lifespan_ms: 60000
+  liveliness: automatic
+  liveliness_lease_ms: 10000
+
+# -----------------------------------------------------------------------------
+# Profile: event
+# Purpose:  Discrete events (job start/stop, anomaly detected, etc.)
+# Usage:    miracle_mes, miracle_ai anomaly_detector
+# -----------------------------------------------------------------------------
+event:
+  history: keep_all
+  depth: 500
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 500
+  lifespan_ms: 30000
+  liveliness: automatic
+  liveliness_lease_ms: 5000
+
+# -----------------------------------------------------------------------------
+# Profile: parameter_update
+# Purpose:  Dynamic parameter changes and configuration updates
+# Usage:    miracle_cognitive self_configurer
+# -----------------------------------------------------------------------------
+parameter_update:
+  history: keep_last
+  depth: 5
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 1000
+  lifespan_ms: 10000
+  liveliness: automatic
+  liveliness_lease_ms: 5000
+
+# -----------------------------------------------------------------------------
+# Profile: knowledge
+# Purpose:  Knowledge graph updates, ontology changes, reasoning results
+# Usage:    miracle_cognitive knowledge_graph, reasoning_engine
+# -----------------------------------------------------------------------------
+knowledge:
+  history: keep_last
+  depth: 50
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 1000
+  lifespan_ms: 60000
+  liveliness: automatic
+  liveliness_lease_ms: 10000
+
+# -----------------------------------------------------------------------------
+# Profile: consensus
+# Purpose:  Multi-agent consensus protocol messages
+# Usage:    miracle_cognitive consensus_protocol, auction_manager
+# -----------------------------------------------------------------------------
+consensus:
+  history: keep_all
+  depth: 100
+  reliability: reliable
+  durability: volatile
+  deadline_ms: 200
+  lifespan_ms: 5000
+  liveliness: manual_by_topic
+  liveliness_lease_ms: 1000
+
+# -----------------------------------------------------------------------------
+# Profile: security_audit
+# Purpose:  Security audit trail messages
+# Usage:    miracle_security audit_logger
+# -----------------------------------------------------------------------------
+security_audit:
+  history: keep_all
+  depth: 1000
+  reliability: reliable
+  durability: transient_local
+  deadline_ms: 5000
+  lifespan_ms: 300000
+  liveliness: automatic
+  liveliness_lease_ms: 10000

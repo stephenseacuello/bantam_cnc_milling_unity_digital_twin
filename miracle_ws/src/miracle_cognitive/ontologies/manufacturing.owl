@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<rdf:RDF xmlns="http://miracle.ros2.org/ontology/manufacturing#"
+     xml:base="http://miracle.ros2.org/ontology/manufacturing"
+     xmlns:owl="http://www.w3.org/2002/07/owl#"
+     xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+     xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+     xmlns:xsd="http://www.w3.org/2001/XMLSchema#">
+    <owl:Ontology rdf:about="http://miracle.ros2.org/ontology/manufacturing"/>
+    <owl:Class rdf:about="#ManufacturingEquipment"/>
+    <owl:Class rdf:about="#CNCMachine">
+        <rdfs:subClassOf rdf:resource="#ManufacturingEquipment"/>
+    </owl:Class>
+    <owl:Class rdf:about="#CuttingTool"/>
+    <owl:Class rdf:about="#MachiningProcess"/>
+    <owl:Class rdf:about="#ProcessParameter"/>
+    <owl:ObjectProperty rdf:about="#hasComponent"/>
+    <owl:ObjectProperty rdf:about="#usesTool"/>
+    <owl:ObjectProperty rdf:about="#hasParameter"/>
+    <owl:DatatypeProperty rdf:about="#hasValue"/>
+</rdf:RDF>

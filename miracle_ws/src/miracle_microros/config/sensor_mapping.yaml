@@ -1,0 +1,161 @@
+# =============================================================================
+# MIRACLE Sensor Pin & Topic Mapping Configuration
+# =============================================================================
+# Maps physical MCU pins to logical sensor channels, defines sampling rates,
+# and assigns ROS 2 topic names for each data stream. The {machine_id}
+# placeholder is resolved at runtime from the node parameters.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Machine Identification
+# ---------------------------------------------------------------------------
+# The machine_id is substituted into all topic paths. Override per-machine
+# via launch parameters or environment variables.
+machine_id: "cnc_001"
+
+# ---------------------------------------------------------------------------
+# ESP32 Sensor Pin Mapping
+# ---------------------------------------------------------------------------
+# The ESP32 handles vibration (3-axis accelerometer via ADC) and spindle
+# current draw monitoring. All four channels use the ESP32 12-bit ADC.
+esp32:
+  sensors:
+    vibration_x:
+      pin: GPIO34
+      peripheral: ADC1_CH6          # ADC1 channel 6 (GPIO34)
+      type: analog
+      adc_attenuation: "11dB"       # 0-3.3 V full-scale range
+      adc_resolution_bits: 12       # 12-bit ADC (0-4095)
+      description: "X-axis vibration / accelerometer"
+      unit: "g"
+      calibration:
+        offset: 2048                # Mid-scale zero-g offset
+        scale: 0.00161              # Conversion factor: ADC counts -> g
+      publish_rate_hz: 1000
+      topic: "/miracle/{machine_id}/raw_sensor/vibration"
+      msg_field: "data[0]"          # Index in Float32MultiArray
+
+    vibration_y:
+      pin: GPIO35
+      peripheral: ADC1_CH7          # ADC1 channel 7 (GPIO35)
+      type: analog
+      adc_attenuation: "11dB"
+      adc_resolution_bits: 12
+      description: "Y-axis vibration / accelerometer"
+      unit: "g"
+      calibration:
+        offset: 2048
+        scale: 0.00161
+      publish_rate_hz: 1000
+      topic: "/miracle/{machine_id}/raw_sensor/vibration"
+      msg_field: "data[1]"
+
+    vibration_z:
+      pin: GPIO36
+      peripheral: ADC1_CH0          # ADC1 channel 0 (GPIO36 / VP)
+      type: analog
+      adc_attenuation: "11dB"
+      adc_resolution_bits: 12
+      description: "Z-axis vibration / accelerometer"
+      unit: "g"
+      calibration:
+        offset: 2048
+        scale: 0.00161
+      publish_rate_hz: 1000
+      topic: "/miracle/{machine_id}/raw_sensor/vibration"
+      msg_field: "data[2]"
+
+    current_draw:
+      pin: GPIO39
+      peripheral: ADC1_CH3          # ADC1 channel 3 (GPIO39 / VN)
+      type: analog
+      adc_attenuation: "11dB"
+      adc_resolution_bits: 12
+      description: "Spindle motor current draw (via ACS712 sensor)"
+      unit: "A"
+      calibration:
+        offset: 2048                # Zero-current offset (ACS712 midpoint)
+        scale: 0.0264               # ACS712-05B: 185 mV/A at 3.3 V ref
+      publish_rate_hz: 500
+      topic: "/miracle/{machine_id}/raw_sensor/current"
+      msg_field: "data[0]"
+
+  # Aggregate vibration message layout
+  # Published as sensor_msgs/Float32MultiArray with layout:
+  #   data[0] = vibration_x
+  #   data[1] = vibration_y
+  #   data[2] = vibration_z
+  vibration_array_layout:
+    dim:
+      - label: "axis"
+        size: 3
+        stride: 3
+    data_offset: 0
+
+# ---------------------------------------------------------------------------
+# STM32 Sensor Pin Mapping
+# ---------------------------------------------------------------------------
+# The STM32 (Nucleo F446RE) handles temperature, acoustic emission, and
+# coolant flow monitoring via its 12-bit ADCs.
+stm32:
+  sensors:
+    temperature:
+      pin: PA0
+      peripheral: ADC1_IN0          # ADC1 input 0
+      type: analog
+      adc_resolution_bits: 12
+      description: "Workpiece / tool temperature (thermocouple via MAX31855 or NTC)"
+      unit: "degC"
+      calibration:
+        offset: 0.0
+        scale: 0.0806               # NTC conversion factor (linearized)
+      publish_rate_hz: 10
+      topic: "/miracle/{machine_id}/raw_sensor/temperature"
+      msg_field: "data[0]"
+
+    acoustic_level:
+      pin: PA1
+      peripheral: ADC1_IN1          # ADC1 input 1
+      type: analog
+      adc_resolution_bits: 12
+      description: "Acoustic emission sensor (AE) - tool wear / chatter detection"
+      unit: "dB"
+      calibration:
+        offset: 0.0
+        scale: 0.0244               # Microphone preamp gain-adjusted scale
+      # Raw sampling at 44100 Hz; downsampled to 1000 Hz for micro-ROS
+      # transport. The full-rate data is processed on-MCU for RMS / peak
+      # extraction before publishing.
+      raw_sample_rate_hz: 44100
+      publish_rate_hz: 1000         # Downsampled publish rate
+      downsample_method: "rms"      # Options: rms, peak, average, decimate
+      downsample_window: 44         # 44100 / 1000 ~= 44 samples per window
+      topic: "/miracle/{machine_id}/raw_sensor/acoustic"
+      msg_field: "data[0]"
+
+    coolant_flow:
+      pin: PA2
+      peripheral: ADC1_IN2          # ADC1 input 2
+      type: analog
+      adc_resolution_bits: 12
+      description: "Coolant flow rate sensor (pulse-based, frequency-to-voltage)"
+      unit: "L/min"
+      calibration:
+        offset: 0.0
+        scale: 0.0098               # Flow sensor conversion factor
+      publish_rate_hz: 10
+      topic: "/miracle/{machine_id}/raw_sensor/coolant_flow"
+      msg_field: "data[0]"
+
+# ---------------------------------------------------------------------------
+# Publish Rate Summary
+# ---------------------------------------------------------------------------
+# Quick reference for all sensor publish rates:
+#
+#   Sensor          | MCU   | Raw Rate   | Publish Rate | Notes
+#   ----------------+-------+------------+--------------+-------------------
+#   Vibration X/Y/Z | ESP32 |     1 kHz  |    1000 Hz   | Direct publish
+#   Current Draw    | ESP32 |   500 Hz   |     500 Hz   | Direct publish
+#   Temperature     | STM32 |    10 Hz   |      10 Hz   | Direct publish
+#   Acoustic        | STM32 | 44100 Hz   |    1000 Hz   | RMS downsampled
+#   Coolant Flow    | STM32 |    10 Hz   |      10 Hz   | Direct publish

@@ -1,0 +1,220 @@
+<?xml version="1.0"?>
+<!-- Niryo Ned2 URDF - Resolved from niryo_ned2.urdf.xacro -->
+<!-- Source: https://github.com/NiryoRobotics/ned_ros -->
+<!-- Uses COLLADA (.dae) for visual, STL for collision (matching original) -->
+<robot name="niryo_ned2">
+
+  <material name="NiryoBlue">
+    <color rgba="0.2 0.4 0.8 1.0"/>
+  </material>
+  <material name="NiryoGray">
+    <color rgba="0.6 0.6 0.6 1.0"/>
+  </material>
+
+  <link name="world"/>
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-0.008924 0.0001357 0.052392" rpy="0 0 0"/>
+      <mass value="0.71142"/>
+      <inertia ixx="0.0017" ixy="0.0" ixz="0.0" iyy="0.0017" iyz="0.0" izz="0.0032"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/base_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="-1.5707963268 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/base_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="shoulder_link">
+    <inertial>
+      <origin xyz="-0.031951 0.0080419 0.030675" rpy="0 0 0"/>
+      <mass value="0.35056"/>
+      <inertia ixx="0.00023875" ixy="0.0" ixz="0.0" iyy="0.00032638" iyz="0.0" izz="0.00030089"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/shoulder_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/shoulder_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="arm_link">
+    <inertial>
+      <origin xyz="-0.00096976 0.086432 0.0038832" rpy="0 3.14159265359 0"/>
+      <mass value="1.0838"/>
+      <inertia ixx="0.008194" ixy="0.00015602" ixz="0.0" iyy="0.0011945" iyz="-0.00031298" izz="0.007915"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 3.14159265359 0"/>
+      <geometry>
+        <mesh filename="package://meshes/arm_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 3.14159265359 0"/>
+      <geometry>
+        <mesh filename="package://meshes/arm_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="elbow_link">
+    <inertial>
+      <origin xyz="-0.019703 0.037336 0.0" rpy="0 3.14159265359 0"/>
+      <mass value="0.22126"/>
+      <inertia ixx="0.00011754" ixy="-0.000012314" ixz="0.0" iyy="0.00020851" iyz="0.0" izz="0.00022753"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 3.14159265359 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/elbow_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 3.14159265359 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/elbow_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="forearm_link">
+    <inertial>
+      <origin xyz="-0.0049532 0.0 0.08106" rpy="0 0 0"/>
+      <mass value="0.35686"/>
+      <inertia ixx="0.0013664" ixy="0.0" ixz="0.00013594" iyy="0.0014781" iyz="0.0" izz="0.00023715"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/forearm_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/forearm_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="wrist_link">
+    <inertial>
+      <origin xyz="-0.019666 0.037312 0.0" rpy="0 0 0"/>
+      <mass value="0.22126"/>
+      <inertia ixx="0.0015" ixy="0.0" ixz="0.0" iyy="0.0015" iyz="0.0" izz="0.0015"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/wrist_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/wrist_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="hand_link">
+    <inertial>
+      <origin xyz="0 0 0.009" rpy="0 0 0"/>
+      <mass value="0.0070027"/>
+      <inertia ixx="0.0015" ixy="0.0" ixz="0.0" iyy="0.0015" iyz="0.0" izz="0.0015"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/hand_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 -1.5707963268"/>
+      <geometry>
+        <mesh filename="package://meshes/hand_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="tool_link"/>
+
+  <!-- Joints -->
+
+  <joint name="joint_world" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="joint_1" type="revolute">
+    <origin xyz="0 0 0.1013" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10.0" velocity="10.0" lower="-3.0001" upper="3.0001"/>
+  </joint>
+
+  <joint name="joint_2" type="revolute">
+    <origin xyz="0 0 0.065" rpy="1.5707963268 0 0"/>
+    <parent link="shoulder_link"/>
+    <child link="arm_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10.0" velocity="8.0" lower="-1.8326" upper="0.6103"/>
+  </joint>
+
+  <joint name="joint_3" type="revolute">
+    <origin xyz="0.012 0.221 0" rpy="0 0 1.5707963268"/>
+    <parent link="arm_link"/>
+    <child link="elbow_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="7.0" velocity="8.0" lower="-1.3402" upper="1.5701"/>
+  </joint>
+
+  <joint name="joint_4" type="revolute">
+    <origin xyz="0.0325 -0.065 0" rpy="1.5707963268 0 0"/>
+    <parent link="elbow_link"/>
+    <child link="forearm_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="7.0" velocity="2.0" lower="-2.0899" upper="2.0899"/>
+  </joint>
+
+  <joint name="joint_5" type="revolute">
+    <origin xyz="0 0 0.17" rpy="-1.5707963268 0 0"/>
+    <parent link="forearm_link"/>
+    <child link="wrist_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="6.0" velocity="2.0" lower="-1.9200" upper="1.9228"/>
+  </joint>
+
+  <joint name="joint_6" type="revolute">
+    <origin xyz="0.00925 -0.0197 0" rpy="1.5707963268 0 0"/>
+    <parent link="wrist_link"/>
+    <child link="hand_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="5.0" velocity="2.0" lower="-2.5299" upper="2.5299"/>
+  </joint>
+
+  <joint name="hand_tool_joint" type="fixed">
+    <parent link="hand_link"/>
+    <child link="tool_link"/>
+    <origin xyz="0 0 0.0285" rpy="3.14159265359 -1.5707963268 0"/>
+  </joint>
+
+</robot>

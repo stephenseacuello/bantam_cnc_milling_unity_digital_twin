@@ -1,0 +1,10 @@
+builtin_interfaces/Time timestamp
+string alert_id
+string severity
+string category
+string source_node
+string description
+string[] affected_nodes
+string recommended_action
+bool requires_isolation
+float64 confidence

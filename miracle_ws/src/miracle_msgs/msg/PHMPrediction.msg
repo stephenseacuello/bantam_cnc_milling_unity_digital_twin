@@ -1,0 +1,10 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string component
+string prediction_type
+float64 remaining_useful_life_hours
+float64 confidence
+float64 health_index
+string recommended_action
+builtin_interfaces/Time predicted_failure_time
+float64[] trend_data

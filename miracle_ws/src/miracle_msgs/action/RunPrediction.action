@@ -1,0 +1,13 @@
+# Goal
+string machine_id
+string prediction_type
+float64 prediction_horizon_hours
+---
+# Result
+bool success
+miracle_msgs/PHMPrediction prediction
+string detailed_report_json
+---
+# Feedback
+float64 progress
+string current_phase

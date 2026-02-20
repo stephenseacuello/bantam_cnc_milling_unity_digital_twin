@@ -1,0 +1,36 @@
+# =============================================================================
+# MIRACLE System - CNC Machine 2 Parameter Overrides
+# =============================================================================
+# Machine-specific overrides for CNC2 (5-axis horizontal milling center).
+# These values override the defaults in miracle_params.yaml.
+# =============================================================================
+
+state_publisher:
+  ros__parameters:
+    machine_id: "cnc2"
+    publish_rate_hz: 50.0
+    simulation_mode: true
+
+gcode_executor:
+  ros__parameters:
+    machine_id: "cnc2"
+    max_feed_rate: 12000.0
+    max_spindle_speed: 18000.0
+
+sensor_fusion:
+  ros__parameters:
+    machine_id: "cnc2"
+
+local_watchdog:
+  ros__parameters:
+    machine_id: "cnc2"
+
+spc_monitor:
+  ros__parameters:
+    machine_id: "cnc2"
+    window_size: 100
+
+rosbag_trigger:
+  ros__parameters:
+    machine_id: "cnc2"
+    output_directory: "/tmp/miracle_bags/cnc2"

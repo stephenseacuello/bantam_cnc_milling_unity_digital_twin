@@ -1,0 +1,142 @@
+// MarchingCubes.compute
+// GPU isosurface extraction from bit-packed voxel grid.
+// Processes one chunk (16x16x16) per dispatch.
+
+#pragma kernel CSMarchingCubes
+
+#include "Common.hlsl"
+
+StructuredBuffer<uint> _VoxelGrid;
+StructuredBuffer<int> _TriTable;      // 256 * 16 lookup table
+StructuredBuffer<int> _EdgeTable;     // 256 entries
+
+struct Vertex
+{
+    float3 position;
+    float3 normal;
+};
+
+AppendStructuredBuffer<Vertex> _Vertices;
+
+int3 _ChunkOffset;    // World-space chunk origin in voxel coordinates
+int3 _GridDim;
+float3 _GridOrigin;
+float3 _VoxelSize;
+
+// Sample voxel occupancy (1.0 = solid, 0.0 = empty)
+float SampleVoxel(int3 pos)
+{
+    if (any(pos < 0) || any(pos >= _GridDim))
+        return 0.0;
+
+    uint flatIdx = pos.x + pos.y * _GridDim.x + pos.z * _GridDim.x * _GridDim.y;
+    uint wordIdx = flatIdx >> 5;
+    uint bitMask = 1u << (flatIdx & 31);
+
+    return (_VoxelGrid[wordIdx] & bitMask) ? 1.0 : 0.0;
+}
+
+// Interpolate vertex position along an edge
+float3 InterpolateEdge(float3 p1, float3 p2, float v1, float v2, float iso)
+{
+    if (abs(v1 - v2) < 1e-6)
+        return (p1 + p2) * 0.5;
+
+    float t = (iso - v1) / (v2 - v1);
+    return p1 + t * (p2 - p1);
+}
+
+// Compute gradient-based normal at a position
+float3 ComputeNormal(int3 pos)
+{
+    float3 n;
+    n.x = SampleVoxel(pos + int3(1, 0, 0)) - SampleVoxel(pos + int3(-1, 0, 0));
+    n.y = SampleVoxel(pos + int3(0, 1, 0)) - SampleVoxel(pos + int3(0, -1, 0));
+    n.z = SampleVoxel(pos + int3(0, 0, 1)) - SampleVoxel(pos + int3(0, 0, -1));
+    return -normalize(n);
+}
+
+// Edge vertex lookup (which corners connect to which edges)
+static const int2 edgeConnection[12] = {
+    int2(0, 1), int2(1, 2), int2(2, 3), int2(3, 0),
+    int2(4, 5), int2(5, 6), int2(6, 7), int2(7, 4),
+    int2(0, 4), int2(1, 5), int2(2, 6), int2(3, 7)
+};
+
+// Corner offsets for a cube
+static const int3 cornerOffset[8] = {
+    int3(0, 0, 0), int3(1, 0, 0), int3(1, 1, 0), int3(0, 1, 0),
+    int3(0, 0, 1), int3(1, 0, 1), int3(1, 1, 1), int3(0, 1, 1)
+};
+
+[numthreads(4, 4, 4)]
+void CSMarchingCubes(uint3 id : SV_DispatchThreadID)
+{
+    int3 pos = _ChunkOffset + (int3)id;
+
+    // Don't process edge voxels (need neighbors for normals)
+    if (any(pos >= _GridDim - 1) || any(pos < 0))
+        return;
+
+    // Sample 8 corners of this cube
+    float corners[8];
+    int3 cornerPos[8];
+    for (int i = 0; i < 8; i++)
+    {
+        cornerPos[i] = pos + cornerOffset[i];
+        corners[i] = SampleVoxel(cornerPos[i]);
+    }
+
+    // Build cube index from corner occupancy
+    float iso = 0.5;
+    uint cubeIndex = 0;
+    for (uint c = 0; c < 8; c++)
+    {
+        if (corners[c] > iso)
+            cubeIndex |= (1u << c);
+    }
+
+    // Skip empty or fully solid cubes
+    int edgeFlags = _EdgeTable[cubeIndex];
+    if (edgeFlags == 0)
+        return;
+
+    // Compute edge vertices
+    float3 edgeVertices[12];
+    for (int e = 0; e < 12; e++)
+    {
+        if (edgeFlags & (1 << e))
+        {
+            int c1 = edgeConnection[e].x;
+            int c2 = edgeConnection[e].y;
+
+            float3 p1 = _GridOrigin + (float3(cornerPos[c1]) + 0.5) * _VoxelSize;
+            float3 p2 = _GridOrigin + (float3(cornerPos[c2]) + 0.5) * _VoxelSize;
+
+            edgeVertices[e] = InterpolateEdge(p1, p2, corners[c1], corners[c2], iso);
+        }
+    }
+
+    // Emit triangles from tri table
+    for (int t = 0; t < 15; t += 3)
+    {
+        int idx = cubeIndex * 16 + t;
+        if (_TriTable[idx] < 0)
+            break;
+
+        Vertex v0, v1, v2;
+        v0.position = edgeVertices[_TriTable[idx]];
+        v1.position = edgeVertices[_TriTable[idx + 1]];
+        v2.position = edgeVertices[_TriTable[idx + 2]];
+
+        // Compute face normal
+        float3 faceNormal = normalize(cross(v1.position - v0.position, v2.position - v0.position));
+        v0.normal = faceNormal;
+        v1.normal = faceNormal;
+        v2.normal = faceNormal;
+
+        _Vertices.Append(v0);
+        _Vertices.Append(v1);
+        _Vertices.Append(v2);
+    }
+}

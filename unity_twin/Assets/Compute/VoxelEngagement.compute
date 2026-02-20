@@ -1,0 +1,54 @@
+// VoxelEngagement.compute
+// Counts engaged voxels within a cylindrical tool swept volume.
+// Used for computing actual radial/axial depth of cut for force calculation.
+
+#pragma kernel CSComputeEngagement
+
+#include "Common.hlsl"
+
+StructuredBuffer<uint> _VoxelGrid;
+RWStructuredBuffer<uint> _EngagementCount;   // [0]=total, [1]=radial, [2]=axial
+RWStructuredBuffer<float> _EngagementDepths; // [0]=ae_actual, [1]=ap_actual
+
+float3 _ToolTip;
+float3 _ToolAxis;     // Typically (0, -1, 0) for vertical mill
+float _ToolRadius;
+float _MaxAxialDepth;
+float3 _GridOrigin;
+float3 _VoxelSize;
+int3 _GridDim;
+
+[numthreads(8, 8, 8)]
+void CSComputeEngagement(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_GridDim))
+        return;
+
+    float3 worldPos = _GridOrigin + (float3(id) + 0.5) * _VoxelSize;
+
+    // Project onto tool axis
+    float3 toVoxel = worldPos - _ToolTip;
+    float axialDist = dot(toVoxel, _ToolAxis);
+
+    // Only consider voxels within axial range
+    if (axialDist < 0 || axialDist > _MaxAxialDepth)
+        return;
+
+    // Radial distance from tool axis
+    float3 axialComponent = axialDist * _ToolAxis;
+    float radialDist = length(toVoxel - axialComponent);
+
+    // Within tool radius?
+    if (radialDist > _ToolRadius)
+        return;
+
+    // Check if voxel is solid
+    uint flatIdx = id.x + id.y * (uint)_GridDim.x + id.z * (uint)_GridDim.x * (uint)_GridDim.y;
+    uint wordIdx = flatIdx >> 5;
+    uint bitMask = 1u << (flatIdx & 31);
+
+    if (_VoxelGrid[wordIdx] & bitMask)
+    {
+        InterlockedAdd(_EngagementCount[0], 1); // Total engaged
+    }
+}

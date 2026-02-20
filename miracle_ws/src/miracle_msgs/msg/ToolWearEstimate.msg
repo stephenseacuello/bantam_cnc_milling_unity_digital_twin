@@ -1,0 +1,10 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string tool_id
+float64 wear_percentage
+float64 remaining_life_minutes
+float64 confidence
+string wear_type
+float64 flank_wear_mm
+float64 crater_wear_mm
+string recommended_action

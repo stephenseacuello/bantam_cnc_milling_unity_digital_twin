@@ -1,0 +1,287 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <model name="cobot">
+    <static>false</static>
+
+    <!-- ========================================================== -->
+    <!-- Base                                                       -->
+    <!-- ========================================================== -->
+    <link name="base_link">
+      <pose>0 0 0.05 0 0 0</pose>
+      <inertial>
+        <mass>10.0</mass>
+        <inertia>
+          <ixx>0.055</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.055</iyy>
+          <iyz>0</iyz>
+          <izz>0.08</izz>
+        </inertia>
+      </inertial>
+      <collision name="base_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.10</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="base_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.10</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1.0</ambient>
+          <diffuse>0.3 0.3 0.3 1.0</diffuse>
+          <specular>0.4 0.4 0.4 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <!-- ========================================================== -->
+    <!-- Shoulder Link                                              -->
+    <!-- ========================================================== -->
+    <link name="shoulder_link">
+      <pose>0 0 0.25 0 0 0</pose>
+      <inertial>
+        <mass>5.0</mass>
+        <inertia>
+          <ixx>0.065</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.065</iyy>
+          <iyz>0</iyz>
+          <izz>0.009</izz>
+        </inertia>
+      </inertial>
+      <collision name="shoulder_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.06</radius>
+            <length>0.30</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="shoulder_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.06</radius>
+            <length>0.30</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.2 0.5 1.0</ambient>
+          <diffuse>0.15 0.3 0.65 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="shoulder_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>shoulder_link</child>
+      <pose>0 0 -0.15 0 0 0</pose>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>-3.14159</lower>
+          <upper>3.14159</upper>
+          <effort>100</effort>
+          <velocity>1.5</velocity>
+        </limit>
+        <dynamics>
+          <damping>5.0</damping>
+          <friction>1.0</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Upper Arm Link                                             -->
+    <!-- ========================================================== -->
+    <link name="upper_arm_link">
+      <pose>0 0 0.55 0 0 0</pose>
+      <inertial>
+        <mass>4.0</mass>
+        <inertia>
+          <ixx>0.045</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.045</iyy>
+          <iyz>0</iyz>
+          <izz>0.006</izz>
+        </inertia>
+      </inertial>
+      <collision name="upper_arm_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.30</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="upper_arm_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.30</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.2 0.5 1.0</ambient>
+          <diffuse>0.15 0.3 0.65 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="elbow_joint" type="revolute">
+      <parent>shoulder_link</parent>
+      <child>upper_arm_link</child>
+      <pose>0 0 -0.15 0 0 0</pose>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <limit>
+          <lower>-2.35619</lower>
+          <upper>2.35619</upper>
+          <effort>80</effort>
+          <velocity>1.5</velocity>
+        </limit>
+        <dynamics>
+          <damping>4.0</damping>
+          <friction>0.8</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Forearm Link                                               -->
+    <!-- ========================================================== -->
+    <link name="forearm_link">
+      <pose>0 0 0.80 0 0 0</pose>
+      <inertial>
+        <mass>3.0</mass>
+        <inertia>
+          <ixx>0.020</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.020</iyy>
+          <iyz>0</iyz>
+          <izz>0.004</izz>
+        </inertia>
+      </inertial>
+      <collision name="forearm_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.04</radius>
+            <length>0.20</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="forearm_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.04</radius>
+            <length>0.20</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.2 0.5 1.0</ambient>
+          <diffuse>0.15 0.3 0.65 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="wrist_joint" type="revolute">
+      <parent>upper_arm_link</parent>
+      <child>forearm_link</child>
+      <pose>0 0 -0.10 0 0 0</pose>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <limit>
+          <lower>-2.35619</lower>
+          <upper>2.35619</upper>
+          <effort>40</effort>
+          <velocity>2.0</velocity>
+        </limit>
+        <dynamics>
+          <damping>2.0</damping>
+          <friction>0.5</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Wrist / End-Effector Link                                  -->
+    <!-- ========================================================== -->
+    <link name="wrist_link">
+      <pose>0 0 0.95 0 0 0</pose>
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.002</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.002</iyy>
+          <iyz>0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+      <collision name="wrist_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.08</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="wrist_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.08</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.5 0.5 0.5 1.0</ambient>
+          <diffuse>0.65 0.65 0.65 1.0</diffuse>
+          <specular>0.5 0.5 0.5 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="wrist_rotate_joint" type="revolute">
+      <parent>forearm_link</parent>
+      <child>wrist_link</child>
+      <pose>0 0 -0.04 0 0 0</pose>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>-3.14159</lower>
+          <upper>3.14159</upper>
+          <effort>20</effort>
+          <velocity>3.0</velocity>
+        </limit>
+        <dynamics>
+          <damping>1.0</damping>
+          <friction>0.3</friction>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- Joint state publisher plugin -->
+    <plugin filename="gz-sim-joint-state-publisher-system"
+            name="gz::sim::systems::JointStatePublisher">
+      <joint_name>shoulder_joint</joint_name>
+      <joint_name>elbow_joint</joint_name>
+      <joint_name>wrist_joint</joint_name>
+      <joint_name>wrist_rotate_joint</joint_name>
+    </plugin>
+
+  </model>
+</sdf>

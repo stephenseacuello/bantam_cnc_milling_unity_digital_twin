@@ -1,0 +1,6 @@
+string query
+string graph_name
+---
+bool success
+string result_json
+uint32 num_results

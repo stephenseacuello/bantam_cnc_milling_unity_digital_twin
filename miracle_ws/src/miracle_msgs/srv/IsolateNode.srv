@@ -1,0 +1,12 @@
+# IsolateNode - Synchronous node isolation service for dashboard use.
+#
+# Lightweight service wrapper for the IsolateNode action,
+# designed for web dashboard calls via rosbridge.
+
+# Request
+string node_id                       # Node to isolate
+string reason                        # Reason for isolation
+---
+# Response
+bool success                         # Isolation completed
+string message                       # Status message

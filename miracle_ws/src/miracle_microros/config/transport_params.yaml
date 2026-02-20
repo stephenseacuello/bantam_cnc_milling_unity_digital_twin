@@ -1,0 +1,109 @@
+# =============================================================================
+# MIRACLE micro-ROS Transport Configuration
+# =============================================================================
+# Transport layer settings for micro-ROS MCU bridges. These parameters
+# configure how the ESP32 and STM32 microcontrollers communicate with the
+# micro-ROS agent running on the host machine.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ROS 2 Domain Configuration
+# ---------------------------------------------------------------------------
+# All MIRACLE nodes operate on domain ID 42 to isolate manufacturing traffic
+# from other ROS 2 systems on the same network.
+ros_domain_id: 42
+
+# ---------------------------------------------------------------------------
+# UDP Transport (ESP32 - WiFi)
+# ---------------------------------------------------------------------------
+# The ESP32 connects to the micro-ROS agent over WiFi using UDP.
+# This provides wireless sensor data acquisition with low latency.
+udp_transport:
+  enabled: true
+  agent_host: "192.168.1.1"        # IP address of the micro-ROS agent host
+  agent_port: 8888                  # UDP port the agent listens on
+  client_port: 0                    # 0 = ephemeral (OS-assigned) client port
+  connection_timeout_ms: 5000       # Timeout for initial agent connection
+  reconnect_interval_ms: 2000       # Delay between reconnection attempts
+  max_reconnect_attempts: 0         # 0 = unlimited reconnection attempts
+
+# ---------------------------------------------------------------------------
+# Serial Transport (STM32 - UART)
+# ---------------------------------------------------------------------------
+# The STM32 connects to the micro-ROS agent over a wired serial link.
+# This provides deterministic, low-jitter communication for high-fidelity
+# sensor data (acoustic emission, temperature).
+serial_transport:
+  enabled: true
+  device: "/dev/ttyUSB0"            # Serial device path on the agent host
+  baudrate: 921600                  # Baud rate (must match firmware config)
+  data_bits: 8
+  stop_bits: 1
+  parity: "none"
+  flow_control: false
+  connection_timeout_ms: 3000
+  reconnect_interval_ms: 1000
+
+# ---------------------------------------------------------------------------
+# WiFi Credentials (ESP32)
+# ---------------------------------------------------------------------------
+# WARNING: Do not commit production credentials to version control.
+# Override these values using environment variables or a local .env file
+# that is excluded from the repository via .gitignore.
+wifi:
+  ssid: "MIRACLE_FACTORY_NET"       # Factory WiFi network SSID
+  password: "CHANGE_ME_IN_ENV"      # WiFi password - override in .env
+  static_ip: ""                     # Leave empty for DHCP; set for static IP
+  gateway: ""                       # Gateway for static IP configuration
+  subnet: "255.255.255.0"           # Subnet mask for static IP
+
+# ---------------------------------------------------------------------------
+# Quality of Service (QoS) Profiles
+# ---------------------------------------------------------------------------
+# Different data streams require different reliability guarantees:
+#   - Commands (e-stop, calibrate) MUST be delivered reliably.
+#   - Sensor data tolerates occasional packet loss for lower latency.
+qos_profiles:
+  # Reliable QoS for safety-critical command messages
+  command:
+    reliability: "reliable"
+    durability: "transient_local"
+    history: "keep_last"
+    depth: 10
+    deadline_ms: 100                # Commands must arrive within 100 ms
+    liveliness: "automatic"
+    liveliness_lease_ms: 1000
+
+  # Best-effort QoS for high-frequency sensor data streams
+  sensor_data:
+    reliability: "best_effort"
+    durability: "volatile"
+    history: "keep_last"
+    depth: 5
+    deadline_ms: 0                  # No deadline enforcement for sensor data
+    liveliness: "automatic"
+    liveliness_lease_ms: 2000
+
+  # Reliable QoS for low-frequency diagnostic / heartbeat messages
+  diagnostics:
+    reliability: "reliable"
+    durability: "transient_local"
+    history: "keep_last"
+    depth: 1
+    deadline_ms: 5000
+    liveliness: "automatic"
+    liveliness_lease_ms: 5000
+
+# ---------------------------------------------------------------------------
+# micro-ROS Agent Launch Parameters
+# ---------------------------------------------------------------------------
+# Convenience parameters used by the MIRACLE bringup launch file to start
+# the micro-ROS agent with the correct transport settings.
+agent_launch:
+  # UDP agent (for ESP32)
+  udp_args: "--udp4 --port 8888 --ros-args --remap __ns:=/miracle"
+  # Serial agent (for STM32)
+  serial_args: "--serial --dev /dev/ttyUSB0 -b 921600 --ros-args --remap __ns:=/miracle"
+  # Shared agent options
+  verbose: false
+  discovery_timeout_ms: 10000

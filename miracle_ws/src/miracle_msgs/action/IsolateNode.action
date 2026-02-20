@@ -1,0 +1,13 @@
+# Goal
+string target_node
+string reason
+string isolation_level
+---
+# Result
+bool success
+string[] affected_nodes
+string message
+---
+# Feedback
+float64 progress
+string current_step

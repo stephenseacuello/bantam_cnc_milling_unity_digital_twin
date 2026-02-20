@@ -1,0 +1,11 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string program_name
+uint32 line_number
+string raw_line
+string command
+float64[] parameters
+float64 feed_rate
+float64 spindle_speed
+string comment
+bool is_rapid

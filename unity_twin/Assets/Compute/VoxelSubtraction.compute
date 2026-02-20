@@ -1,0 +1,101 @@
+// VoxelSubtraction.compute
+// GPU kernels for tool subtraction and engagement counting on bit-packed voxel grid.
+
+#pragma kernel CSSubtractTool
+#pragma kernel CSCountEngaged
+
+#include "Common.hlsl"
+
+RWStructuredBuffer<uint> _VoxelGrid;
+RWStructuredBuffer<uint> _DirtyChunks;
+RWStructuredBuffer<uint> _RemovedCount;
+
+float3 _PrevToolTip;
+float3 _CurrToolTip;
+float _ToolRadius;
+float3 _GridOrigin;
+float3 _VoxelSize;
+int3 _GridDim;
+int3 _ChunkDim;
+
+// Distance from point to line segment
+float DistanceToSegment(float3 p, float3 a, float3 b)
+{
+    float3 ab = b - a;
+    float abLenSq = dot(ab, ab);
+
+    // Degenerate case: segment is a point
+    if (abLenSq < 1e-10)
+        return length(p - a);
+
+    float t = saturate(dot(p - a, ab) / abLenSq);
+    float3 closest = a + t * ab;
+    return length(p - closest);
+}
+
+uint FlatIndex(uint3 id)
+{
+    return id.x + id.y * (uint)_GridDim.x + id.z * (uint)_GridDim.x * (uint)_GridDim.y;
+}
+
+uint ChunkFlatIndex(uint3 chunkId)
+{
+    return chunkId.x + chunkId.y * (uint)_ChunkDim.x + chunkId.z * (uint)_ChunkDim.x * (uint)_ChunkDim.y;
+}
+
+[numthreads(8, 8, 8)]
+void CSSubtractTool(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_GridDim))
+        return;
+
+    // Compute world position of this voxel center
+    float3 worldPos = _GridOrigin + (float3(id) + 0.5) * _VoxelSize;
+
+    // Distance from voxel center to tool swept segment
+    float dist = DistanceToSegment(worldPos, _PrevToolTip, _CurrToolTip);
+
+    if (dist < _ToolRadius)
+    {
+        uint flatIdx = FlatIndex(id);
+        uint wordIdx = flatIdx >> 5;        // divide by 32
+        uint bitMask = 1u << (flatIdx & 31); // mod 32
+
+        uint original;
+        InterlockedAnd(_VoxelGrid[wordIdx], ~bitMask, original);
+
+        // Count only newly removed voxels (was solid, now empty)
+        if (original & bitMask)
+        {
+            InterlockedAdd(_RemovedCount[0], 1);
+
+            // Mark containing chunk as dirty
+            uint3 chunkId = id / 16u;
+            uint chunkFlat = ChunkFlatIndex(chunkId);
+            _DirtyChunks[chunkFlat] = 1;
+        }
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSCountEngaged(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_GridDim))
+        return;
+
+    float3 worldPos = _GridOrigin + (float3(id) + 0.5) * _VoxelSize;
+    float dist = DistanceToSegment(worldPos, _PrevToolTip, _CurrToolTip);
+
+    if (dist < _ToolRadius)
+    {
+        uint flatIdx = FlatIndex(id);
+        uint wordIdx = flatIdx >> 5;
+        uint bitMask = 1u << (flatIdx & 31);
+
+        // Count solid voxels within tool swept volume
+        if (_VoxelGrid[wordIdx] & bitMask)
+        {
+            InterlockedAdd(_RemovedCount[0], 1);
+        }
+    }
+}

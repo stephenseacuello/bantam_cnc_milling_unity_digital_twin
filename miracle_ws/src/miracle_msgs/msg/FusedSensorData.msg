@@ -1,0 +1,9 @@
+builtin_interfaces/Time timestamp
+string machine_id
+float64[] imu_features
+float64[] current_features
+float64[] audio_features
+float64[] vision_features
+float64[] feature_vector
+uint8 sensor_health
+float64 synchronization_quality

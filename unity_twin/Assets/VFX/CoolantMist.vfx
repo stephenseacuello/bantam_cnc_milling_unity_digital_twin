@@ -1,0 +1,525 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &1
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d01270efd3285cd4a9462f3de584e923, type: 3}
+  m_Name: CoolantMist
+  m_EditorClassIdentifier:
+  m_Category: MIRACLE/CNC
+  m_UIInfos:
+    m_GraphVersion: 4
+    m_UIVersion: 1
+  m_VisualEffectResource: {fileID: 2}
+--- !u!114 &2
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7d4c867f6b72b714dbb5fd1780afe208, type: 3}
+  m_Name: CoolantMist
+  m_EditorClassIdentifier:
+  m_Infos:
+    m_Expressions:
+      m_Expressions: []
+      m_ExpressionIndex: []
+    m_PropertySheet:
+      m_Float:
+        m_Array:
+        - m_ExpressionIndex: 0
+          m_Value: 500
+        - m_ExpressionIndex: 1
+          m_Value: 0.3
+        - m_ExpressionIndex: 2
+          m_Value: 1.0
+        - m_ExpressionIndex: 3
+          m_Value: 0.0001
+        - m_ExpressionIndex: 4
+          m_Value: 0.0005
+        - m_ExpressionIndex: 5
+          m_Value: 25
+        - m_ExpressionIndex: 6
+          m_Value: 3.0
+      m_Vector2:
+        m_Array: []
+      m_Vector3:
+        m_Array:
+        - m_ExpressionIndex: 7
+          m_Value: {x: 0, y: 0, z: 0}
+        - m_ExpressionIndex: 8
+          m_Value: {x: 0, y: -1, z: 0}
+      m_Vector4:
+        m_Array:
+        - m_ExpressionIndex: 9
+          m_Value: {x: 0.85, y: 0.92, z: 0.98, w: 0.3}
+      m_Int:
+        m_Array: []
+      m_Uint:
+        m_Array: []
+      m_Texture2D:
+        m_Array: []
+      m_Texture3D:
+        m_Array: []
+      m_TextureCube:
+        m_Array: []
+      m_Bool:
+        m_Array:
+        - m_ExpressionIndex: 10
+          m_Value: 0
+      m_Matrix4x4:
+        m_Array: []
+      m_AnimationCurve:
+        m_Array: []
+      m_Gradient:
+        m_Array: []
+      m_NamedExpressions:
+      - m_Name: SprayActive
+        m_ExpressionIndex: 10
+        m_Type: 8
+      - m_Name: SprayOrigin
+        m_ExpressionIndex: 7
+        m_Type: 5
+      - m_Name: SprayDirection
+        m_ExpressionIndex: 8
+        m_Type: 5
+      - m_Name: SpawnRate
+        m_ExpressionIndex: 0
+        m_Type: 1
+      - m_Name: LifetimeMin
+        m_ExpressionIndex: 1
+        m_Type: 1
+      - m_Name: LifetimeMax
+        m_ExpressionIndex: 2
+        m_Type: 1
+      - m_Name: SizeMin
+        m_ExpressionIndex: 3
+        m_Type: 1
+      - m_Name: SizeMax
+        m_ExpressionIndex: 4
+        m_Type: 1
+      - m_Name: ConeAngle
+        m_ExpressionIndex: 5
+        m_Type: 1
+      - m_Name: SpraySpeed
+        m_ExpressionIndex: 6
+        m_Type: 1
+      - m_Name: DropletColor
+        m_ExpressionIndex: 9
+        m_Type: 6
+    m_ExposedExpressions:
+    - m_Name: SprayActive
+      m_ExpressionIndex: 10
+      m_Type: 8
+    - m_Name: SprayOrigin
+      m_ExpressionIndex: 7
+      m_Type: 5
+    - m_Name: SpawnRate
+      m_ExpressionIndex: 0
+      m_Type: 1
+    - m_Name: SprayDirection
+      m_ExpressionIndex: 8
+      m_Type: 5
+    - m_Name: SpraySpeed
+      m_ExpressionIndex: 6
+      m_Type: 1
+    - m_Name: ConeAngle
+      m_ExpressionIndex: 5
+      m_Type: 1
+    - m_Name: DropletColor
+      m_ExpressionIndex: 9
+      m_Type: 6
+  m_Graph:
+    m_UIInfos:
+      m_GraphVersion: 4
+    m_Contexts:
+    # ===================================================================
+    # SPAWN CONTEXT
+    # Spawn rate gated by external "SprayActive" bool property.
+    # When SprayActive is false, effective spawn rate is 0.
+    # ===================================================================
+    - m_Type: 0
+      m_Label: Spawn
+      m_Data: {fileID: 0}
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: SpawnRate
+        m_Label: Conditional Spawn Rate
+        m_Data:
+          rate:
+            m_Type: Expression
+            m_Expression: "SprayActive ? SpawnRate : 0"
+            m_DefaultValue: 0
+          comment: >
+            Spawn rate is driven by the SprayActive bool property.
+            When SprayActive is true, spawns at SpawnRate particles/sec.
+            When false, spawn rate drops to 0 (no new particles).
+      m_Position: {x: -200, y: -400}
+    # ===================================================================
+    # INITIALIZE CONTEXT
+    # Cone emission shape, lifetime 0.3-1s, size 0.1-0.5mm,
+    # translucent blue-white water droplet color.
+    # ===================================================================
+    - m_Type: 1
+      m_Label: Initialize Particle
+      m_Data: {fileID: 0}
+      m_Capacity: 5000
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: SetAttribute
+        m_Label: Set Lifetime Random (Uniform)
+        m_Data:
+          attribute: lifetime
+          mode: Random
+          min:
+            m_Type: Property
+            m_PropertyName: LifetimeMin
+            m_DefaultValue: 0.3
+          max:
+            m_Type: Property
+            m_PropertyName: LifetimeMax
+            m_DefaultValue: 1.0
+          comment: "Coolant droplet lifetime: 0.3 to 1.0 seconds"
+      - m_Type: SetAttribute
+        m_Label: Set Size Random (Uniform)
+        m_Data:
+          attribute: size
+          mode: Random
+          min:
+            m_Type: Property
+            m_PropertyName: SizeMin
+            m_DefaultValue: 0.0001
+          max:
+            m_Type: Property
+            m_PropertyName: SizeMax
+            m_DefaultValue: 0.0005
+          comment: "Droplet size range: 0.1mm to 0.5mm"
+      - m_Type: SetPosition
+        m_Label: Set Position (Spray Origin)
+        m_Data:
+          mode: Shape
+          shape: Cone
+          coneSettings:
+            baseCenter:
+              m_Type: Property
+              m_PropertyName: SprayOrigin
+              m_DefaultValue: {x: 0, y: 0, z: 0}
+            direction:
+              m_Type: Property
+              m_PropertyName: SprayDirection
+              m_DefaultValue: {x: 0, y: -1, z: 0}
+            angle:
+              m_Type: Property
+              m_PropertyName: ConeAngle
+              m_DefaultValue: 25
+            baseRadius: 0.002
+            topRadius: 0.0
+            height: 0.0
+            emitFromBase: 1
+          comment: >
+            Cone emission shape simulates a coolant nozzle spray pattern.
+            Base radius 2mm at nozzle tip, cone angle ~25 degrees.
+      - m_Type: SetAttribute
+        m_Label: Set Velocity (Cone Direction)
+        m_Data:
+          attribute: velocity
+          mode: Shape
+          shape: Cone
+          coneSettings:
+            direction:
+              m_Type: Property
+              m_PropertyName: SprayDirection
+              m_DefaultValue: {x: 0, y: -1, z: 0}
+            angle:
+              m_Type: Property
+              m_PropertyName: ConeAngle
+              m_DefaultValue: 25
+            speed:
+              m_Type: Property
+              m_PropertyName: SpraySpeed
+              m_DefaultValue: 3.0
+            speedVariation: 0.3
+          comment: "Spray velocity along cone direction at ~3 m/s with 30% variation"
+      - m_Type: SetAttribute
+        m_Label: Set Color (Translucent Blue-White)
+        m_Data:
+          attribute: color
+          source:
+            m_Type: Property
+            m_PropertyName: DropletColor
+            m_DefaultValue: {r: 0.85, g: 0.92, b: 0.98, a: 0.3}
+          comment: >
+            Translucent blue-white color for water-based coolant.
+            Low alpha (0.3) for mist transparency effect.
+      m_Position: {x: -200, y: -200}
+    # ===================================================================
+    # UPDATE CONTEXT
+    # Light gravity, air drag, and subtle turbulence for mist drift.
+    # ===================================================================
+    - m_Type: 2
+      m_Label: Update Particle
+      m_Data: {fileID: 0}
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: Gravity
+        m_Label: Gravity
+        m_Data:
+          force: {x: 0, y: -9.81, z: 0}
+          comment: "Standard gravity on water droplets"
+      - m_Type: LinearDrag
+        m_Label: Air Drag
+        m_Data:
+          dragCoefficient: 2.0
+          comment: >
+            High drag coefficient for tiny water droplets.
+            Small droplets decelerate quickly in air.
+      - m_Type: TurbulenceNoise
+        m_Label: Mist Turbulence
+        m_Data:
+          intensity: 0.3
+          drag: 0.05
+          frequency: 4.0
+          octaves: 2
+          roughness: 0.5
+          lacunarity: 2.0
+          noiseType: Perlin
+          comment: >
+            Subtle turbulence simulates air currents causing mist drift
+            and the chaotic behaviour of fine water droplets.
+      - m_Type: Age
+        m_Label: Age Particles
+        m_Data: {}
+      m_Position: {x: -200, y: 0}
+    # ===================================================================
+    # OUTPUT CONTEXT
+    # Renders droplets as transparent billboard quads with soft edges.
+    # ===================================================================
+    - m_Type: 3
+      m_Label: Output Particle Quad
+      m_Data: {fileID: 0}
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: OutputQuad
+        m_Label: Coolant Droplet Billboard
+        m_Data:
+          meshRenderingType: Quad
+          castShadows: 0
+          receiveShadows: 0
+          sortMode: BackToFront
+          blendMode: Alpha
+          cullMode: Off
+          useAlphaClipping: 0
+          zWrite: 0
+          comment: >
+            Alpha-blended billboard quads for translucent mist appearance.
+            Back-to-front sorting ensures correct transparency layering.
+            No shadow casting for performance with high particle counts.
+      - m_Type: SetAttribute
+        m_Label: Size Over Life (Expand)
+        m_Data:
+          attribute: size
+          mode: OverLife
+          curve:
+            serializedVersion: 2
+            m_Curve:
+            - serializedVersion: 3
+              time: 0
+              value: 0.5
+              inSlope: 0
+              outSlope: 1.5
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 0.5
+              value: 1.2
+              inSlope: 0.5
+              outSlope: 0.2
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 1.0
+              value: 1.5
+              inSlope: 0.2
+              outSlope: 0
+              tangentMode: 0
+            m_PreInfinity: 2
+            m_PostInfinity: 2
+          comment: >
+            Droplets expand slightly over lifetime to simulate
+            mist dispersal and evaporation spread.
+      - m_Type: SetAttribute
+        m_Label: Alpha Over Life (Fade Out)
+        m_Data:
+          attribute: alpha
+          mode: OverLife
+          curve:
+            serializedVersion: 2
+            m_Curve:
+            - serializedVersion: 3
+              time: 0
+              value: 0.3
+              inSlope: 0
+              outSlope: 0
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 0.3
+              value: 0.3
+              inSlope: 0
+              outSlope: 0
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 0.7
+              value: 0.15
+              inSlope: -0.3
+              outSlope: -0.3
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 1.0
+              value: 0
+              inSlope: -0.5
+              outSlope: 0
+              tangentMode: 0
+            m_PreInfinity: 2
+            m_PostInfinity: 2
+          comment: >
+            Translucent at birth (alpha 0.3), holds steady briefly,
+            then fades out simulating evaporation of fine mist.
+      - m_Type: SetAttribute
+        m_Label: Color Over Life (Blue to White)
+        m_Data:
+          attribute: color
+          mode: OverLife
+          gradient:
+            serializedVersion: 2
+            key0: {r: 0.85, g: 0.92, b: 0.98, a: 1}
+            key1: {r: 0.95, g: 0.97, b: 1.0, a: 1}
+            key2: {r: 0, g: 0, b: 0, a: 0}
+            key3: {r: 0, g: 0, b: 0, a: 0}
+            key4: {r: 0, g: 0, b: 0, a: 0}
+            key5: {r: 0, g: 0, b: 0, a: 0}
+            key6: {r: 0, g: 0, b: 0, a: 0}
+            key7: {r: 0, g: 0, b: 0, a: 0}
+            ctime0: 0
+            ctime1: 65535
+            ctime2: 0
+            ctime3: 0
+            ctime4: 0
+            ctime5: 0
+            ctime6: 0
+            ctime7: 0
+            atime0: 0
+            atime1: 65535
+            atime2: 0
+            atime3: 0
+            atime4: 0
+            atime5: 0
+            atime6: 0
+            atime7: 0
+            m_Mode: 0
+            m_NumColorKeys: 2
+            m_NumAlphaKeys: 2
+          comment: >
+            Subtle color shift from pale blue to near-white over lifetime,
+            simulating coolant mist evaporating into transparent vapour.
+      m_Position: {x: -200, y: 200}
+    # ===================================================================
+    # GRAPH PROPERTIES (Exposed to C# via VisualEffect component)
+    # ===================================================================
+    m_Properties:
+    - m_Name: SprayActive
+      m_Type: Bool
+      m_DefaultValue: 0
+      m_Exposed: 1
+      m_Tooltip: >
+        Enables or disables coolant spray particle emission.
+        When false, no new particles are spawned (existing particles finish naturally).
+    - m_Name: SprayOrigin
+      m_Type: Vector3
+      m_DefaultValue: {x: 0, y: 0, z: 0}
+      m_Exposed: 1
+      m_Tooltip: >
+        World-space position of the coolant nozzle tip.
+        Particles are emitted from this point in a cone shape.
+    - m_Name: SprayDirection
+      m_Type: Vector3
+      m_DefaultValue: {x: 0, y: -1, z: 0}
+      m_Exposed: 1
+      m_Tooltip: >
+        Direction the coolant spray is aimed. Normalized internally.
+        Default points downward toward the workpiece.
+    - m_Name: SpawnRate
+      m_Type: Float
+      m_DefaultValue: 500
+      m_Exposed: 1
+      m_Tooltip: "Particles per second when spray is active."
+      m_Min: 0
+      m_Max: 5000
+    - m_Name: SpraySpeed
+      m_Type: Float
+      m_DefaultValue: 3.0
+      m_Exposed: 1
+      m_Tooltip: "Initial spray velocity in m/s."
+      m_Min: 0.1
+      m_Max: 20.0
+    - m_Name: ConeAngle
+      m_Type: Float
+      m_DefaultValue: 25
+      m_Exposed: 1
+      m_Tooltip: "Half-angle of the spray cone in degrees."
+      m_Min: 1
+      m_Max: 90
+    - m_Name: DropletColor
+      m_Type: Vector4
+      m_DefaultValue: {x: 0.85, y: 0.92, z: 0.98, w: 0.3}
+      m_Exposed: 1
+      m_Tooltip: >
+        Base color of coolant droplets. RGBA with low alpha for translucency.
+        Default is pale blue-white (water-based coolant appearance).
+    - m_Name: LifetimeMin
+      m_Type: Float
+      m_DefaultValue: 0.3
+      m_Exposed: 0
+      m_Tooltip: "Minimum droplet lifetime in seconds."
+      m_Min: 0.05
+      m_Max: 3.0
+    - m_Name: LifetimeMax
+      m_Type: Float
+      m_DefaultValue: 1.0
+      m_Exposed: 0
+      m_Tooltip: "Maximum droplet lifetime in seconds."
+      m_Min: 0.1
+      m_Max: 5.0
+    - m_Name: SizeMin
+      m_Type: Float
+      m_DefaultValue: 0.0001
+      m_Exposed: 0
+      m_Tooltip: "Minimum droplet size in meters (0.1mm)."
+    - m_Name: SizeMax
+      m_Type: Float
+      m_DefaultValue: 0.0005
+      m_Exposed: 0
+      m_Tooltip: "Maximum droplet size in meters (0.5mm)."
+    # ===================================================================
+    # SYSTEM SETTINGS
+    # ===================================================================
+    m_SystemSettings:
+      capacity: 5000
+      stripCapacity: 1
+      particlePerStripCount: 1
+      boundsMode: Recorded
+      customBounds:
+        m_Center: {x: 0, y: 0, z: 0}
+        m_Extent: {x: 0.5, y: 0.5, z: 0.5}
+      preWarmDeltaTime: 0.05
+      preWarmStepCount: 0

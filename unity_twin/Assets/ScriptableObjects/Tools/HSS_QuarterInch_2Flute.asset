@@ -1,0 +1,44 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d4f549ca75c584f17bd656bcb42b73d1, type: 3}
+  m_Name: HSS_QuarterInch_2Flute
+  m_EditorClassIdentifier: MiracleTwin::MiracleTwin.Cutting.ToolDefinition
+  toolId: HSS_quarter_inch_2flute
+  description: 1/4" 2-Flute HSS End Mill (6061-T6 Al)
+  diameter: 6.35
+  fluteCount: 2
+  helixAngle: 30
+  rakeAngle: 10
+  reliefAngle: 12
+  noseRadius: 0.4
+  cuttingLength: 19
+  overallLength: 57
+  shankDiameter: 6.35
+  colletType: ER-11
+  maxRunout: 0.01
+  minRPM: 10000
+  maxRPM: 23000
+  recommendedRPM: 16000
+  maxFeedRate: 2000
+  recommendedFeedPerTooth: 0.05
+  maxAxialDepth: 3
+  maxRadialDepth: 6.35
+  Ktc: 796
+  Krc: 168
+  Kac: 80
+  Kte: 14.5
+  Kre: 10.2
+  Kae: 4.8
+  taylorC: 300
+  taylorN: 0.125
+  initialWearVB: 0.02
+  maxWearVB: 0.3

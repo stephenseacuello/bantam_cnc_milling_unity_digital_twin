@@ -1,0 +1,8 @@
+string task_name
+string[] task_parameters
+string[] available_methods
+---
+bool success
+string[] plan_steps
+float64 estimated_duration
+string plan_tree_json

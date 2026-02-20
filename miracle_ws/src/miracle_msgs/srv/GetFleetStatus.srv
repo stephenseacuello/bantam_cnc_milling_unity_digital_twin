@@ -1,0 +1,5 @@
+string filter_criticality
+string filter_state
+---
+miracle_msgs/FleetHealth fleet_health
+string[] node_details_json

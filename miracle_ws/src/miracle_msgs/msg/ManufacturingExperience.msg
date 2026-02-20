@@ -1,0 +1,11 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string job_id
+string material
+string operation_type
+float64[] process_parameters
+float64[] quality_metrics
+float64[] sensor_summary
+float64 oee_achieved
+string outcome
+string[] lessons_learned

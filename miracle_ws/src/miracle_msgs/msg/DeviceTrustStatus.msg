@@ -1,0 +1,8 @@
+builtin_interfaces/Time timestamp
+string device_id
+string device_type
+float64 trust_score
+string attestation_status
+builtin_interfaces/Time last_attestation
+string[] active_policies
+bool is_quarantined

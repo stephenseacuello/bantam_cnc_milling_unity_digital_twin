@@ -1,0 +1,13 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string status
+float64 spindle_speed
+float64 feed_rate
+float64[] axis_positions
+float64[] axis_velocities
+float64 spindle_load
+float64 coolant_level
+string current_program
+uint32 current_line
+float64 cycle_time_elapsed
+float64 cycle_time_remaining

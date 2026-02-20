@@ -1,0 +1,55 @@
+{
+    "coefficients": [
+        {
+            "workpiece": "6061-T6",
+            "tool": "HSS",
+            "toolDiameter_mm": 6.35,
+            "fluteCount": 2,
+            "helixAngle_deg": 30,
+            "rakeAngle_deg": 10,
+            "Ktc": 796.0,
+            "Krc": 168.0,
+            "Kac": 80.0,
+            "Kte": 14.5,
+            "Kre": 10.2,
+            "Kae": 4.8,
+            "Kc1_1": 650.0,
+            "mc": 0.23,
+            "source": "Cutting_Physics_Digital_Twin_Reference.pdf"
+        },
+        {
+            "workpiece": "6061-T6",
+            "tool": "Carbide",
+            "toolDiameter_mm": 6.35,
+            "fluteCount": 3,
+            "helixAngle_deg": 35,
+            "rakeAngle_deg": 12,
+            "Ktc": 680.0,
+            "Krc": 145.0,
+            "Kac": 70.0,
+            "Kte": 12.0,
+            "Kre": 8.5,
+            "Kae": 3.5,
+            "Kc1_1": 600.0,
+            "mc": 0.25,
+            "source": "Calibrated"
+        },
+        {
+            "workpiece": "Ti-6Al-4V",
+            "tool": "Carbide",
+            "toolDiameter_mm": 10.0,
+            "fluteCount": 4,
+            "helixAngle_deg": 40,
+            "rakeAngle_deg": 8,
+            "Ktc": 2000.0,
+            "Krc": 700.0,
+            "Kac": 300.0,
+            "Kte": 35.0,
+            "Kre": 25.0,
+            "Kae": 12.0,
+            "Kc1_1": 1400.0,
+            "mc": 0.25,
+            "source": "Governing_Equations_CNC_Digital_Twin.pdf"
+        }
+    ]
+}

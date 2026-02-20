@@ -1,0 +1,15 @@
+# Goal
+string machine_id
+string calibration_type
+string[] axes
+---
+# Result
+bool success
+float64[] offsets
+float64[] accuracies
+string report_json
+---
+# Feedback
+float64 progress
+string current_step
+string current_axis

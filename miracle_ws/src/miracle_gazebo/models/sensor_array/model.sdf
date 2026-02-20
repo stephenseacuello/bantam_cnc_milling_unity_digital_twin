@@ -1,0 +1,243 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <model name="sensor_array">
+    <static>true</static>
+
+    <!-- ========================================================== -->
+    <!-- Mounting Bracket                                            -->
+    <!-- ========================================================== -->
+    <link name="bracket_link">
+      <pose>0 0 0.05 0 0 0</pose>
+      <inertial>
+        <mass>2.0</mass>
+        <inertia>
+          <ixx>0.007</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.007</iyy>
+          <iyz>0</iyz>
+          <izz>0.007</izz>
+        </inertia>
+      </inertial>
+      <collision name="bracket_collision">
+        <geometry>
+          <box>
+            <size>0.15 0.15 0.10</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="bracket_visual">
+        <geometry>
+          <box>
+            <size>0.15 0.15 0.10</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1.0</ambient>
+          <diffuse>0.3 0.3 0.3 1.0</diffuse>
+          <specular>0.4 0.4 0.4 1.0</specular>
+        </material>
+      </visual>
+    </link>
+
+    <!-- ========================================================== -->
+    <!-- Camera Sensor                                              -->
+    <!-- ========================================================== -->
+    <link name="camera_link">
+      <pose>0 0.06 0.13 0 0 0</pose>
+      <inertial>
+        <mass>0.3</mass>
+        <inertia>
+          <ixx>0.0002</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.0002</iyy>
+          <iyz>0</iyz>
+          <izz>0.0001</izz>
+        </inertia>
+      </inertial>
+      <collision name="camera_collision">
+        <geometry>
+          <box>
+            <size>0.04 0.04 0.04</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="camera_visual">
+        <geometry>
+          <box>
+            <size>0.04 0.04 0.04</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1.0</ambient>
+          <diffuse>0.15 0.15 0.15 1.0</diffuse>
+          <specular>0.3 0.3 0.3 1.0</specular>
+        </material>
+      </visual>
+      <sensor name="camera" type="camera">
+        <always_on>true</always_on>
+        <update_rate>30</update_rate>
+        <camera>
+          <horizontal_fov>1.0472</horizontal_fov>  <!-- 60 degrees -->
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>50.0</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+        </camera>
+        <topic>sensor_array/camera</topic>
+      </sensor>
+    </link>
+
+    <joint name="camera_joint" type="fixed">
+      <parent>bracket_link</parent>
+      <child>camera_link</child>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- IMU Sensor                                                 -->
+    <!-- ========================================================== -->
+    <link name="imu_link">
+      <pose>0 -0.04 0.13 0 0 0</pose>
+      <inertial>
+        <mass>0.1</mass>
+        <inertia>
+          <ixx>0.00003</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00003</iyy>
+          <iyz>0</iyz>
+          <izz>0.00003</izz>
+        </inertia>
+      </inertial>
+      <collision name="imu_collision">
+        <geometry>
+          <box>
+            <size>0.03 0.03 0.02</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="imu_visual">
+        <geometry>
+          <box>
+            <size>0.03 0.03 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.0 0.3 0.0 1.0</ambient>
+          <diffuse>0.0 0.5 0.0 1.0</diffuse>
+          <specular>0.2 0.2 0.2 1.0</specular>
+        </material>
+      </visual>
+      <sensor name="imu" type="imu">
+        <always_on>true</always_on>
+        <update_rate>200</update_rate>
+        <imu>
+          <angular_velocity>
+            <x>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.0002</stddev>
+              </noise>
+            </x>
+            <y>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.0002</stddev>
+              </noise>
+            </y>
+            <z>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.0002</stddev>
+              </noise>
+            </z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.017</stddev>
+              </noise>
+            </x>
+            <y>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.017</stddev>
+              </noise>
+            </y>
+            <z>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.017</stddev>
+              </noise>
+            </z>
+          </linear_acceleration>
+        </imu>
+        <topic>sensor_array/imu</topic>
+      </sensor>
+    </link>
+
+    <joint name="imu_joint" type="fixed">
+      <parent>bracket_link</parent>
+      <child>imu_link</child>
+    </joint>
+
+    <!-- ========================================================== -->
+    <!-- Microphone Placeholder (box representing mic housing)      -->
+    <!-- ========================================================== -->
+    <link name="microphone_link">
+      <pose>0 0 0.16 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.000005</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.000005</iyy>
+          <iyz>0</iyz>
+          <izz>0.000005</izz>
+        </inertia>
+      </inertial>
+      <collision name="microphone_collision">
+        <geometry>
+          <box>
+            <size>0.02 0.02 0.03</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="microphone_visual">
+        <geometry>
+          <box>
+            <size>0.02 0.02 0.03</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.3 0.0 0.0 1.0</ambient>
+          <diffuse>0.5 0.05 0.05 1.0</diffuse>
+          <specular>0.2 0.2 0.2 1.0</specular>
+        </material>
+      </visual>
+      <!-- Note: Gazebo does not natively support audio sensors.
+           This link serves as a visual/collision placeholder for
+           the microphone.  Audio data is generated externally and
+           bridged into ROS 2 via a custom node. -->
+    </link>
+
+    <joint name="microphone_joint" type="fixed">
+      <parent>bracket_link</parent>
+      <child>microphone_link</child>
+    </joint>
+
+  </model>
+</sdf>

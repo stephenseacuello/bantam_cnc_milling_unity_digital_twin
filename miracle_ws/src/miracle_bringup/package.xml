@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>miracle_bringup</name>
+  <version>1.0.0</version>
+  <description>Launch files and configuration for the MIRACLE CNC Digital Twin system</description>
+  <maintainer email="miracle@example.com">MIRACLE Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>miracle_msgs</depend>
+  <depend>miracle_core</depend>
+  <depend>miracle_cnc</depend>
+  <depend>miracle_scada</depend>
+  <depend>miracle_bridges</depend>
+  <depend>miracle_mes</depend>
+  <depend>miracle_twin</depend>
+  <depend>miracle_ai</depend>
+  <depend>miracle_security</depend>
+  <depend>miracle_resiliency</depend>
+  <depend>miracle_cognitive</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

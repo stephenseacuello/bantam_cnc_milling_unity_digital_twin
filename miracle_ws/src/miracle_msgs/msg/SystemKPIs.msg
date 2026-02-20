@@ -1,0 +1,14 @@
+builtin_interfaces/Time timestamp
+float64 oee
+float64 availability
+float64 performance
+float64 quality
+float64 cpk
+float64 mtbf
+float64 mttr
+float64 energy_efficiency
+float64 schedule_adherence
+float64 tool_life_utilization
+uint32 jobs_completed_today
+uint32 jobs_in_progress
+uint32 jobs_queued

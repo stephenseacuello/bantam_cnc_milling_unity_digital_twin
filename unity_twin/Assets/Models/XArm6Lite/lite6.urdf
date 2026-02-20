@@ -1,0 +1,233 @@
+<?xml version="1.0"?>
+<!-- UFactory Lite6 (xArm 6 Lite) URDF - Resolved from lite6.urdf.xacro -->
+<!-- Source: https://github.com/xArm-Developer/xarm_ros2 -->
+<!-- Joint origins from commented values in xacro + official kinematic params -->
+<robot name="lite6">
+
+  <material name="White">
+    <color rgba="1.0 1.0 1.0 1.0"/>
+  </material>
+  <material name="Silver">
+    <color rgba="0.75 0.75 0.75 1.0"/>
+  </material>
+
+  <link name="world"/>
+
+  <link name="link_base">
+    <inertial>
+      <origin xyz="-0.00829544579053192 0.0000326357432323433 0.0631194584987089" rpy="0 0 0"/>
+      <mass value="1.65393501783165"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.003"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link_base.stl"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link_base.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link1">
+    <inertial>
+      <origin xyz="-0.0002 0.0271 -0.0146" rpy="0 0 0"/>
+      <mass value="1.411"/>
+      <inertia ixx="0.003" ixy="0" ixz="0" iyy="0.003" iyz="0" izz="0.002"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link1.stl"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link2">
+    <inertial>
+      <origin xyz="0.1068 0.0 -0.0014" rpy="0 0 0"/>
+      <mass value="1.34"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link2.stl"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link2.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link3">
+    <inertial>
+      <origin xyz="0.0441 -0.009 -0.0108" rpy="0 0 0"/>
+      <mass value="0.953"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.003" iyz="0" izz="0.003"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link3.stl"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link3.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link4">
+    <inertial>
+      <origin xyz="-0.0018 -0.0145 0.0" rpy="0 0 0"/>
+      <mass value="1.284"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link4.stl"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link4.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link5">
+    <inertial>
+      <origin xyz="0.0 0.0085 0.0" rpy="0 0 0"/>
+      <mass value="0.804"/>
+      <inertia ixx="0.0005" ixy="0" ixz="0" iyy="0.0005" iyz="0" izz="0.0003"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link5.stl"/>
+      </geometry>
+      <material name="White"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link5.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link6">
+    <inertial>
+      <origin xyz="0 -0.0017 -0.0102" rpy="0 0 0"/>
+      <mass value="0.13"/>
+      <inertia ixx="0.00005" ixy="0" ixz="0" iyy="0.00005" iyz="0" izz="0.00006"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link6.stl"/>
+      </geometry>
+      <material name="Silver"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://meshes/link6.stl"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link_eef"/>
+
+  <!-- Joints -->
+
+  <joint name="world_joint" type="fixed">
+    <parent link="world"/>
+    <child link="link_base"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="joint1" type="revolute">
+    <origin xyz="0 0 0.2435" rpy="0 0 0"/>
+    <parent link="link_base"/>
+    <child link="link1"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50.0" velocity="3.14"/>
+    <dynamics damping="1.0" friction="1.0"/>
+  </joint>
+
+  <joint name="joint2" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5708 -1.5708 3.1416"/>
+    <parent link="link1"/>
+    <child link="link2"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.61799" upper="2.61799" effort="50.0" velocity="3.14"/>
+    <dynamics damping="1.0" friction="1.0"/>
+  </joint>
+
+  <joint name="joint3" type="revolute">
+    <origin xyz="0.2002 0 0" rpy="-3.1416 0 1.5708"/>
+    <parent link="link2"/>
+    <child link="link3"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.061087" upper="5.235988" effort="32.0" velocity="3.14"/>
+    <dynamics damping="1.0" friction="1.0"/>
+  </joint>
+
+  <joint name="joint4" type="revolute">
+    <origin xyz="0.087 -0.22761 0" rpy="1.5708 0 0"/>
+    <parent link="link3"/>
+    <child link="link4"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="32.0" velocity="3.14"/>
+    <dynamics damping="1.0" friction="1.0"/>
+  </joint>
+
+  <joint name="joint5" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+    <parent link="link4"/>
+    <child link="link5"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.1642" upper="2.1642" effort="32.0" velocity="3.14"/>
+    <dynamics damping="1.0" friction="1.0"/>
+  </joint>
+
+  <joint name="joint6" type="revolute">
+    <origin xyz="0 0.0625 0" rpy="-1.5708 0 0"/>
+    <parent link="link5"/>
+    <child link="link6"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="20.0" velocity="3.14"/>
+    <dynamics damping="1.0" friction="1.0"/>
+  </joint>
+
+  <joint name="joint_eef" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="link6"/>
+    <child link="link_eef"/>
+  </joint>
+
+</robot>

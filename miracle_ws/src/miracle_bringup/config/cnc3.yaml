@@ -1,0 +1,36 @@
+# =============================================================================
+# MIRACLE System - CNC Machine 3 Parameter Overrides
+# =============================================================================
+# Machine-specific overrides for CNC3 (CNC lathe / turning center).
+# These values override the defaults in miracle_params.yaml.
+# =============================================================================
+
+state_publisher:
+  ros__parameters:
+    machine_id: "cnc3"
+    publish_rate_hz: 50.0
+    simulation_mode: true
+
+gcode_executor:
+  ros__parameters:
+    machine_id: "cnc3"
+    max_feed_rate: 8000.0
+    max_spindle_speed: 6000.0
+
+sensor_fusion:
+  ros__parameters:
+    machine_id: "cnc3"
+
+local_watchdog:
+  ros__parameters:
+    machine_id: "cnc3"
+
+spc_monitor:
+  ros__parameters:
+    machine_id: "cnc3"
+    window_size: 100
+
+rosbag_trigger:
+  ros__parameters:
+    machine_id: "cnc3"
+    output_directory: "/tmp/miracle_bags/cnc3"

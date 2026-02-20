@@ -1,0 +1,76 @@
+{
+    "m_SGVersion": 3,
+    "m_Type": "UnityEditor.ShaderGraph.GraphData",
+    "m_ObjectId": "b2c3d4e5f6a789012345678abcdef012",
+    "m_Properties": [
+        {
+            "m_Id": "prop_basecolor",
+            "m_Name": "_BaseColor",
+            "m_DefaultReferenceName": "_BaseColor",
+            "m_Type": "UnityEditor.ShaderGraph.ColorShaderProperty",
+            "m_Value": { "r": 0.25, "g": 0.25, "b": 0.28, "a": 1.0 },
+            "m_ColorMode": 0
+        },
+        {
+            "m_Id": "prop_metallic",
+            "m_Name": "_Metallic",
+            "m_DefaultReferenceName": "_Metallic",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.8,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1
+        },
+        {
+            "m_Id": "prop_smoothness",
+            "m_Name": "_Smoothness",
+            "m_DefaultReferenceName": "_Smoothness",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.6,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1
+        },
+        {
+            "m_Id": "prop_colorvariation",
+            "m_Name": "_ColorVariation",
+            "m_DefaultReferenceName": "_ColorVariation",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.15,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1,
+            "m_Description": "Subtle color variation across the steel surface from heat treatment"
+        },
+        {
+            "m_Id": "prop_wearamount",
+            "m_Name": "_WearAmount",
+            "m_DefaultReferenceName": "_WearAmount",
+            "m_Type": "UnityEditor.ShaderGraph.Vector1ShaderProperty",
+            "m_Value": 0.0,
+            "m_RangeValues": { "x": 0.0, "y": 1.0 },
+            "m_FloatType": 1,
+            "m_Description": "Tool wear level - affects roughness and darkening at cutting edges"
+        },
+        {
+            "m_Id": "prop_tintcolor",
+            "m_Name": "_TintColor",
+            "m_DefaultReferenceName": "_TintColor",
+            "m_Type": "UnityEditor.ShaderGraph.ColorShaderProperty",
+            "m_Value": { "r": 0.35, "g": 0.30, "b": 0.45, "a": 1.0 },
+            "m_ColorMode": 0,
+            "m_Description": "Secondary tint for heat treatment / coating color variation"
+        }
+    ],
+    "m_SubGraphs": [],
+    "m_Path": "MIRACLE/Materials",
+    "m_GraphPrecision": 1,
+    "m_PreviewMode": 2,
+    "m_ActiveTargets": [
+        {
+            "m_Type": "UnityEditor.Rendering.Universal.UniversalTarget",
+            "m_SurfaceType": 0,
+            "m_AlphaMode": 0,
+            "m_RenderFace": 2,
+            "m_WorkflowMode": 1
+        }
+    ],
+    "m_Notes": "HSSToolSteel - High Speed Steel material for cutting tools (end mills, drill bits, etc.). Dark steel appearance with subtle color variation from heat treatment. Metallic: 0.8, Smoothness: 0.6. Includes wear parameter to simulate tool degradation. Fallback shader: MIRACLE/HSSToolSteel (hand-written HLSL)."
+}

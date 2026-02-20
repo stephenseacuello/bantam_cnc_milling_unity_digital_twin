@@ -1,0 +1,12 @@
+builtin_interfaces/Time timestamp
+string job_id
+string machine_id
+string status
+string program_name
+uint32 total_lines
+uint32 current_line
+float64 progress
+float64 estimated_remaining_sec
+float64 elapsed_sec
+string[] warnings
+string[] errors

@@ -1,0 +1,70 @@
+(50mm x 50mm pocket in center of block)
+(Tool: 1/4" 2-flute HSS end mill)
+(Pocket depth: 10mm, 1mm DOC per pass)
+G90 G21
+G17
+
+M3 S16000
+G0 Z5.0
+G0 X13.1 Y13.1 (Start corner: centered pocket)
+
+(Layer 1: Z = -1.0mm)
+G1 Z-1.0 F300
+G1 X63.1 F800
+G1 Y63.1
+G1 X13.1
+G1 Y13.1
+(Stepover inward)
+G1 X16.275 Y16.275
+G1 X59.925
+G1 Y59.925
+G1 X16.275
+G1 Y16.275
+(Continue inward)
+G1 X19.45 Y19.45
+G1 X56.75
+G1 Y56.75
+G1 X19.45
+G1 Y19.45
+G1 X22.625 Y22.625
+G1 X53.575
+G1 Y53.575
+G1 X22.625
+G1 Y22.625
+G1 X25.8 Y25.8
+G1 X50.4
+G1 Y50.4
+G1 X25.8
+G1 Y25.8
+G1 X28.975 Y28.975
+G1 X47.225
+G1 Y47.225
+G1 X28.975
+G1 Y28.975
+G1 X32.15 Y32.15
+G1 X44.05
+G1 Y44.05
+G1 X32.15
+G1 Y32.15
+G1 X35.325 Y35.325
+G1 X40.875
+G1 Y40.875
+G1 X35.325
+G1 Y35.325
+G0 Z1.0
+
+(Layer 2: Z = -2.0mm - repeat pocket pattern)
+G0 X13.1 Y13.1
+G1 Z-2.0 F300
+G1 X63.1 F800
+G1 Y63.1
+G1 X13.1
+G1 Y13.1
+G0 Z1.0
+
+(Layers 3-10 would repeat the same pattern at -3 through -10mm)
+
+M5
+G0 Z10.0
+G0 X0 Y0
+M30

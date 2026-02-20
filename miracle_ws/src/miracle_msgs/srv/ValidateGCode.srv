@@ -1,0 +1,7 @@
+string program_content
+string machine_id
+---
+bool is_valid
+string[] errors
+string[] warnings
+float64 estimated_duration_sec

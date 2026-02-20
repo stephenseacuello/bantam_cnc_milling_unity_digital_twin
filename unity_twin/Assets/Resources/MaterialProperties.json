@@ -1,0 +1,63 @@
+{
+    "materials": [
+        {
+            "name": "6061-T6 Aluminum",
+            "category": "workpiece",
+            "density_kg_m3": 2700,
+            "youngsModulus_GPa": 68.9,
+            "poissonsRatio": 0.33,
+            "yieldStrength_MPa": 276,
+            "ultimateTensileStrength_MPa": 310,
+            "hardnessBrinell": 95,
+            "thermalConductivity_W_mK": 167,
+            "specificHeat_J_kgK": 896,
+            "thermalExpansion_um_mC": 23.6,
+            "meltingPoint_C": 582,
+            "frictionCoeff_HSS": 0.4,
+            "frictionCoeff_Carbide": 0.35
+        },
+        {
+            "name": "Ti-6Al-4V",
+            "category": "workpiece",
+            "density_kg_m3": 4430,
+            "youngsModulus_GPa": 113.8,
+            "poissonsRatio": 0.342,
+            "yieldStrength_MPa": 880,
+            "ultimateTensileStrength_MPa": 950,
+            "hardnessBrinell": 334,
+            "thermalConductivity_W_mK": 6.7,
+            "specificHeat_J_kgK": 526,
+            "thermalExpansion_um_mC": 8.6,
+            "meltingPoint_C": 1660,
+            "frictionCoeff_Carbide": 0.5
+        },
+        {
+            "name": "HSS (M2)",
+            "category": "tool",
+            "density_kg_m3": 8100,
+            "youngsModulus_GPa": 210,
+            "poissonsRatio": 0.30,
+            "hardnessBrinell": 800,
+            "thermalConductivity_W_mK": 24,
+            "specificHeat_J_kgK": 460,
+            "thermalExpansion_um_mC": 11,
+            "meltingPoint_C": 1430,
+            "taylorN": 0.125,
+            "taylorC": 300
+        },
+        {
+            "name": "Tungsten Carbide (WC-Co)",
+            "category": "tool",
+            "density_kg_m3": 14500,
+            "youngsModulus_GPa": 620,
+            "poissonsRatio": 0.22,
+            "hardnessBrinell": 1600,
+            "thermalConductivity_W_mK": 84,
+            "specificHeat_J_kgK": 292,
+            "thermalExpansion_um_mC": 5.2,
+            "meltingPoint_C": 2870,
+            "taylorN": 0.25,
+            "taylorC": 400
+        }
+    ]
+}

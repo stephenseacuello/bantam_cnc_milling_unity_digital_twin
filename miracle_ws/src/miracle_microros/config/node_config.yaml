@@ -1,0 +1,169 @@
+# =============================================================================
+# MIRACLE micro-ROS Node Configuration
+# =============================================================================
+# Defines the micro-ROS node topology, including publishers, subscribers,
+# timers, and memory allocation limits for each MCU node. These values must
+# match the compile-time allocations in the firmware (micro-ROS static
+# memory pools are sized at build time).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Global micro-ROS Allocator Settings
+# ---------------------------------------------------------------------------
+# micro-ROS uses static memory allocation on MCUs. These limits define the
+# maximum number of ROS entities the allocator can support.
+global:
+  max_publishers: 6
+  max_subscribers: 2
+  max_timers: 4
+  max_services: 0                   # No services on MCU nodes (use topics)
+  max_clients: 0
+  max_nodes: 1                      # One node per MCU
+  max_guard_conditions: 2
+
+# ---------------------------------------------------------------------------
+# ESP32 Node: miracle_sensor_esp32
+# ---------------------------------------------------------------------------
+# Handles vibration (3-axis) and current draw acquisition over WiFi/UDP.
+miracle_sensor_esp32:
+  node_name: "miracle_sensor_esp32"
+  namespace: "/miracle"
+
+  # -- Publishers ----------------------------------------------------------
+  publishers:
+    raw_vibration:
+      topic: "/miracle/{machine_id}/raw_sensor/vibration"
+      msg_type: "sensor_msgs/msg/Float32MultiArray"
+      qos_profile: "sensor_data"    # Best-effort, volatile
+      description: >
+        3-axis vibration data from ADXL345 accelerometer.
+        Float32MultiArray with data[0..2] = X, Y, Z in g-force units.
+
+    raw_current:
+      topic: "/miracle/{machine_id}/raw_sensor/current"
+      msg_type: "std_msgs/msg/Float32"
+      qos_profile: "sensor_data"
+      description: >
+        Spindle motor current draw in Amperes from ACS712 sensor.
+
+    heartbeat:
+      topic: "/miracle/{machine_id}/heartbeat"
+      msg_type: "std_msgs/msg/UInt32"
+      qos_profile: "diagnostics"    # Reliable, transient-local
+      description: >
+        Monotonically increasing heartbeat counter published at 1 Hz.
+        Used for liveness monitoring by the MIRACLE health supervisor.
+
+  # -- Subscribers ---------------------------------------------------------
+  subscribers:
+    command:
+      topic: "/miracle/{machine_id}/command"
+      msg_type: "std_msgs/msg/String"
+      qos_profile: "command"        # Reliable, transient-local
+      description: >
+        Receives safety-critical commands:
+          - "ESTOP"     : Immediately halt all MCU output and enter safe state
+          - "CALIBRATE" : Trigger sensor zero-offset calibration routine
+          - "RESET"     : Clear error state and resume normal operation
+
+  # -- Timers --------------------------------------------------------------
+  timers:
+    heartbeat_timer:
+      period_ms: 1000               # 1 Hz heartbeat
+      callback: "heartbeat_timer_callback"
+      description: "Publishes heartbeat counter and checks agent connectivity."
+
+    vibration_publish_timer:
+      period_ms: 1                   # 1000 Hz (1 ms period)
+      callback: "vibration_timer_callback"
+      description: "Reads ADC channels for vibration X/Y/Z and publishes."
+
+    current_publish_timer:
+      period_ms: 2                   # 500 Hz (2 ms period)
+      callback: "current_timer_callback"
+      description: "Reads ADC channel for current draw and publishes."
+
+  # -- Memory Allocation ---------------------------------------------------
+  memory:
+    max_publishers: 3                # vibration, current, heartbeat
+    max_subscribers: 1               # command
+    max_timers: 3                    # heartbeat, vibration, current
+
+# ---------------------------------------------------------------------------
+# STM32 Node: miracle_sensor_stm32
+# ---------------------------------------------------------------------------
+# Handles temperature, acoustic emission, and coolant flow acquisition
+# over serial/UART transport.
+miracle_sensor_stm32:
+  node_name: "miracle_sensor_stm32"
+  namespace: "/miracle"
+
+  # -- Publishers ----------------------------------------------------------
+  publishers:
+    raw_temperature:
+      topic: "/miracle/{machine_id}/raw_sensor/temperature"
+      msg_type: "std_msgs/msg/Float32"
+      qos_profile: "sensor_data"
+      description: >
+        Workpiece/tool temperature in degrees Celsius.
+
+    raw_acoustic:
+      topic: "/miracle/{machine_id}/raw_sensor/acoustic"
+      msg_type: "std_msgs/msg/Float32"
+      qos_profile: "sensor_data"
+      description: >
+        Acoustic emission RMS level in dB. Raw 44.1 kHz signal is
+        downsampled on-MCU to 1000 Hz via windowed RMS computation.
+
+    raw_coolant_flow:
+      topic: "/miracle/{machine_id}/raw_sensor/coolant_flow"
+      msg_type: "std_msgs/msg/Float32"
+      qos_profile: "sensor_data"
+      description: >
+        Coolant flow rate in litres per minute.
+
+    heartbeat:
+      topic: "/miracle/{machine_id}/heartbeat_stm32"
+      msg_type: "std_msgs/msg/UInt32"
+      qos_profile: "diagnostics"
+      description: >
+        STM32 heartbeat counter at 1 Hz.
+
+  # -- Subscribers ---------------------------------------------------------
+  subscribers:
+    command:
+      topic: "/miracle/{machine_id}/command"
+      msg_type: "std_msgs/msg/String"
+      qos_profile: "command"
+      description: >
+        Receives safety-critical commands (ESTOP, CALIBRATE, RESET).
+
+  # -- Timers --------------------------------------------------------------
+  timers:
+    heartbeat_timer:
+      period_ms: 1000               # 1 Hz
+      callback: "heartbeat_timer_callback"
+      description: "Publishes heartbeat and checks serial link health."
+
+    temperature_publish_timer:
+      period_ms: 100                 # 10 Hz (100 ms period)
+      callback: "temperature_timer_callback"
+      description: "Reads temperature ADC and publishes."
+
+    acoustic_publish_timer:
+      period_ms: 1                   # 1000 Hz (1 ms period)
+      callback: "acoustic_timer_callback"
+      description: >
+        Triggers RMS computation over the acoustic sample buffer
+        (44 samples accumulated via DMA) and publishes the result.
+
+    coolant_flow_timer:
+      period_ms: 100                 # 10 Hz
+      callback: "coolant_flow_timer_callback"
+      description: "Reads coolant flow ADC and publishes."
+
+  # -- Memory Allocation ---------------------------------------------------
+  memory:
+    max_publishers: 4                # temperature, acoustic, coolant, heartbeat
+    max_subscribers: 1               # command
+    max_timers: 4                    # heartbeat, temperature, acoustic, coolant

@@ -1,0 +1,162 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements"
+         xsi="http://www.w3.org/2001/XMLSchema-instance"
+         engine="UnityEngine.UIElements"
+         editor="UnityEditor.UIElements"
+         noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd"
+         editor-extension-mode="False">
+
+    <!-- ============================================================
+         SimControls.uxml
+         MIRACLE Digital Twin - Simulation Control Panel
+         Controls for CNC milling simulation playback, speed, mode,
+         G-code loading, and robot status monitoring.
+         ============================================================ -->
+
+    <ui:VisualElement name="sim-controls-root" class="sim-controls-root"
+                      style="position: absolute; right: 16px; top: 16px;
+                             width: 320px; background-color: rgba(24, 24, 28, 0.94);
+                             border-radius: 8px; padding: 16px;
+                             border-left-width: 1px; border-right-width: 1px;
+                             border-top-width: 1px; border-bottom-width: 1px;
+                             border-color: rgba(255, 255, 255, 0.08);
+                             flex-direction: column;">
+
+        <!-- Panel Header -->
+        <ui:Label name="panel-title" text="Simulation Controls"
+                  style="font-size: 16px; color: rgb(230, 230, 235);
+                         -unity-font-style: bold; margin-bottom: 12px;
+                         padding-bottom: 8px;
+                         border-bottom-width: 1px;
+                         border-bottom-color: rgba(255, 255, 255, 0.1);" />
+
+        <!-- Sim Time Display -->
+        <ui:VisualElement name="sim-time-row"
+                          style="flex-direction: row; justify-content: space-between;
+                                 align-items: center; margin-bottom: 12px;
+                                 background-color: rgba(0, 0, 0, 0.3);
+                                 border-radius: 4px; padding: 8px;">
+            <ui:Label name="sim-time-label" text="Sim Time"
+                      style="font-size: 11px; color: rgba(200, 200, 210, 0.7);
+                             -unity-font-style: bold; letter-spacing: 1px;" />
+            <ui:Label name="sim-time-value" text="00:00:00.000"
+                      style="font-size: 18px; color: rgb(100, 220, 180);
+                             -unity-font-style: bold;
+                             -unity-text-align: middle-right;" />
+        </ui:VisualElement>
+
+        <!-- Transport Controls: Play / Pause / Stop -->
+        <ui:VisualElement name="transport-controls"
+                          style="flex-direction: row; justify-content: center;
+                                 margin-bottom: 14px;">
+            <ui:Button name="btn-play" text="Play"
+                       class="transport-btn"
+                       style="width: 80px; height: 36px; margin-right: 6px;
+                              background-color: rgb(46, 125, 50);
+                              color: white; border-radius: 4px;
+                              font-size: 13px; -unity-font-style: bold;
+                              border-width: 0;" />
+            <ui:Button name="btn-pause" text="Pause"
+                       class="transport-btn"
+                       style="width: 80px; height: 36px; margin-right: 6px;
+                              background-color: rgb(245, 165, 0);
+                              color: rgb(33, 33, 33); border-radius: 4px;
+                              font-size: 13px; -unity-font-style: bold;
+                              border-width: 0;" />
+            <ui:Button name="btn-stop" text="Stop"
+                       class="transport-btn"
+                       style="width: 80px; height: 36px;
+                              background-color: rgb(120, 120, 130);
+                              color: white; border-radius: 4px;
+                              font-size: 13px; -unity-font-style: bold;
+                              border-width: 0;" />
+        </ui:VisualElement>
+
+        <!-- Speed Slider -->
+        <ui:VisualElement name="speed-section" style="margin-bottom: 14px;">
+            <ui:VisualElement style="flex-direction: row; justify-content: space-between;
+                                     margin-bottom: 4px;">
+                <ui:Label name="speed-label" text="Playback Speed"
+                          style="font-size: 12px; color: rgba(200, 200, 210, 0.85);" />
+                <ui:Label name="speed-value-label" text="1.0x"
+                          style="font-size: 12px; color: rgb(100, 180, 255);
+                                 -unity-font-style: bold;" />
+            </ui:VisualElement>
+            <ui:Slider name="speed-slider" low-value="0.1" high-value="100" value="1"
+                       style="margin: 0;" />
+        </ui:VisualElement>
+
+        <!-- Simulation Mode Dropdown -->
+        <ui:VisualElement name="mode-section" style="margin-bottom: 14px;">
+            <ui:Label name="mode-label" text="Simulation Mode"
+                      style="font-size: 12px; color: rgba(200, 200, 210, 0.85);
+                             margin-bottom: 4px;" />
+            <ui:DropdownField name="mode-dropdown"
+                              choices="Real-Time,Accelerated,Replay"
+                              value="Real-Time"
+                              style="height: 30px;" />
+        </ui:VisualElement>
+
+        <!-- Load G-code Button -->
+        <ui:Button name="btn-load-gcode" text="Load G-code File"
+                   style="height: 34px; margin-bottom: 14px;
+                          background-color: rgb(55, 71, 133);
+                          color: white; border-radius: 4px;
+                          font-size: 13px; -unity-font-style: bold;
+                          border-width: 0;" />
+
+        <!-- Separator -->
+        <ui:VisualElement style="height: 1px; background-color: rgba(255, 255, 255, 0.08);
+                                 margin-bottom: 12px;" />
+
+        <!-- Robot Status Section -->
+        <ui:Label name="robot-status-header" text="Robot Status"
+                  style="font-size: 13px; color: rgb(230, 230, 235);
+                         -unity-font-style: bold; margin-bottom: 8px;" />
+
+        <!-- Niryo Ned2 Status -->
+        <ui:VisualElement name="ned2-status-row"
+                          style="flex-direction: row; justify-content: space-between;
+                                 align-items: center; margin-bottom: 6px;
+                                 padding: 6px 8px;
+                                 background-color: rgba(0, 0, 0, 0.2);
+                                 border-radius: 4px;">
+            <ui:Label name="ned2-name" text="Niryo Ned2"
+                      style="font-size: 12px; color: rgba(200, 200, 210, 0.85);" />
+            <ui:Label name="ned2-state" text="IDLE"
+                      style="font-size: 12px; color: rgb(100, 220, 180);
+                             -unity-font-style: bold;" />
+        </ui:VisualElement>
+
+        <!-- xArm6 Status -->
+        <ui:VisualElement name="xarm6-status-row"
+                          style="flex-direction: row; justify-content: space-between;
+                                 align-items: center; margin-bottom: 14px;
+                                 padding: 6px 8px;
+                                 background-color: rgba(0, 0, 0, 0.2);
+                                 border-radius: 4px;">
+            <ui:Label name="xarm6-name" text="UFactory xArm6"
+                      style="font-size: 12px; color: rgba(200, 200, 210, 0.85);" />
+            <ui:Label name="xarm6-state" text="IDLE"
+                      style="font-size: 12px; color: rgb(100, 220, 180);
+                             -unity-font-style: bold;" />
+        </ui:VisualElement>
+
+        <!-- Separator -->
+        <ui:VisualElement style="height: 1px; background-color: rgba(255, 255, 255, 0.08);
+                                 margin-bottom: 12px;" />
+
+        <!-- Emergency Stop Button -->
+        <ui:Button name="btn-estop" text="E-STOP"
+                   class="estop-btn"
+                   style="height: 56px;
+                          background-color: rgb(198, 40, 40);
+                          color: white; border-radius: 6px;
+                          font-size: 20px; -unity-font-style: bold;
+                          border-left-width: 3px; border-right-width: 3px;
+                          border-top-width: 3px; border-bottom-width: 3px;
+                          border-color: rgb(244, 67, 54);
+                          letter-spacing: 3px;" />
+
+    </ui:VisualElement>
+
+</ui:UXML>

@@ -1,0 +1,6 @@
+string machine_id
+string reason
+string requesting_node
+---
+bool success
+string message

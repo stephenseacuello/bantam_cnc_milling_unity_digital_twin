@@ -1,0 +1,419 @@
+# =============================================================================
+# MIRACLE System - Master Parameter Configuration
+# =============================================================================
+# Parameter names EXACTLY match each node's declare_and_validate_parameters().
+# Per-machine overrides live in cnc1.yaml, cnc2.yaml, cnc3.yaml.
+#
+# Top-level keys are bare node names (no namespace prefix) so that ROS2
+# matches them regardless of the runtime namespace assigned by the launch
+# file.  All node names in MIRACLE are globally unique.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# L1 - CNC Machine Control (miracle_cnc)
+# -----------------------------------------------------------------------------
+state_publisher:
+  ros__parameters:
+    machine_id: "cnc1"
+    publish_rate_hz: 50.0
+    simulation_mode: true
+
+gcode_executor:
+  ros__parameters:
+    machine_id: "cnc1"
+    max_feed_rate: 10000.0
+    max_spindle_speed: 24000.0
+    dry_run: false
+
+sensor_fusion:
+  ros__parameters:
+    machine_id: "cnc1"
+    sync_slop_sec: 0.01
+    imu_buffer_size: 100
+    current_buffer_size: 50
+    audio_buffer_size: 10
+
+local_watchdog:
+  ros__parameters:
+    machine_id: "cnc1"
+    max_spindle_load: 95.0
+    min_coolant_level: 10.0
+    state_timeout_sec: 2.0
+    check_rate_hz: 10.0
+
+spc_monitor:
+  ros__parameters:
+    machine_id: "cnc1"
+    window_size: 100
+    sigma_limit: 3.0
+    warmup_samples: 30
+
+rosbag_trigger:
+  ros__parameters:
+    machine_id: "cnc1"
+    output_directory: "/tmp/miracle_bags"
+    post_trigger_sec: 30.0
+    min_severity: 0.5
+
+# -----------------------------------------------------------------------------
+# L2 - SCADA / Supervisory (miracle_scada)
+# -----------------------------------------------------------------------------
+discovery_server:
+  ros__parameters:
+    max_devices: 100
+    initial_trust_score: 0.5
+
+traffic_manager:
+  ros__parameters:
+    bandwidth_limit_mbps: 100.0
+    monitor_interval_sec: 5.0
+    alert_threshold: 0.8
+
+alarm_manager:
+  ros__parameters:
+    max_active_alarms: 1000
+    escalation_timeout_sec: 300.0
+    history_size: 10000
+
+historian:
+  ros__parameters:
+    storage_path: "/tmp/miracle_history"
+    buffer_size: 1000
+    flush_interval_sec: 10.0
+    retention_days: 90
+
+hmi_bridge:
+  ros__parameters:
+    websocket_port: 9090
+    update_rate_hz: 10.0
+    enable_commands: false
+
+# -----------------------------------------------------------------------------
+# L2 - Protocol Bridges (miracle_bridges)
+# -----------------------------------------------------------------------------
+opc_ua_bridge:
+  ros__parameters:
+    server_url: "opc.tcp://localhost:4840"
+    machine_id: "cnc1"
+    poll_rate_hz: 10.0
+    namespace_index: 2
+    security_policy: "None"
+
+sparkplug_bridge:
+  ros__parameters:
+    mqtt_broker: "localhost"
+    mqtt_port: 1883
+    group_id: "MIRACLE"
+    edge_node_id: "CNCCell1"
+    machine_id: "cnc1"
+
+mtconnect_agent:
+  ros__parameters:
+    agent_url: "http://localhost:5000"
+    machine_id: "cnc1"
+    poll_rate_hz: 5.0
+    device_name: "CNC1"
+
+modbus_bridge:
+  ros__parameters:
+    host: "localhost"
+    port: 502
+    unit_id: 1
+    machine_id: "cnc1"
+    poll_rate_hz: 10.0
+
+kafka_bridge:
+  ros__parameters:
+    bootstrap_servers: "localhost:9092"
+    machine_id: "cnc1"
+    batch_size: 100
+    linger_ms: 100
+
+# -----------------------------------------------------------------------------
+# L3 - MES / Orchestration (miracle_mes)
+# -----------------------------------------------------------------------------
+job_scheduler:
+  ros__parameters:
+    max_queue_size: 1000
+    scheduling_interval_sec: 1.0
+    enable_auction: false
+
+fleet_manager:
+  ros__parameters:
+    fleet_size: 3
+    status_publish_rate_hz: 1.0
+
+digital_thread:
+  ros__parameters:
+    storage_path: "/tmp/miracle_thread"
+    max_chain_memory: 10000
+
+resource_manager:
+  ros__parameters:
+    tool_inventory_size: 50
+    low_tool_life_threshold: 10.0
+    check_interval_sec: 30.0
+
+oee_calculator:
+  ros__parameters:
+    calculation_interval_sec: 5.0
+    shift_duration_hours: 8.0
+    ideal_cycle_time_sec: 60.0
+
+# -----------------------------------------------------------------------------
+# L3 - Digital Twin (miracle_twin)
+# -----------------------------------------------------------------------------
+sync_engine:
+  ros__parameters:
+    sync_rate_hz: 50.0
+    max_drift_threshold: 1.0
+    interpolation_factor: 0.8
+
+gazebo_bridge:
+  ros__parameters:
+    machine_id: "cnc1"
+    gazebo_model_name: "cnc_machine_1"
+    update_rate_hz: 30.0
+
+prediction_runner:
+  ros__parameters:
+    max_concurrent_predictions: 5
+    default_horizon_hours: 24.0
+
+scenario_manager:
+  ros__parameters:
+    max_scenarios: 100
+    auto_compare: true
+
+# -----------------------------------------------------------------------------
+# L3 - AI / ML (miracle_ai)
+# -----------------------------------------------------------------------------
+anomaly_detector:
+  ros__parameters:
+    machine_id: "cnc1"
+    isolation_forest_contamination: 0.05
+    autoencoder_threshold: 0.5
+    statistical_sigma: 3.0
+    ensemble_threshold: 0.6
+    warmup_samples: 50
+
+phm_predictor:
+  ros__parameters:
+    machine_id: "cnc1"
+    prediction_interval_sec: 60.0
+    health_window_size: 100
+    degradation_model: "exponential"
+
+tool_wear_estimator:
+  ros__parameters:
+    machine_id: "cnc1"
+    tool_id: "T001"
+    max_tool_life_minutes: 120.0
+    estimation_interval_sec: 10.0
+    wear_rate_factor: 1.0
+
+chatter_detector:
+  ros__parameters:
+    machine_id: "cnc1"
+    chatter_freq_min_hz: 500.0
+    chatter_freq_max_hz: 5000.0
+    energy_ratio_threshold: 2.0
+
+model_manager:
+  ros__parameters:
+    model_directory: "/tmp/miracle_models"
+    max_models_loaded: 10
+    auto_switch_threshold: 0.05
+
+# -----------------------------------------------------------------------------
+# L4 - Security (miracle_security)
+# -----------------------------------------------------------------------------
+intrusion_detection:
+  ros__parameters:
+    scan_interval_sec: 5.0
+    max_msg_rate_per_node: 1000
+    unknown_node_alert: true
+
+attestation_verifier:
+  ros__parameters:
+    attestation_interval_sec: 300.0
+    trust_decay_rate: 0.01
+    min_trust_threshold: 0.3
+
+threat_response:
+  ros__parameters:
+    auto_isolate_critical: true
+    response_delay_sec: 5.0
+    max_active_threats: 100
+
+access_enforcer:
+  ros__parameters:
+    default_policy: "deny"
+    audit_all_access: false
+
+audit_logger:
+  ros__parameters:
+    log_directory: "/tmp/miracle_audit"
+    max_entries_per_file: 10000
+    enable_hash_chain: true
+
+sros2_manager:
+  ros__parameters:
+    keystore_path: "/tmp/miracle_keystore"
+    auto_generate: false
+    policy_directory: ""
+
+# -----------------------------------------------------------------------------
+# L4 - Resiliency (miracle_resiliency)
+# -----------------------------------------------------------------------------
+supervisor_root:
+  ros__parameters:
+    strategy: "one_for_one"
+    max_restarts: 5
+    restart_window_sec: 300.0
+
+heartbeat_aggregator:
+  ros__parameters:
+    critical_timeout_sec: 0.5
+    high_timeout_sec: 1.0
+    medium_timeout_sec: 5.0
+    low_timeout_sec: 30.0
+    check_interval_sec: 0.1
+    health_publish_interval_sec: 1.0
+
+failover_coordinator:
+  ros__parameters:
+    failover_timeout_sec: 10.0
+    auto_failover: true
+
+checkpoint_manager:
+  ros__parameters:
+    checkpoint_directory: "/tmp/miracle_checkpoints"
+    checkpoint_interval_sec: 60.0
+    max_checkpoints: 50
+
+recovery_orchestrator:
+  ros__parameters:
+    max_concurrent_recoveries: 5
+    recovery_timeout_sec: 30.0
+
+chaos_injector:
+  ros__parameters:
+    enabled: false
+    max_concurrent_faults: 3
+
+# -----------------------------------------------------------------------------
+# L5 - Cognitive (miracle_cognitive)
+# -----------------------------------------------------------------------------
+
+# Knowledge Management
+knowledge_graph:
+  ros__parameters:
+    max_triples: 100000
+    persist_path: "/tmp/miracle_kg"
+
+ontology_manager:
+  ros__parameters:
+    ontology_file: ""
+
+reasoning_engine:
+  ros__parameters:
+    max_inference_depth: 10
+    reasoning_interval_sec: 5.0
+
+causal_inference:
+  ros__parameters:
+    min_evidence: 3
+    analysis_interval_sec: 30.0
+
+# Planning
+goal_manager:
+  ros__parameters:
+    max_goals: 50
+    evaluation_interval_sec: 30.0
+
+behavior_tree_executor:
+  ros__parameters:
+    tick_rate_hz: 10.0
+    tree_library_path: ""
+
+htn_planner:
+  ros__parameters:
+    max_plan_depth: 20
+    max_planning_time_sec: 5.0
+
+goap_planner:
+  ros__parameters:
+    max_search_nodes: 10000
+
+# Multi-Agent
+agent_registry:
+  ros__parameters:
+    max_agents: 50
+
+task_allocator:
+  ros__parameters:
+    allocation_strategy: "auction"
+    bid_timeout_sec: 5.0
+
+auction_manager:
+  ros__parameters:
+    auction_duration_sec: 10.0
+    min_bidders: 1
+
+coalition_former:
+  ros__parameters:
+    max_coalition_size: 5
+
+consensus_protocol:
+  ros__parameters:
+    consensus_timeout_sec: 10.0
+    quorum_fraction: 0.67
+
+# Learning
+rl_optimizer:
+  ros__parameters:
+    learning_rate: 0.01
+    discount_factor: 0.99
+    exploration_rate: 0.1
+    state_dim: 10
+    action_dim: 5
+
+federated_coordinator:
+  ros__parameters:
+    min_participants: 2
+    aggregation_strategy: "FedAvg"
+
+# Self-X Properties
+self_optimizer:
+  ros__parameters:
+    optimization_interval_sec: 60.0
+    min_improvement: 0.01
+
+self_healer:
+  ros__parameters:
+    healing_threshold: 0.7
+    max_healing_attempts: 3
+
+self_configurer:
+  ros__parameters:
+    auto_discover: true
+    config_template_path: ""
+
+self_protector:
+  ros__parameters:
+    threat_level: "NORMAL"
+
+# Human Interface
+nlp_interface:
+  ros__parameters:
+    confidence_threshold: 0.7
+
+explanation_generator:
+  ros__parameters:
+    detail_level: "medium"
+
+human_escalation:
+  ros__parameters:
+    escalation_timeout_sec: 300.0
+    auto_approve_low_risk: false

@@ -1,0 +1,5 @@
+string device_id
+string challenge_nonce
+---
+bool success
+miracle_msgs/AttestationReport report

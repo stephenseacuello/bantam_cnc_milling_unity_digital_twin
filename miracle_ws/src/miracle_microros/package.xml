@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>miracle_microros</name>
+  <version>0.1.0</version>
+  <description>
+    Firmware configurations and transport setup for micro-ROS MCU bridges
+    (ESP32, STM32) in the MIRACLE manufacturing digital twin system.
+    Provides sensor acquisition firmware, transport layer configuration,
+    and micro-ROS agent integration for real-time CNC machine monitoring.
+  </description>
+
+  <maintainer email="miracle-dev@banatam.com">MIRACLE Dev Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <author email="miracle-dev@banatam.com">MIRACLE Dev Team</author>
+
+  <url type="website">https://github.com/banatam/miracle_cnc_digital_twin</url>
+  <url type="repository">https://github.com/banatam/miracle_cnc_digital_twin</url>
+  <url type="bugtracker">https://github.com/banatam/miracle_cnc_digital_twin/issues</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- micro-ROS toolchain and agent -->
+  <exec_depend>micro_ros_setup</exec_depend>
+  <exec_depend>micro_ros_agent</exec_depend>
+
+  <!-- ROS 2 message dependencies for sensor data and commands -->
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>miracle_msgs</depend>
+
+  <!-- Testing dependencies -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

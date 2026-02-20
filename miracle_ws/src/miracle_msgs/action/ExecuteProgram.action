@@ -1,0 +1,20 @@
+# Goal
+string machine_id
+string program_name
+string program_content
+float64[] override_parameters
+---
+# Result
+bool success
+string message
+float64 total_time_sec
+uint32 lines_executed
+float64[] quality_metrics
+---
+# Feedback
+uint32 current_line
+uint32 total_lines
+float64 progress
+string current_operation
+float64 elapsed_sec
+float64 estimated_remaining_sec

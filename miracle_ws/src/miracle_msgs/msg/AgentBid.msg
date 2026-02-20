@@ -1,0 +1,8 @@
+builtin_interfaces/Time timestamp
+string auction_id
+string agent_id
+float64 proposed_cost
+float64 proposed_completion_time
+float64 confidence
+float64 current_load
+string[] capabilities_offered

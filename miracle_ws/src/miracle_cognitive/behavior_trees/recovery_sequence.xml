@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<BehaviorTree ID="RecoverySequence">
+  <Sequence name="recover">
+    <Action ID="SaveCurrentState"/>
+    <Action ID="SafeStop"/>
+    <Fallback name="recovery_strategy">
+      <Sequence name="quick_recovery">
+        <Condition ID="IsQuickRecoverable"/>
+        <Action ID="RestartComponent"/>
+        <Action ID="VerifyRecovery"/>
+      </Sequence>
+      <Sequence name="checkpoint_recovery">
+        <Action ID="LoadCheckpoint"/>
+        <Action ID="RestoreState"/>
+        <Action ID="VerifyRecovery"/>
+      </Sequence>
+      <Sequence name="full_restart">
+        <Action ID="FullSystemRestart"/>
+        <Action ID="Recalibrate"/>
+        <Action ID="VerifyRecovery"/>
+      </Sequence>
+    </Fallback>
+    <Action ID="LogRecovery"/>
+  </Sequence>
+</BehaviorTree>

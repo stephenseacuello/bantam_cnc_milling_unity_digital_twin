@@ -1,0 +1,8 @@
+string natural_language_input
+string context_json
+---
+bool understood
+string interpreted_action
+string[] parameters
+float64 confidence
+string clarification_question

@@ -1,0 +1,10 @@
+string machine_id
+string job_id
+string optimization_target
+float64[] current_parameters
+string[] parameter_names
+---
+bool success
+float64[] optimized_parameters
+float64 expected_improvement
+string reasoning

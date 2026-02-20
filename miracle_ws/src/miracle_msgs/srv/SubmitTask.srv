@@ -1,0 +1,10 @@
+string task_type
+string job_id
+string material
+float64 complexity
+string priority
+string[] required_capabilities
+---
+bool accepted
+string auction_id
+string message

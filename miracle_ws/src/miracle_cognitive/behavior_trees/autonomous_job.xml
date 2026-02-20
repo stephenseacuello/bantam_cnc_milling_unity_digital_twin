@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<BehaviorTree ID="AutonomousJob">
+  <Fallback name="root">
+    <Sequence name="NormalOperation">
+      <Condition ID="CheckMachineReady"/>
+      <Action ID="ValidateJob"/>
+      <Action ID="OptimizeParameters"/>
+      <Parallel threshold="3">
+        <Action ID="ExecuteGCode"/>
+        <Action ID="MonitorQuality"/>
+        <Action ID="MonitorHealth"/>
+      </Parallel>
+      <Action ID="CompleteJob"/>
+    </Sequence>
+    <Sequence name="AnomalyResponse">
+      <Condition ID="DetectAnomaly"/>
+      <Action ID="ClassifyAnomaly"/>
+      <Fallback name="SelectResponse">
+        <Sequence name="AutoRecover">
+          <Condition ID="IsRecoverable"/>
+          <Action ID="ExecuteRecovery"/>
+        </Sequence>
+        <Action ID="RequestHumanHelp"/>
+      </Fallback>
+    </Sequence>
+    <Sequence name="SafetyFallback">
+      <Action ID="TriggerEStop"/>
+      <Action ID="AlertOperator"/>
+    </Sequence>
+  </Fallback>
+</BehaviorTree>

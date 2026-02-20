@@ -1,0 +1,403 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &1
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d01270efd3285cd4a9462f3de584e923, type: 3}
+  m_Name: ChipFormation
+  m_EditorClassIdentifier:
+  m_Category: MIRACLE/CNC
+  m_UIInfos:
+    m_GraphVersion: 4
+    m_UIVersion: 1
+  m_VisualEffectResource: {fileID: 2}
+--- !u!114 &2
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7d4c867f6b72b714dbb5fd1780afe208, type: 3}
+  m_Name: ChipFormation
+  m_EditorClassIdentifier:
+  m_Infos:
+    m_Expressions:
+      m_Expressions: []
+      m_ExpressionIndex: []
+    m_PropertySheet:
+      m_Float:
+        m_Array:
+        - m_ExpressionIndex: 0
+          m_Value: 0
+        - m_ExpressionIndex: 1
+          m_Value: 0.5
+        - m_ExpressionIndex: 2
+          m_Value: 2.0
+        - m_ExpressionIndex: 3
+          m_Value: 0.0005
+        - m_ExpressionIndex: 4
+          m_Value: 0.002
+      m_Vector2:
+        m_Array: []
+      m_Vector3:
+        m_Array:
+        - m_ExpressionIndex: 5
+          m_Value: {x: 0, y: 0, z: 0}
+      m_Vector4:
+        m_Array:
+        - m_ExpressionIndex: 6
+          m_Value: {x: 0.75, y: 0.75, z: 0.78, w: 1}
+      m_Int:
+        m_Array: []
+      m_Uint:
+        m_Array: []
+      m_Texture2D:
+        m_Array: []
+      m_Texture3D:
+        m_Array: []
+      m_TextureCube:
+        m_Array: []
+      m_Bool:
+        m_Array: []
+      m_Matrix4x4:
+        m_Array: []
+      m_AnimationCurve:
+        m_Array: []
+      m_Gradient:
+        m_Array: []
+      m_NamedExpressions:
+      - m_Name: SpawnRate
+        m_ExpressionIndex: 0
+        m_Type: 1
+      - m_Name: LifetimeMin
+        m_ExpressionIndex: 1
+        m_Type: 1
+      - m_Name: LifetimeMax
+        m_ExpressionIndex: 2
+        m_Type: 1
+      - m_Name: SizeMin
+        m_ExpressionIndex: 3
+        m_Type: 1
+      - m_Name: SizeMax
+        m_ExpressionIndex: 4
+        m_Type: 1
+      - m_Name: ChipVelocity
+        m_ExpressionIndex: 5
+        m_Type: 5
+      - m_Name: ChipColor
+        m_ExpressionIndex: 6
+        m_Type: 6
+    m_ExposedExpressions:
+    - m_Name: SpawnRate
+      m_ExpressionIndex: 0
+      m_Type: 1
+    - m_Name: ChipVelocity
+      m_ExpressionIndex: 5
+      m_Type: 5
+    - m_Name: ChipColor
+      m_ExpressionIndex: 6
+      m_Type: 6
+    - m_Name: SpawnPosition
+      m_ExpressionIndex: 7
+      m_Type: 5
+    - m_Name: ChipDirection
+      m_ExpressionIndex: 8
+      m_Type: 5
+    - m_Name: ChipSize
+      m_ExpressionIndex: 3
+      m_Type: 1
+    - m_Name: CurlRadius
+      m_ExpressionIndex: 9
+      m_Type: 1
+  m_Graph:
+    m_UIInfos:
+      m_GraphVersion: 4
+    m_Contexts:
+    # ===================================================================
+    # SPAWN CONTEXT
+    # Spawn rate driven externally by "SpawnRate" property.
+    # ===================================================================
+    - m_Type: 0
+      m_Label: Spawn
+      m_Data: {fileID: 0}
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: SpawnRate
+        m_Label: Constant Spawn Rate
+        m_Data:
+          rate:
+            m_Type: Property
+            m_PropertyName: SpawnRate
+            m_DefaultValue: 0
+      m_Position: {x: -200, y: -400}
+    # ===================================================================
+    # INITIALIZE CONTEXT
+    # Sets lifetime, size, velocity, position, color, and gravity.
+    # ===================================================================
+    - m_Type: 1
+      m_Label: Initialize Particle
+      m_Data: {fileID: 0}
+      m_Capacity: 10000
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: SetAttributeFromCurve
+        m_Label: Set Lifetime Random (Uniform)
+        m_Data:
+          attribute: lifetime
+          channelCount: 1
+          mode: Random
+          min:
+            m_Type: Property
+            m_PropertyName: LifetimeMin
+            m_DefaultValue: 0.5
+          max:
+            m_Type: Property
+            m_PropertyName: LifetimeMax
+            m_DefaultValue: 2.0
+      - m_Type: SetAttribute
+        m_Label: Set Size Random (Uniform)
+        m_Data:
+          attribute: size
+          mode: Random
+          min:
+            m_Type: Property
+            m_PropertyName: SizeMin
+            m_DefaultValue: 0.0005
+          max:
+            m_Type: Property
+            m_PropertyName: SizeMax
+            m_DefaultValue: 0.002
+          comment: "Size range 0.5mm to 2mm"
+      - m_Type: SetAttribute
+        m_Label: Set Position
+        m_Data:
+          attribute: position
+          source:
+            m_Type: Property
+            m_PropertyName: SpawnPosition
+            m_DefaultValue: {x: 0, y: 0, z: 0}
+      - m_Type: SetAttribute
+        m_Label: Set Velocity from ChipVelocity
+        m_Data:
+          attribute: velocity
+          source:
+            m_Type: Property
+            m_PropertyName: ChipVelocity
+            m_DefaultValue: {x: 0, y: 0.5, z: 0}
+          comment: "Initial velocity driven by external ChipVelocity Vector3"
+      - m_Type: SetAttribute
+        m_Label: Set Color (Aluminum Silver/Gray)
+        m_Data:
+          attribute: color
+          source:
+            m_Type: Property
+            m_PropertyName: ChipColor
+            m_DefaultValue: {r: 0.75, g: 0.75, b: 0.78, a: 1.0}
+          comment: "Silver/gray aluminum chip color"
+      - m_Type: SetAttribute
+        m_Label: Set Angular Velocity (Chip Curl)
+        m_Data:
+          attribute: angularVelocity
+          mode: Random
+          min: {x: -180, y: -90, z: -180}
+          max: {x: 180, y: 90, z: 180}
+          comment: "Random rotation to simulate chip curling"
+      m_Position: {x: -200, y: -200}
+    # ===================================================================
+    # UPDATE CONTEXT
+    # Applies gravity, turbulence noise, and age-based operations.
+    # ===================================================================
+    - m_Type: 2
+      m_Label: Update Particle
+      m_Data: {fileID: 0}
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: Gravity
+        m_Label: Gravity
+        m_Data:
+          force: {x: 0, y: -9.81, z: 0}
+          comment: "Standard gravity pulls chips downward"
+      - m_Type: TurbulenceNoise
+        m_Label: Turbulence
+        m_Data:
+          intensity: 0.8
+          drag: 0.1
+          frequency: 2.0
+          octaves: 3
+          roughness: 0.5
+          lacunarity: 2.0
+          noiseType: Perlin
+          comment: "Turbulence simulates air currents disturbing chips"
+      - m_Type: LinearDrag
+        m_Label: Linear Drag
+        m_Data:
+          dragCoefficient: 0.5
+          comment: "Air resistance on small metal chips"
+      - m_Type: Age
+        m_Label: Age Particles
+        m_Data: {}
+      m_Position: {x: -200, y: 0}
+    # ===================================================================
+    # OUTPUT CONTEXT
+    # Renders chips as mesh particles (chip curl mesh).
+    # ===================================================================
+    - m_Type: 3
+      m_Label: Output Particle Mesh
+      m_Data: {fileID: 0}
+      m_InputSlots: []
+      m_OutputSlots: []
+      m_Blocks:
+      - m_Type: OutputMesh
+        m_Label: Chip Curl Mesh Output
+        m_Data:
+          meshRenderingType: Mesh
+          castShadows: 1
+          receiveShadows: 1
+          sortMode: None
+          blendMode: Opaque
+          cullMode: Back
+          useAlphaClipping: 0
+          comment: >
+            Output as mesh particles. Assign a chip curl mesh in the inspector
+            to represent curled metal chip geometry. Falls back to a small quad
+            if no custom mesh is assigned.
+          # Mesh reference - assign in Unity Inspector to a chip curl mesh asset
+          mesh: {fileID: 0}
+          # Material override: use default lit VFX material with metallic properties
+          materialOverride:
+            baseColor:
+              m_Type: Attribute
+              m_AttributeName: color
+            metallic: 0.85
+            smoothness: 0.6
+            comment: "High metallic value for aluminum chip appearance"
+      - m_Type: SetAttribute
+        m_Label: Orient Along Velocity
+        m_Data:
+          attribute: axisX
+          mode: AlongVelocity
+          comment: "Chips orient along their travel direction"
+      - m_Type: SetAttribute
+        m_Label: Alpha Over Life Fade
+        m_Data:
+          attribute: alpha
+          mode: OverLife
+          curve:
+            serializedVersion: 2
+            m_Curve:
+            - serializedVersion: 3
+              time: 0
+              value: 1
+              inSlope: 0
+              outSlope: 0
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 0.8
+              value: 1
+              inSlope: 0
+              outSlope: -3
+              tangentMode: 0
+            - serializedVersion: 3
+              time: 1
+              value: 0
+              inSlope: -3
+              outSlope: 0
+              tangentMode: 0
+            m_PreInfinity: 2
+            m_PostInfinity: 2
+          comment: "Fade out in the last 20% of lifetime"
+      m_Position: {x: -200, y: 200}
+    # ===================================================================
+    # GRAPH PROPERTIES (Exposed to C# via VisualEffect component)
+    # ===================================================================
+    m_Properties:
+    - m_Name: SpawnRate
+      m_Type: Float
+      m_DefaultValue: 0
+      m_Exposed: 1
+      m_Tooltip: "Particles per second. Driven externally by ChipParticleController based on MRR."
+      m_Min: 0
+      m_Max: 10000
+    - m_Name: ChipVelocity
+      m_Type: Vector3
+      m_DefaultValue: {x: 0, y: 0.5, z: 0}
+      m_Exposed: 1
+      m_Tooltip: "Initial velocity direction and magnitude for chip ejection."
+    - m_Name: SpawnPosition
+      m_Type: Vector3
+      m_DefaultValue: {x: 0, y: 0, z: 0}
+      m_Exposed: 1
+      m_Tooltip: "World-space position where chips are emitted (tool tip contact point)."
+    - m_Name: ChipDirection
+      m_Type: Vector3
+      m_DefaultValue: {x: 0, y: 1, z: 0}
+      m_Exposed: 1
+      m_Tooltip: "Primary ejection direction for chips. Opposite of tool feed direction."
+    - m_Name: ChipColor
+      m_Type: Vector4
+      m_DefaultValue: {x: 0.75, y: 0.75, z: 0.78, w: 1.0}
+      m_Exposed: 1
+      m_Tooltip: "Base color of chip particles. Default is aluminum silver/gray (RGB 0.75, 0.75, 0.78)."
+    - m_Name: ChipSize
+      m_Type: Float
+      m_DefaultValue: 0.001
+      m_Exposed: 1
+      m_Tooltip: "Base particle size in meters. Range 0.0005 (0.5mm) to 0.002 (2mm)."
+      m_Min: 0.0001
+      m_Max: 0.01
+    - m_Name: CurlRadius
+      m_Type: Float
+      m_DefaultValue: 0.002
+      m_Exposed: 1
+      m_Tooltip: "Chip curl radius in meters. Affects angular velocity at spawn."
+      m_Min: 0.0001
+      m_Max: 0.05
+    - m_Name: LifetimeMin
+      m_Type: Float
+      m_DefaultValue: 0.5
+      m_Exposed: 0
+      m_Tooltip: "Minimum particle lifetime in seconds."
+      m_Min: 0.1
+      m_Max: 5.0
+    - m_Name: LifetimeMax
+      m_Type: Float
+      m_DefaultValue: 2.0
+      m_Exposed: 0
+      m_Tooltip: "Maximum particle lifetime in seconds."
+      m_Min: 0.1
+      m_Max: 10.0
+    - m_Name: SizeMin
+      m_Type: Float
+      m_DefaultValue: 0.0005
+      m_Exposed: 0
+      m_Tooltip: "Minimum particle size in meters (0.5mm)."
+    - m_Name: SizeMax
+      m_Type: Float
+      m_DefaultValue: 0.002
+      m_Exposed: 0
+      m_Tooltip: "Maximum particle size in meters (2mm)."
+    # ===================================================================
+    # SYSTEM SETTINGS
+    # ===================================================================
+    m_SystemSettings:
+      capacity: 10000
+      stripCapacity: 1
+      particlePerStripCount: 1
+      boundsMode: Recorded
+      customBounds:
+        m_Center: {x: 0, y: 0, z: 0}
+        m_Extent: {x: 1, y: 1, z: 1}
+      preWarmDeltaTime: 0.05
+      preWarmStepCount: 0

@@ -1,0 +1,122 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements"
+         xsi="http://www.w3.org/2001/XMLSchema-instance"
+         engine="UnityEngine.UIElements"
+         editor="UnityEditor.UIElements"
+         noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd"
+         editor-extension-mode="False">
+
+    <!-- ============================================================
+         AlertToast.uxml
+         MIRACLE Digital Twin - Alert Notification Toast Popup
+         Displays severity-based alerts with icon, title, description,
+         timestamp, and dismiss action. Supports slide-in animation.
+         ============================================================ -->
+
+    <!-- Toast Container - anchored to bottom-right, supports slide-in -->
+    <ui:VisualElement name="alert-toast-root" class="alert-toast-root toast-hidden"
+                      style="position: absolute; right: 16px; bottom: 16px;
+                             width: 380px;
+                             flex-direction: column;
+                             translate: 400px 0;
+                             transition-property: translate, opacity;
+                             transition-duration: 350ms, 250ms;
+                             transition-timing-function: ease-out, ease-out;
+                             opacity: 0;">
+
+        <!-- Toast Card -->
+        <ui:VisualElement name="alert-toast-card" class="alert-toast-card"
+                          style="flex-direction: row; align-items: flex-start;
+                                 background-color: rgba(30, 30, 36, 0.96);
+                                 border-radius: 8px; padding: 14px 16px;
+                                 border-left-width: 4px; border-right-width: 1px;
+                                 border-top-width: 1px; border-bottom-width: 1px;
+                                 border-left-color: rgb(244, 67, 54);
+                                 border-right-color: rgba(255, 255, 255, 0.06);
+                                 border-top-color: rgba(255, 255, 255, 0.06);
+                                 border-bottom-color: rgba(255, 255, 255, 0.06);">
+
+            <!-- Severity Icon Area -->
+            <ui:VisualElement name="severity-icon-container"
+                              style="width: 36px; height: 36px; min-width: 36px;
+                                     margin-right: 12px; margin-top: 2px;
+                                     align-items: center; justify-content: center;
+                                     background-color: rgba(244, 67, 54, 0.15);
+                                     border-radius: 18px;">
+                <ui:Label name="severity-icon" text="!"
+                          style="font-size: 18px; color: rgb(244, 67, 54);
+                                 -unity-font-style: bold;
+                                 -unity-text-align: middle-center;" />
+            </ui:VisualElement>
+
+            <!-- Text Content Area -->
+            <ui:VisualElement name="alert-content"
+                              style="flex-grow: 1; flex-shrink: 1;
+                                     flex-direction: column;">
+
+                <!-- Title Row with Dismiss Button -->
+                <ui:VisualElement name="title-row"
+                                  style="flex-direction: row; justify-content: space-between;
+                                         align-items: flex-start; margin-bottom: 4px;">
+
+                    <ui:Label name="alert-title" text="Alert Title"
+                              style="font-size: 14px; color: rgb(240, 240, 245);
+                                     -unity-font-style: bold;
+                                     flex-grow: 1; flex-shrink: 1;
+                                     white-space: normal;
+                                     margin-right: 8px;" />
+
+                    <!-- Dismiss Button -->
+                    <ui:Button name="btn-dismiss" text="x"
+                               class="dismiss-btn"
+                               style="width: 24px; height: 24px; min-width: 24px;
+                                      background-color: rgba(255, 255, 255, 0.05);
+                                      color: rgba(200, 200, 210, 0.6);
+                                      border-radius: 12px; border-width: 0;
+                                      font-size: 12px; padding: 0;
+                                      -unity-text-align: middle-center;
+                                      flex-shrink: 0;" />
+                </ui:VisualElement>
+
+                <!-- Alert Description -->
+                <ui:Label name="alert-description"
+                          text="Detailed description of the alert condition goes here."
+                          style="font-size: 12px; color: rgba(200, 200, 210, 0.75);
+                                 white-space: normal; margin-bottom: 8px;" />
+
+                <!-- Timestamp -->
+                <ui:Label name="alert-timestamp" text="12:34:56.789"
+                          style="font-size: 10px; color: rgba(160, 160, 170, 0.5);
+                                 -unity-text-align: lower-right;" />
+
+            </ui:VisualElement>
+
+        </ui:VisualElement>
+
+    </ui:VisualElement>
+
+    <!--
+        USS Animation Classes (apply via C# to trigger transitions):
+
+        .toast-hidden   => translate: 400px 0; opacity: 0;
+        .toast-visible  => translate: 0 0;     opacity: 1;
+
+        .severity-error   => border-left-color: rgb(244, 67, 54);   icon bg: rgba(244,67,54,0.15);   icon color: rgb(244,67,54);
+        .severity-warning => border-left-color: rgb(255, 167, 38);  icon bg: rgba(255,167,38,0.15);  icon color: rgb(255,167,38);
+        .severity-info    => border-left-color: rgb(66, 165, 245);  icon bg: rgba(66,165,245,0.15);  icon color: rgb(66,165,245);
+        .severity-success => border-left-color: rgb(102, 187, 106); icon bg: rgba(102,187,106,0.15); icon color: rgb(102,187,106);
+
+        To show the toast from C#:
+            var root = toastDocument.rootVisualElement.Q("alert-toast-root");
+            root.RemoveFromClassList("toast-hidden");
+            root.AddToClassList("toast-visible");
+            root.style.translate = new Translate(0, 0);
+            root.style.opacity = 1f;
+
+        To dismiss:
+            root.RemoveFromClassList("toast-visible");
+            root.AddToClassList("toast-hidden");
+            root.style.translate = new Translate(400, 0);
+            root.style.opacity = 0f;
+    -->
+
+</ui:UXML>

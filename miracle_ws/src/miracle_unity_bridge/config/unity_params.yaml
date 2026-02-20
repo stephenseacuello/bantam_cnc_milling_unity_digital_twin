@@ -1,0 +1,23 @@
+# Unity Bridge Parameters
+# Configuration for the MIRACLE Unity Digital Twin bridge
+
+unity_endpoint_config:
+  ros__parameters:
+    # TCP connection settings
+    tcp_ip: "0.0.0.0"
+    tcp_port: 10000
+
+    # Connection keepalive timeout (seconds)
+    keepalive_timeout: 10.0
+
+    # Logging level
+    log_level: "info"
+
+    # Topic throttle rates (Hz) - 0 = no throttle
+    # These limit the rate at which high-frequency topics are forwarded to Unity
+    throttle_rates:
+      machine_state: 30.0      # 30 Hz for smooth visualization
+      sensor_data: 10.0        # 10 Hz for sensor display
+      heartbeat: 1.0           # 1 Hz for heartbeat display
+      system_kpis: 2.0         # 2 Hz for KPI updates
+      twin_sync_status: 10.0   # 10 Hz for sync monitoring

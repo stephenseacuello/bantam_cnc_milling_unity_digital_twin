@@ -1,0 +1,9 @@
+builtin_interfaces/Time timestamp
+string machine_id
+string anomaly_type
+float64 confidence
+float64 severity
+string[] contributing_factors
+float64[] feature_contributions
+string recommended_action
+bool requires_immediate_stop

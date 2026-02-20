@@ -1,0 +1,10 @@
+builtin_interfaces/Time timestamp
+string auction_id
+string task_type
+string job_id
+string material
+float64 complexity
+builtin_interfaces/Time deadline
+string[] required_capabilities
+float64 estimated_duration
+string priority

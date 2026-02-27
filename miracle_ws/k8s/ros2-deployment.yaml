@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ros2-miracle
+  namespace: miracle-system
+  labels:
+    app: ros2-miracle
+    app.kubernetes.io/part-of: miracle
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ros2-miracle
+  template:
+    metadata:
+      labels:
+        app: ros2-miracle
+    spec:
+      containers:
+        - name: ros2-miracle
+          image: miracle/ros2:latest
+          ports:
+            - containerPort: 10000
+              name: ros-tcp-bridge
+              protocol: TCP
+          env:
+            - name: ROS_DOMAIN_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: miracle-config
+                  key: ROS_DOMAIN_ID
+            - name: ROS_LOG_DIR
+              value: /miracle_ws/log
+            - name: FASTRTPS_DEFAULT_PROFILES_FILE
+              value: /config/fastdds_profile.xml
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - "ros2 topic list > /dev/null 2>&1"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - "ros2 topic list > /dev/null 2>&1"
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: miracle-data
+              mountPath: /miracle_ws/data
+            - name: miracle-logs
+              mountPath: /miracle_ws/log
+            - name: miracle-config-volume
+              mountPath: /config
+      volumes:
+        - name: miracle-data
+          persistentVolumeClaim:
+            claimName: miracle-data-pvc
+        - name: miracle-logs
+          emptyDir: {}
+        - name: miracle-config-volume
+          configMap:
+            name: miracle-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ros2-miracle
+  namespace: miracle-system
+  labels:
+    app: ros2-miracle
+spec:
+  selector:
+    app: ros2-miracle
+  ports:
+    - name: ros-tcp-bridge
+      port: 10000
+      targetPort: 10000
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: miracle-data-pvc
+  namespace: miracle-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: miracle-config
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+data:
+  ROS_DOMAIN_ID: "42"
+  fastdds_profile.xml: |
+    <?xml version="1.0" encoding="UTF-8" ?>
+    <dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+      <profiles>
+        <participant profile_name="miracle_participant" is_default_profile="true">
+          <rtps>
+            <builtin>
+              <discovery_config>
+                <discoveryProtocol>SIMPLE</discoveryProtocol>
+                <leaseDuration>
+                  <sec>10</sec>
+                  <nanosec>0</nanosec>
+                </leaseDuration>
+              </discovery_config>
+              <metatrafficUnicastLocatorList>
+                <locator>
+                  <udpv4>
+                    <address>0.0.0.0</address>
+                  </udpv4>
+                </locator>
+              </metatrafficUnicastLocatorList>
+            </builtin>
+            <defaultUnicastLocatorList>
+              <locator>
+                <udpv4>
+                  <address>0.0.0.0</address>
+                </udpv4>
+              </locator>
+            </defaultUnicastLocatorList>
+            <useBuiltinTransports>true</useBuiltinTransports>
+          </rtps>
+        </participant>
+        <data_writer profile_name="default_datawriter" is_default_profile="true">
+          <qos>
+            <reliability>
+              <kind>RELIABLE</kind>
+            </reliability>
+            <durability>
+              <kind>TRANSIENT_LOCAL</kind>
+            </durability>
+          </qos>
+          <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </data_writer>
+        <data_reader profile_name="default_datareader" is_default_profile="true">
+          <qos>
+            <reliability>
+              <kind>RELIABLE</kind>
+            </reliability>
+            <durability>
+              <kind>TRANSIENT_LOCAL</kind>
+            </durability>
+          </qos>
+          <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </data_reader>
+      </profiles>
+    </dds>

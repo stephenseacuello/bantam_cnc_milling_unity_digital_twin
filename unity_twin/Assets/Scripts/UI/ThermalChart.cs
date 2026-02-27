@@ -6,17 +6,19 @@ using MiracleTwin.Core;
 namespace MiracleTwin.UI
 {
     /// <summary>
-    /// Scrolling line chart for Fx, Fy, Fz forces over time.
-    /// Uses UI Toolkit custom drawing via generateVisualContent/Painter2D
-    /// for efficient rendering of color-coded force traces with grid lines,
-    /// axis labels, and a legend.
+    /// Scrolling line chart plotting toolTemperature and interfaceTemperature
+    /// as two separate lines over time.
+    ///
+    /// Uses UI Toolkit custom drawing via generateVisualContent/Painter2D.
+    /// Subscribes to CuttingStateEventSO for data, buffers samples in Queue.
     /// </summary>
-    public class ForceChart : MonoBehaviour
+    public class ThermalChart : MonoBehaviour
     {
         [SerializeField] private CuttingStateEventSO cuttingStateEvent;
         [SerializeField] private UIDocument uiDocument;
         [SerializeField] private int maxSamples = 200;
-        [SerializeField] private float maxForce = 200f;
+        [SerializeField] private float maxTemperature = 300f;
+        [SerializeField] private float minTemperature = 20f;
         [SerializeField] private float sampleInterval = 0.033f;
 
         [Header("Appearance")]
@@ -24,14 +26,13 @@ namespace MiracleTwin.UI
         [SerializeField] private int gridLinesHorizontal = 4;
         [SerializeField] private int gridLinesVertical = 5;
 
-        private static readonly Color FxColor = new(1f, 0.2f, 0.2f, 1f);   // Red
-        private static readonly Color FyColor = new(0.2f, 0.8f, 0.2f, 1f); // Green
-        private static readonly Color FzColor = new(0.3f, 0.3f, 1f, 1f);   // Blue
+        private static readonly Color ToolTempColor = new(1f, 0.6f, 0.1f, 1f);      // Orange
+        private static readonly Color InterfaceTempColor = new(1f, 0.2f, 0.2f, 1f);  // Red
         private static readonly Color GridColor = new(0.3f, 0.3f, 0.3f, 0.5f);
         private static readonly Color BackgroundColor = new(0.1f, 0.1f, 0.12f, 0.9f);
-        private static readonly Color AxisLabelColor = new(0.7f, 0.7f, 0.7f, 1f);
 
-        private readonly Queue<Vector3> forceSamples = new();
+        /// <summary>x = toolTemperature, y = interfaceTemperature</summary>
+        private readonly Queue<Vector2> temperatureSamples = new();
         private float lastSampleTime;
         private VisualElement chartElement;
 
@@ -52,18 +53,12 @@ namespace MiracleTwin.UI
             if (uiDocument == null) return;
             var root = uiDocument.rootVisualElement;
 
-            // Find or create the chart visual element
-            chartElement = root.Q<VisualElement>("force-chart");
+            chartElement = root.Q<VisualElement>("thermal-chart");
             if (chartElement == null)
-            {
-                // If no element named "force-chart" exists, look for a generic chart container
-                chartElement = root.Q<VisualElement>("chart-container");
-            }
+                chartElement = root.Q<VisualElement>("chart-container-thermal");
 
             if (chartElement != null)
-            {
                 chartElement.generateVisualContent += OnGenerateVisualContent;
-            }
         }
 
         void OnDestroy()
@@ -77,31 +72,26 @@ namespace MiracleTwin.UI
             if (Time.time - lastSampleTime < sampleInterval) return;
             lastSampleTime = Time.time;
 
-            forceSamples.Enqueue(new Vector3(state.forceFx, state.forceFy, state.forceFz));
-            while (forceSamples.Count > maxSamples)
-                forceSamples.Dequeue();
+            temperatureSamples.Enqueue(new Vector2(state.toolTemperature, state.interfaceTemperature));
+            while (temperatureSamples.Count > maxSamples)
+                temperatureSamples.Dequeue();
         }
 
         void Update()
         {
-            // Mark for repaint every frame so the chart scrolls smoothly
             chartElement?.MarkDirtyRepaint();
         }
 
-        /// <summary>
-        /// Main rendering callback using Painter2D for the force chart.
-        /// Draws background, grid, axis labels, force traces, and legend.
-        /// </summary>
         private void OnGenerateVisualContent(MeshGenerationContext ctx)
         {
             var painter = ctx.painter2D;
             Rect rect = chartElement.contentRect;
             if (rect.width < 10 || rect.height < 10) return;
 
-            float padding = 40f;     // Left padding for Y-axis labels
+            float padding = 40f;
             float rightPad = 10f;
-            float topPad = 25f;      // Top padding for legend
-            float bottomPad = 20f;   // Bottom padding for X-axis labels
+            float topPad = 25f;
+            float bottomPad = 20f;
 
             float chartLeft = padding;
             float chartTop = topPad;
@@ -110,7 +100,7 @@ namespace MiracleTwin.UI
 
             if (chartWidth < 10 || chartHeight < 10) return;
 
-            // 1. Draw background
+            // Background
             painter.fillColor = BackgroundColor;
             painter.BeginPath();
             painter.MoveTo(new Vector2(0, 0));
@@ -120,11 +110,10 @@ namespace MiracleTwin.UI
             painter.ClosePath();
             painter.Fill();
 
-            // 2. Draw grid lines
+            // Grid
             painter.strokeColor = GridColor;
             painter.lineWidth = 1f;
 
-            // Horizontal grid lines (force values)
             for (int i = 0; i <= gridLinesHorizontal; i++)
             {
                 float y = chartTop + (chartHeight / gridLinesHorizontal) * i;
@@ -134,7 +123,6 @@ namespace MiracleTwin.UI
                 painter.Stroke();
             }
 
-            // Vertical grid lines (time divisions)
             for (int i = 0; i <= gridLinesVertical; i++)
             {
                 float x = chartLeft + (chartWidth / gridLinesVertical) * i;
@@ -144,16 +132,15 @@ namespace MiracleTwin.UI
                 painter.Stroke();
             }
 
-            // 3. Draw force traces
-            var samples = forceSamples.ToArray();
+            // Draw traces
+            var samples = temperatureSamples.ToArray();
             if (samples.Length > 1)
             {
-                DrawTrace(painter, samples, 0, FxColor, chartLeft, chartTop, chartWidth, chartHeight); // Fx
-                DrawTrace(painter, samples, 1, FyColor, chartLeft, chartTop, chartWidth, chartHeight); // Fy
-                DrawTrace(painter, samples, 2, FzColor, chartLeft, chartTop, chartWidth, chartHeight); // Fz
+                DrawTrace(painter, samples, 0, ToolTempColor, chartLeft, chartTop, chartWidth, chartHeight);
+                DrawTrace(painter, samples, 1, InterfaceTempColor, chartLeft, chartTop, chartWidth, chartHeight);
             }
 
-            // 4. Draw axis border
+            // Axis border
             painter.strokeColor = new Color(0.5f, 0.5f, 0.5f, 0.8f);
             painter.lineWidth = 1.5f;
             painter.BeginPath();
@@ -162,18 +149,13 @@ namespace MiracleTwin.UI
             painter.LineTo(new Vector2(chartLeft + chartWidth, chartTop + chartHeight));
             painter.Stroke();
 
-            // Note: Axis labels and legend text are drawn via Label elements
-            // added in Start(). Painter2D does not support text rendering directly.
-            // The labels below use small colored rectangles as legend keys.
-
-            // 5. Draw legend color keys (small colored rectangles)
+            // Legend keys
             float legendY = 5f;
             float legendX = chartLeft;
             float keySize = 10f;
-            float keySpacing = 70f;
+            float keySpacing = 100f;
 
-            // Fx legend key
-            painter.fillColor = FxColor;
+            painter.fillColor = ToolTempColor;
             painter.BeginPath();
             painter.MoveTo(new Vector2(legendX, legendY));
             painter.LineTo(new Vector2(legendX + keySize, legendY));
@@ -182,8 +164,7 @@ namespace MiracleTwin.UI
             painter.ClosePath();
             painter.Fill();
 
-            // Fy legend key
-            painter.fillColor = FyColor;
+            painter.fillColor = InterfaceTempColor;
             painter.BeginPath();
             painter.MoveTo(new Vector2(legendX + keySpacing, legendY));
             painter.LineTo(new Vector2(legendX + keySpacing + keySize, legendY));
@@ -191,30 +172,9 @@ namespace MiracleTwin.UI
             painter.LineTo(new Vector2(legendX + keySpacing, legendY + keySize));
             painter.ClosePath();
             painter.Fill();
-
-            // Fz legend key
-            painter.fillColor = FzColor;
-            painter.BeginPath();
-            painter.MoveTo(new Vector2(legendX + keySpacing * 2, legendY));
-            painter.LineTo(new Vector2(legendX + keySpacing * 2 + keySize, legendY));
-            painter.LineTo(new Vector2(legendX + keySpacing * 2 + keySize, legendY + keySize));
-            painter.LineTo(new Vector2(legendX + keySpacing * 2, legendY + keySize));
-            painter.ClosePath();
-            painter.Fill();
         }
 
-        /// <summary>
-        /// Draw a single force trace line using Painter2D.
-        /// </summary>
-        /// <param name="painter">The Painter2D instance</param>
-        /// <param name="samples">Array of Vector3 force samples</param>
-        /// <param name="component">0=X, 1=Y, 2=Z</param>
-        /// <param name="color">Line color</param>
-        /// <param name="left">Chart area left edge</param>
-        /// <param name="top">Chart area top edge</param>
-        /// <param name="width">Chart area width</param>
-        /// <param name="height">Chart area height</param>
-        private void DrawTrace(Painter2D painter, Vector3[] samples, int component, Color color,
+        private void DrawTrace(Painter2D painter, Vector2[] samples, int component, Color color,
             float left, float top, float width, float height)
         {
             if (samples.Length < 2) return;
@@ -229,19 +189,10 @@ namespace MiracleTwin.UI
             for (int i = 0; i < samples.Length; i++)
             {
                 float x = left + (i / (float)(maxSamples - 1)) * width;
+                float value = component == 0 ? samples[i].x : samples[i].y;
 
-                float value = component switch
-                {
-                    0 => samples[i].x,
-                    1 => samples[i].y,
-                    2 => samples[i].z,
-                    _ => 0f
-                };
-
-                // Map force value to Y position (0 at bottom, maxForce at top)
-                // Support negative forces: center line at middle, +/- maxForce at edges
-                float normalized = Mathf.Clamp(value / maxForce, -1f, 1f);
-                float y = top + height * 0.5f - normalized * (height * 0.5f);
+                float normalized = Mathf.InverseLerp(minTemperature, maxTemperature, value);
+                float y = top + height * (1f - normalized);
 
                 if (i == 0)
                     painter.MoveTo(new Vector2(x, y));
@@ -252,16 +203,9 @@ namespace MiracleTwin.UI
             painter.Stroke();
         }
 
-        public Vector3[] GetSamples()
-        {
-            var arr = new Vector3[forceSamples.Count];
-            forceSamples.CopyTo(arr, 0);
-            return arr;
-        }
-
         public void Clear()
         {
-            forceSamples.Clear();
+            temperatureSamples.Clear();
         }
     }
 }

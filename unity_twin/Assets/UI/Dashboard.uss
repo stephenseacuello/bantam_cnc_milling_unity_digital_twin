@@ -1,10 +1,11 @@
-/* Compact left sidebar — does NOT fill the entire screen */
+/* Full-width overlay with transparent center pass-through */
 .dashboard {
-    flex-grow: 0;
+    flex-grow: 1;
     flex-direction: column;
     background-color: rgba(0, 0, 0, 0);
-    width: 280px;
+    width: 100%;
     height: 100%;
+    picking-mode: ignore;
 }
 
 .header-bar {
@@ -16,6 +17,7 @@
     border-bottom-width: 1px;
     border-bottom-color: rgba(80, 140, 220, 0.4);
     min-height: 32px;
+    picking-mode: position;
 }
 
 .title {
@@ -36,22 +38,73 @@
 
 .main-row {
     flex-grow: 1;
-    flex-direction: column;
+    flex-direction: row;
     overflow: hidden;
+    picking-mode: ignore;
 }
 
 .sidebar {
-    width: 100%;
-    min-width: 0;
-    max-width: none;
+    width: 260px;
+    min-width: 260px;
+    max-width: 260px;
     padding: 4px;
     background-color: rgba(15, 15, 25, 0.88);
     overflow: scroll;
-    flex-grow: 1;
+    flex-grow: 0;
+    flex-shrink: 0;
+    picking-mode: position;
+}
+
+.gcode-sidebar {
+    width: 280px;
+    min-width: 280px;
+    max-width: 280px;
 }
 
 .viewport {
-    display: none;
+    flex-grow: 1;
+    picking-mode: ignore;
+}
+
+.gcode-toolbar {
+    flex-direction: row;
+    margin-bottom: 4px;
+    picking-mode: position;
+}
+
+.gcode-status-row {
+    flex-direction: row;
+    justify-content: space-between;
+    margin-bottom: 2px;
+}
+
+.gcode-text-field {
+    flex-grow: 1;
+    min-height: 200px;
+    font-size: 10px;
+    color: rgb(200, 220, 200);
+    background-color: rgba(10, 10, 20, 0.9);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: rgba(60, 60, 80, 0.5);
+    white-space: normal;
+    picking-mode: position;
+}
+
+.gcode-progress-bar {
+    height: 14px;
+    margin-bottom: 3px;
+}
+
+.gcode-info-row {
+    flex-direction: row;
+    margin-bottom: 2px;
+}
+
+.shortcut-hint {
+    font-size: 9px;
+    color: rgb(120, 130, 150);
+    -unity-font-style: italic;
 }
 
 .panel {
@@ -114,6 +167,7 @@
     border-top-width: 1px;
     border-top-color: rgba(80, 140, 220, 0.4);
     min-height: 28px;
+    picking-mode: position;
 }
 
 .control-btn {
@@ -193,4 +247,20 @@
     border-radius: 4px;
     border-width: 1px;
     border-color: rgba(80, 80, 100, 0.5);
+}
+
+.chart-container {
+    height: 120px;
+    min-height: 120px;
+    background-color: rgba(10, 10, 15, 0.9);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: rgba(60, 60, 80, 0.5);
+    margin-top: 2px;
+}
+
+.chart-title {
+    font-size: 10px;
+    margin-bottom: 1px;
+    padding-bottom: 1px;
 }

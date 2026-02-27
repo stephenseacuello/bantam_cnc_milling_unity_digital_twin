@@ -164,10 +164,52 @@
                         <Label name="qual-value" text="0%" class="data-value" />
                     </VisualElement>
                 </VisualElement>
+
+                <!-- Live Charts -->
+                <VisualElement class="panel">
+                    <Label text="Forces (Fx/Fy/Fz)" class="panel-title chart-title" />
+                    <VisualElement name="force-chart" class="chart-container" />
+                </VisualElement>
+
+                <VisualElement class="panel">
+                    <Label text="Temperature (°C)" class="panel-title chart-title" />
+                    <VisualElement name="thermal-chart" class="chart-container" />
+                </VisualElement>
+
+                <VisualElement class="panel">
+                    <Label text="Tool Wear VB (mm)" class="panel-title chart-title" />
+                    <VisualElement name="tool-wear-chart" class="chart-container" />
+                </VisualElement>
+
+                <VisualElement class="panel">
+                    <Label text="Power (W)" class="panel-title chart-title" />
+                    <VisualElement name="power-chart" class="chart-container" />
+                </VisualElement>
             </VisualElement>
 
             <!-- 3D Viewport (transparent pass-through) -->
             <VisualElement name="viewport" class="viewport" />
+
+            <!-- Right Sidebar: G-Code Editor -->
+            <VisualElement name="right-sidebar" class="sidebar gcode-sidebar">
+                <VisualElement class="panel">
+                    <Label text="G-Code Program" class="panel-title" />
+                    <VisualElement class="gcode-toolbar">
+                        <Button name="load-file-button" text="Load File" class="control-btn" />
+                        <Button name="run-button" text="Run" class="control-btn play" />
+                        <Button name="stop-button" text="Stop" class="control-btn" />
+                    </VisualElement>
+                    <ProgressBar name="gcode-progress-bar" title="Progress" low-value="0" high-value="100" class="gcode-progress-bar" />
+                    <VisualElement class="gcode-status-row">
+                        <Label name="line-count" text="0 lines" class="data-value" />
+                        <Label name="gcode-progress" text="" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="gcode-info-row">
+                        <Label text="G = Run pocket_50x50" class="data-label shortcut-hint" />
+                    </VisualElement>
+                    <TextField name="gcode-editor" multiline="true" class="gcode-text-field" />
+                </VisualElement>
+            </VisualElement>
         </VisualElement>
 
         <!-- Bottom Control Bar -->

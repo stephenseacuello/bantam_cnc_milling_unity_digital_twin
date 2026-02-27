@@ -7,6 +7,8 @@ and services. Validates permissions before allowing operations.
 
 from typing import Any, Dict, List, Set
 from dataclasses import dataclass, field
+from collections import defaultdict
+import time
 import threading
 
 from rclpy.lifecycle import TransitionCallbackReturn
@@ -46,6 +48,11 @@ class AccessEnforcerNode(MiracleLifecycleNode):
         self._alert_pub = None
         self._lock = threading.Lock()
         self._violation_count: int = 0
+
+        # Rate limiting state
+        self._access_counts: Dict[str, int] = defaultdict(int)
+        self._rate_limit_per_minute: int = 100
+        self._last_reset: float = time.monotonic()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure access enforcer."""
@@ -109,6 +116,21 @@ class AccessEnforcerNode(MiracleLifecycleNode):
             True if access is permitted.
         """
         with self._lock:
+            # Rate limiting: reset counts every minute
+            now = time.monotonic()
+            if now - self._last_reset >= 60.0:
+                self._access_counts.clear()
+                self._last_reset = now
+
+            # Check rate limit for this role
+            self._access_counts[role] += 1
+            if self._access_counts[role] > self._rate_limit_per_minute:
+                self._report_violation(
+                    role, resource,
+                    reason=f"Rate limit exceeded ({self._rate_limit_per_minute}/min)"
+                )
+                return False
+
             policy = self._policies.get(role)
             if policy is None:
                 default = self.get_parameter('default_policy').value
@@ -136,22 +158,34 @@ class AccessEnforcerNode(MiracleLifecycleNode):
                 return False
             return True
 
-    def _report_violation(self, role: str, resource: str) -> None:
-        """Report an access violation."""
+    def _report_violation(self, role: str, resource: str,
+                          reason: str = '') -> None:
+        """Report an access violation.
+
+        Args:
+            role: The role that triggered the violation.
+            resource: The resource being accessed.
+            reason: Optional specific reason for the violation.
+        """
         self._violation_count += 1
+        description = reason if reason else f"Access denied: role '{role}' to '{resource}'"
+        is_rate_limit = 'Rate limit' in description
         msg = SecurityAlert()
         msg.timestamp = self.get_clock().now().to_msg()
         msg.alert_id = f"ACL-{self._violation_count:06d}"
-        msg.severity = 'MEDIUM'
-        msg.category = 'ACCESS_VIOLATION'
+        msg.severity = 'HIGH' if is_rate_limit else 'MEDIUM'
+        msg.category = 'RATE_LIMIT_EXCEEDED' if is_rate_limit else 'ACCESS_VIOLATION'
         msg.source_node = role
-        msg.description = f"Access denied: role '{role}' to '{resource}'"
-        msg.recommended_action = 'Review access policies'
-        msg.requires_isolation = False
+        msg.description = description
+        msg.recommended_action = (
+            'Investigate potential abuse or misconfigured client'
+            if is_rate_limit else 'Review access policies'
+        )
+        msg.requires_isolation = is_rate_limit
         msg.confidence = 1.0
 
         self._alert_pub.publish(msg)
-        self.get_logger().warn(f"Access violation: {role} -> {resource}")
+        self.get_logger().warn(f"Access violation: {role} -> {resource} ({description})")
 
 
 def main(args=None):

@@ -4,6 +4,10 @@ OPC-UA Bridge Node.
 Bridges OPC-UA industrial protocol to ROS2 topics.
 Supports reading/writing OPC-UA variables and mapping them
 to ROS2 messages for CNC machine integration.
+
+Includes exponential backoff reconnection logic so that transient
+connection failures are retried with increasing delays (1 s -> 2 s
+-> 4 s ... capped at 60 s).
 """
 
 from typing import Any, Dict, List, Optional
@@ -47,6 +51,12 @@ class OPCUABridgeNode(MiracleLifecycleNode):
         self._machine_id: str = ''
         self._node_mappings: Dict[str, str] = {}
         self._lock = threading.Lock()
+
+        # Exponential backoff reconnection state
+        self._reconnect_attempts: int = 0
+        self._max_backoff: float = 60.0
+        self._base_backoff: float = 1.0
+        self._reconnect_timer = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure OPC-UA bridge."""
@@ -114,6 +124,7 @@ class OPCUABridgeNode(MiracleLifecycleNode):
 
     def _do_activate(self) -> TransitionCallbackReturn:
         """Connect to OPC-UA server and start polling."""
+        self._reconnect_attempts = 0
         try:
             self._connect_opcua()
         except Exception as exc:
@@ -135,6 +146,9 @@ class OPCUABridgeNode(MiracleLifecycleNode):
         if self._poll_timer is not None:
             self._poll_timer.cancel()
             self._poll_timer = None
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+            self._reconnect_timer = None
         self._disconnect_opcua()
         return TransitionCallbackReturn.SUCCESS
 
@@ -165,6 +179,51 @@ class OPCUABridgeNode(MiracleLifecycleNode):
             self._connected = False
             self._client = None
 
+    def _schedule_reconnect(self) -> None:
+        """Schedule a reconnection attempt with exponential backoff.
+
+        Delay doubles each attempt: 1 s -> 2 s -> 4 s ... capped at
+        ``_max_backoff`` (default 60 s).
+        """
+        delay = min(
+            self._base_backoff * (2 ** self._reconnect_attempts),
+            self._max_backoff,
+        )
+        self._reconnect_attempts += 1
+        self.get_logger().warn(
+            f"Scheduling OPC-UA reconnect in {delay:.1f}s "
+            f"(attempt {self._reconnect_attempts})"
+        )
+
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+
+        self._reconnect_timer = self.create_timer(
+            delay,
+            self._retry_connect,
+        )
+
+    def _retry_connect(self) -> None:
+        """Attempt to reconnect to the OPC-UA server.
+
+        On success the backoff counter resets; on failure a new timer
+        is scheduled with a longer delay.
+        """
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+            self._reconnect_timer = None
+
+        self.get_logger().info(
+            f"Attempting OPC-UA reconnect (attempt {self._reconnect_attempts})"
+        )
+        self._connect_opcua()
+
+        if self._connected:
+            self._reconnect_attempts = 0
+            self.get_logger().info("OPC-UA reconnection successful")
+        else:
+            self._schedule_reconnect()
+
     def _poll_opcua(self) -> None:
         """Poll OPC-UA server for current values."""
         if not self._connected:
@@ -187,6 +246,7 @@ class OPCUABridgeNode(MiracleLifecycleNode):
         except Exception as exc:
             self.get_logger().error(f"OPC-UA poll error: {exc}")
             self._connected = False
+            self._schedule_reconnect()
 
     def _publish_state_from_values(self, values: Dict[str, Any]) -> None:
         """Build and publish MachineState from OPC-UA values."""

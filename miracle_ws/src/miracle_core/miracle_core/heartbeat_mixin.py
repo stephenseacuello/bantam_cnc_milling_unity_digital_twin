@@ -28,6 +28,10 @@ class HeartbeatMixin:
     CRITICALITY_MEDIUM = 'MEDIUM'
     CRITICALITY_LOW = 'LOW'
 
+    # Pre-initialize so _set_lifecycle_state() is safe before _setup_heartbeat()
+    _hb_lock = None
+    _hb_lifecycle_state = 'unconfigured'
+
     def _setup_heartbeat(
         self,
         criticality: str = 'MEDIUM',
@@ -80,7 +84,10 @@ class HeartbeatMixin:
 
     def _set_lifecycle_state(self, state: str) -> None:
         """Update the lifecycle state reported in heartbeats."""
-        with self._hb_lock:
+        if self._hb_lock is not None:
+            with self._hb_lock:
+                self._hb_lifecycle_state = state
+        else:
             self._hb_lifecycle_state = state
 
     def _publish_heartbeat(self) -> None:

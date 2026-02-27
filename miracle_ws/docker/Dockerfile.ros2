@@ -37,7 +37,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
         opcua \
         paho-mqtt \
         pymodbus \
-        kafka-python
+        kafka-python \
+        websockets
 
 # Create workspace directory
 WORKDIR /miracle_ws
@@ -88,7 +89,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
         opcua \
         paho-mqtt \
         pymodbus \
-        kafka-python
+        kafka-python \
+        websockets
 
 # Copy built workspace from builder stage
 WORKDIR /miracle_ws
@@ -117,7 +119,7 @@ COPY docker/ros2_entrypoint.sh /ros2_entrypoint.sh
 RUN chmod +x /ros2_entrypoint.sh
 
 ENTRYPOINT ["/ros2_entrypoint.sh"]
-CMD ["ros2", "launch", "miracle_bringup", "miracle_full_system.launch.py", "simulation_mode:=true"]
+CMD ["ros2", "launch", "miracle_bringup", "miracle_simulation.launch.py", "machine_count:=1", "use_sim_time:=false"]
 
 # Healthcheck: verify the ROS2 daemon is responsive
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \

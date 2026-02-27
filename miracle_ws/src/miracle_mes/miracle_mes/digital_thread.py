@@ -29,9 +29,9 @@ class DigitalThreadNode(MiracleLifecycleNode):
         max_chain_memory (int): Max entries held in memory.
 
     Subscribed Topics:
-        /miracle/+/job_status (JobStatus): Job events.
-        /miracle/+/anomaly (AnomalyAlert): Anomaly events.
-        /miracle/+/state (MachineState): State snapshots.
+        /miracle/{machine_id}/job_status (JobStatus): Job events.
+        /miracle/{machine_id}/anomaly (AnomalyAlert): Anomaly events.
+        /miracle/{machine_id}/state (MachineState): State snapshots.
 
     Published Topics:
         ~/entries (DigitalThreadEntry): New thread entries.
@@ -47,13 +47,13 @@ class DigitalThreadNode(MiracleLifecycleNode):
         self._chain: List[DigitalThreadEntry] = []
         self._chain_lock = threading.Lock()
         self._last_hash: str = '0' * 64
-        self._job_sub = None
-        self._anomaly_sub = None
-        self._state_sub = None
+        self._job_subs = None
+        self._anomaly_subs = None
+        self._state_subs = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure digital thread."""
-        self.declare_and_validate_parameters({
+        params = self.declare_and_validate_parameters({
             'storage_path': {
                 'default': '/tmp/miracle_thread',
                 'type': str,
@@ -63,7 +63,13 @@ class DigitalThreadNode(MiracleLifecycleNode):
                 'type': int,
                 'range': (100, 1000000),
             },
+            'machine_ids': {
+                'default': 'cnc1,cnc2,cnc3',
+                'type': str,
+            },
         })
+
+        machine_ids = self.get_machine_ids(params)
 
         self._entry_pub = self.create_publisher(
             DigitalThreadEntry,
@@ -71,18 +77,28 @@ class DigitalThreadNode(MiracleLifecycleNode):
             QoSProfiles.logging(),
         )
 
-        self._job_sub = self.create_subscription(
+        self._job_subs = self.create_multi_machine_subscriptions(
             JobStatus,
-            '/miracle/+/job_status',
+            'job_status',
             self._on_job_status,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
-        self._anomaly_sub = self.create_subscription(
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
             AnomalyAlert,
-            '/miracle/+/anomaly',
+            'anomaly',
             self._on_anomaly,
             QoSProfiles.alert(),
+            machine_ids,
+        )
+
+        self._state_subs = self.create_multi_machine_subscriptions(
+            MachineState,
+            'state',
+            self._on_state,
+            QoSProfiles.state_data(),
+            machine_ids,
         )
 
         self.get_logger().info("Digital thread configured")
@@ -153,6 +169,23 @@ class DigitalThreadNode(MiracleLifecycleNode):
                 'current_line': msg.current_line,
             },
             tags=['job', msg.status.lower()],
+        )
+
+    def _on_state(self, msg: MachineState) -> None:
+        """Record state snapshot in digital thread."""
+        self._add_entry(
+            entry_type='STATE_SNAPSHOT',
+            job_id='',
+            source_node=msg.machine_id,
+            data={
+                'status': msg.status,
+                'spindle_speed': msg.spindle_speed,
+                'feed_rate': msg.feed_rate,
+                'axis_positions': list(msg.axis_positions),
+                'spindle_load': msg.spindle_load,
+                'current_program': msg.current_program,
+            },
+            tags=['state', msg.status.lower()],
         )
 
     def _on_anomaly(self, msg: AnomalyAlert) -> None:

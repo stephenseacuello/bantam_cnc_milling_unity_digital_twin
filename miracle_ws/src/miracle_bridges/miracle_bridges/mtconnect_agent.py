@@ -3,6 +3,10 @@ MTConnect Agent Bridge Node.
 
 Bridges MTConnect protocol to ROS2. Reads MTConnect XML streams
 from CNC machines and publishes as ROS2 messages.
+
+Includes exponential backoff reconnection logic so that transient
+HTTP failures are retried with increasing delays (1 s -> 2 s
+-> 4 s ... capped at 60 s).
 """
 
 from typing import Any, Dict, Optional
@@ -40,6 +44,15 @@ class MTConnectAgentNode(MiracleLifecycleNode):
         self._machine_id: str = ''
         self._device_name: str = ''
         self._sequence: int = 0
+        self._connected: bool = False
+
+        # Exponential backoff reconnection state
+        self._reconnect_attempts: int = 0
+        self._max_backoff: float = 60.0
+        self._base_backoff: float = 1.0
+        self._reconnect_timer = None
+        self._consecutive_failures: int = 0
+        self._failure_threshold: int = 3
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure MTConnect agent."""
@@ -80,6 +93,9 @@ class MTConnectAgentNode(MiracleLifecycleNode):
 
     def _do_activate(self) -> TransitionCallbackReturn:
         """Start polling MTConnect agent."""
+        self._reconnect_attempts = 0
+        self._consecutive_failures = 0
+        self._connected = True
         rate = self.get_parameter('poll_rate_hz').value
         self._poll_timer = self.create_timer(
             1.0 / rate,
@@ -94,21 +110,89 @@ class MTConnectAgentNode(MiracleLifecycleNode):
         if self._poll_timer is not None:
             self._poll_timer.cancel()
             self._poll_timer = None
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+            self._reconnect_timer = None
+        self._connected = False
         return TransitionCallbackReturn.SUCCESS
 
-    def _poll_mtconnect(self) -> None:
-        """Poll MTConnect current endpoint."""
+    def _schedule_reconnect(self) -> None:
+        """Schedule a reconnection attempt with exponential backoff.
+
+        Delay doubles each attempt: 1 s -> 2 s -> 4 s ... capped at
+        ``_max_backoff`` (default 60 s).
+        """
+        delay = min(
+            self._base_backoff * (2 ** self._reconnect_attempts),
+            self._max_backoff,
+        )
+        self._reconnect_attempts += 1
+        self.get_logger().warn(
+            f"Scheduling MTConnect reconnect in {delay:.1f}s "
+            f"(attempt {self._reconnect_attempts})"
+        )
+
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+
+        self._reconnect_timer = self.create_timer(
+            delay,
+            self._retry_connect,
+        )
+
+    def _retry_connect(self) -> None:
+        """Attempt to reconnect to the MTConnect agent.
+
+        A single successful HTTP poll resets the backoff counter and
+        re-marks the connection as healthy.
+        """
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+            self._reconnect_timer = None
+
+        self.get_logger().info(
+            f"Attempting MTConnect reconnect (attempt {self._reconnect_attempts})"
+        )
+
         try:
             import urllib.request
             url = f"{self._agent_url}/current"
             with urllib.request.urlopen(url, timeout=2) as response:
                 xml_data = response.read().decode()
             self._parse_mtconnect_xml(xml_data)
+            self._connected = True
+            self._consecutive_failures = 0
+            self._reconnect_attempts = 0
+            self.get_logger().info("MTConnect reconnection successful")
         except Exception as exc:
+            self.get_logger().warn(f"MTConnect reconnect failed: {exc}")
+            self._schedule_reconnect()
+
+    def _poll_mtconnect(self) -> None:
+        """Poll MTConnect current endpoint."""
+        if not self._connected:
+            return
+
+        try:
+            import urllib.request
+            url = f"{self._agent_url}/current"
+            with urllib.request.urlopen(url, timeout=2) as response:
+                xml_data = response.read().decode()
+            self._parse_mtconnect_xml(xml_data)
+            self._consecutive_failures = 0
+        except Exception as exc:
+            self._consecutive_failures += 1
             self.get_logger().debug(
                 f"MTConnect poll failed: {exc}",
                 throttle_duration_sec=10.0,
             )
+            if self._consecutive_failures >= self._failure_threshold:
+                self.get_logger().warn(
+                    f"MTConnect agent unreachable after "
+                    f"{self._consecutive_failures} consecutive failures"
+                )
+                self._connected = False
+                self._schedule_reconnect()
 
     def _parse_mtconnect_xml(self, xml_data: str) -> None:
         """Parse MTConnect XML response into MachineState."""

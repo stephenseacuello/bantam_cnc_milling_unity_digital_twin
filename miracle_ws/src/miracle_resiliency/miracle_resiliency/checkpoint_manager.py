@@ -27,8 +27,8 @@ class CheckpointManagerNode(MiracleLifecycleNode):
         max_checkpoints (int): Maximum stored checkpoints.
 
     Subscribed Topics:
-        /miracle/+/state (MachineState): Machine states to checkpoint.
-        /miracle/+/job_status (JobStatus): Job states to checkpoint.
+        /miracle/{machine_id}/state (MachineState): Machine states to checkpoint.
+        /miracle/{machine_id}/job_status (JobStatus): Job states to checkpoint.
 
     Service Servers:
         ~/restore_checkpoint (RestoreCheckpoint): Restore from checkpoint.
@@ -40,8 +40,8 @@ class CheckpointManagerNode(MiracleLifecycleNode):
             criticality=self.CRITICALITY_HIGH,
             **kwargs,
         )
-        self._state_sub = None
-        self._job_sub = None
+        self._state_subs = []
+        self._job_subs = []
         self._restore_srv = None
         self._checkpoint_timer = None
         self._current_state: Dict[str, Any] = {}
@@ -61,18 +61,20 @@ class CheckpointManagerNode(MiracleLifecycleNode):
             'max_checkpoints': {
                 'default': 50, 'type': int, 'range': (5, 1000),
             },
+            'machine_ids': {'default': 'cnc1,cnc2,cnc3', 'type': str},
         })
+        machine_ids = self.get_machine_ids(params)
 
         self._checkpoint_dir = params['checkpoint_directory']
         os.makedirs(self._checkpoint_dir, exist_ok=True)
 
-        self._state_sub = self.create_subscription(
-            MachineState, '/miracle/+/state',
-            self._on_state, QoSProfiles.state_data(),
+        self._state_subs = self.create_multi_machine_subscriptions(
+            MachineState, 'state',
+            self._on_state, QoSProfiles.state_data(), machine_ids,
         )
-        self._job_sub = self.create_subscription(
-            JobStatus, '/miracle/+/job_status',
-            self._on_job, QoSProfiles.state_data(),
+        self._job_subs = self.create_multi_machine_subscriptions(
+            JobStatus, 'job_status',
+            self._on_job, QoSProfiles.state_data(), machine_ids,
         )
         self._restore_srv = self.create_service(
             RestoreCheckpoint, 'restore_checkpoint',

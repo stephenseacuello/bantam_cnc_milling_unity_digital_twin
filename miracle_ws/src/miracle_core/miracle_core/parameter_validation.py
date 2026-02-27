@@ -85,9 +85,10 @@ def declare_and_validate_parameters(
                 )
             ]
 
-        # Declare parameter
+        # Declare parameter (skip if already declared, e.g. after a failed configure)
         try:
-            node.declare_parameter(name, default_value, descriptor)
+            if not node.has_parameter(name):
+                node.declare_parameter(name, default_value, descriptor)
         except Exception as exc:
             raise ParameterValidationError(
                 f"Failed to declare parameter '{name}': {exc}"

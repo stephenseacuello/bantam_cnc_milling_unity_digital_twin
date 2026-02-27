@@ -25,4 +25,9 @@ setup(
     description='Launch files and configuration for the MIRACLE CNC Digital Twin system',
     license='Apache-2.0',
     tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'lifecycle_autostart = miracle_bringup.lifecycle_autostart:main',
+        ],
+    },
 )

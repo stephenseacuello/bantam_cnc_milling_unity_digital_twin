@@ -216,3 +216,55 @@ class MiracleLifecycleNode(LifecycleNode, HeartbeatMixin):
         callback = create_parameter_callback(self, param_specs)
         self.add_on_set_parameters_callback(callback)
         return validated
+
+    def create_multi_machine_subscriptions(
+        self,
+        msg_type: Any,
+        topic_suffix: str,
+        callback: Any,
+        qos: Any,
+        machine_ids: Optional[List[str]] = None,
+    ) -> List:
+        """Create per-machine subscriptions for a topic pattern.
+
+        Replaces MQTT-style '/miracle/+/suffix' wildcards with concrete
+        per-machine subscriptions, since ROS2 DDS does not support wildcards.
+
+        Args:
+            msg_type: Message type class.
+            topic_suffix: Topic suffix after machine ID (e.g. 'state', 'anomaly').
+            callback: Subscription callback.
+            qos: QoS profile.
+            machine_ids: List of machine IDs. Defaults to ['cnc1', 'cnc2', 'cnc3'].
+
+        Returns:
+            List of subscription objects.
+        """
+        if machine_ids is None:
+            machine_ids = getattr(self, '_miracle_machine_ids', None)
+            if machine_ids is None:
+                machine_ids = ['cnc1', 'cnc2', 'cnc3']
+
+        subs = []
+        for mid in machine_ids:
+            subs.append(self.create_subscription(
+                msg_type,
+                f'/miracle/{mid}/{topic_suffix}',
+                callback,
+                qos,
+            ))
+        return subs
+
+    def get_machine_ids(self, params: Dict[str, Any]) -> List[str]:
+        """Parse machine_ids from a parameter dict and cache the result.
+
+        Args:
+            params: Parameter dict containing 'machine_ids' string.
+
+        Returns:
+            List of machine ID strings.
+        """
+        raw = params.get('machine_ids', 'cnc1,cnc2,cnc3')
+        ids = [m.strip() for m in raw.split(',') if m.strip()]
+        self._miracle_machine_ids = ids
+        return ids

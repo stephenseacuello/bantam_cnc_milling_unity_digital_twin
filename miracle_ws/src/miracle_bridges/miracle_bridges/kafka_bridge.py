@@ -27,9 +27,9 @@ class KafkaBridgeNode(MiracleLifecycleNode):
         linger_ms (int): Kafka producer linger time in ms.
 
     Subscribed Topics:
-        /miracle/+/state (MachineState): Machine states.
-        /miracle/+/anomaly (AnomalyAlert): Anomaly alerts.
-        /miracle/+/job_status (JobStatus): Job status updates.
+        /miracle/{machine_id}/state (MachineState): Machine states.
+        /miracle/{machine_id}/anomaly (AnomalyAlert): Anomaly alerts.
+        /miracle/{machine_id}/job_status (JobStatus): Job status updates.
         /miracle/system_kpis (SystemKPIs): System KPIs.
     """
 
@@ -41,9 +41,9 @@ class KafkaBridgeNode(MiracleLifecycleNode):
         )
         self._producer = None
         self._connected: bool = False
-        self._state_sub = None
-        self._anomaly_sub = None
-        self._job_sub = None
+        self._state_subs = []
+        self._anomaly_subs = []
+        self._job_subs = []
         self._kpi_sub = None
         self._message_count: int = 0
         self._lock = threading.Lock()
@@ -69,27 +69,32 @@ class KafkaBridgeNode(MiracleLifecycleNode):
                 'type': int,
                 'range': (0, 60000),
             },
+            'machine_ids': {'default': 'cnc1,cnc2,cnc3', 'type': str},
         })
+        machine_ids = self.get_machine_ids(params)
 
-        self._state_sub = self.create_subscription(
+        self._state_subs = self.create_multi_machine_subscriptions(
             MachineState,
-            '/miracle/+/state',
+            'state',
             self._on_state,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
-        self._anomaly_sub = self.create_subscription(
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
             AnomalyAlert,
-            '/miracle/+/anomaly',
+            'anomaly',
             self._on_anomaly,
             QoSProfiles.alert(),
+            machine_ids,
         )
 
-        self._job_sub = self.create_subscription(
+        self._job_subs = self.create_multi_machine_subscriptions(
             JobStatus,
-            '/miracle/+/job_status',
+            'job_status',
             self._on_job_status,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
         self._kpi_sub = self.create_subscription(

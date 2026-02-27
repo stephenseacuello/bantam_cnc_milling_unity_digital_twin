@@ -82,7 +82,7 @@ class JobSchedulerNode(MiracleLifecycleNode):
         self._status_pub = None
         self._announcement_pub = None
         self._schedule_timer = None
-        self._state_sub = None
+        self._state_subs = None
 
         self._machine_states: Dict[str, MachineState] = {}
         self._max_queue: int = 1000
@@ -105,7 +105,13 @@ class JobSchedulerNode(MiracleLifecycleNode):
                 'default': False,
                 'type': bool,
             },
+            'machine_ids': {
+                'default': 'cnc1,cnc2,cnc3',
+                'type': str,
+            },
         })
+
+        machine_ids = self.get_machine_ids(params)
 
         self._max_queue = params['max_queue_size']
         self._enable_auction = params['enable_auction']
@@ -139,11 +145,12 @@ class JobSchedulerNode(MiracleLifecycleNode):
             QoSProfiles.command(),
         )
 
-        self._state_sub = self.create_subscription(
+        self._state_subs = self.create_multi_machine_subscriptions(
             MachineState,
-            '/miracle/+/state',
+            'state',
             self._on_machine_state,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
         self.get_logger().info("Job scheduler configured")

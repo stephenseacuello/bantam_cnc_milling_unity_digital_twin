@@ -39,8 +39,8 @@ class SyncEngineNode(MiracleLifecycleNode):
         interpolation_factor (float): Twin state interpolation factor.
 
     Subscribed Topics:
-        /miracle/+/state (MachineState): Physical machine states.
-        /miracle/+/sensor/fused (FusedSensorData): Fused sensor data.
+        /miracle/{machine_id}/state (MachineState): Physical machine states.
+        /miracle/{machine_id}/sensor/fused (FusedSensorData): Fused sensor data.
 
     Published Topics:
         ~/twin_state (MachineState): Digital twin state.
@@ -55,8 +55,8 @@ class SyncEngineNode(MiracleLifecycleNode):
         )
         self._twins: Dict[str, TwinState] = {}
         self._twins_lock = threading.Lock()
-        self._state_sub = None
-        self._sensor_sub = None
+        self._state_subs = []
+        self._sensor_subs = []
         self._twin_pub = None
         self._sync_status_pub = None
         self._sync_timer = None
@@ -81,23 +81,27 @@ class SyncEngineNode(MiracleLifecycleNode):
                 'type': float,
                 'range': (0.0, 1.0),
             },
+            'machine_ids': {'default': 'cnc1,cnc2,cnc3', 'type': str},
         })
 
         self._max_drift = params['max_drift_threshold']
         self._interp_factor = params['interpolation_factor']
+        machine_ids = self.get_machine_ids(params)
 
-        self._state_sub = self.create_subscription(
+        self._state_subs = self.create_multi_machine_subscriptions(
             MachineState,
-            '/miracle/+/state',
+            'state',
             self._on_physical_state,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
-        self._sensor_sub = self.create_subscription(
+        self._sensor_subs = self.create_multi_machine_subscriptions(
             FusedSensorData,
-            '/miracle/+/sensor/fused',
+            'sensor/fused',
             self._on_sensor_data,
             QoSProfiles.sensor_data(),
+            machine_ids,
         )
 
         self._twin_pub = self.create_publisher(

@@ -31,6 +31,7 @@ services:
       - FASTRTPS_DEFAULT_PROFILES_FILE=/miracle_ws/docker/fastdds_profile.xml
     ports:
       - "10000:10000"   # Unity ROS-TCP-Endpoint bridge
+      - "9091:9090"     # HMI WebSocket bridge (host 9091 -> container 9090)
     volumes:
       - miracle_data:/miracle_ws/data
       - miracle_logs:/miracle_ws/log
@@ -38,10 +39,21 @@ services:
       - miracle_net
     depends_on:
       mqtt_broker:
-        condition: service_started
+        condition: service_healthy
       kafka:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'source /opt/ros/jazzy/setup.bash && source /miracle_ws/install/setup.bash && ros2 topic list > /dev/null 2>&1' || exit 1"]
+      interval: 20s
+      timeout: 15s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "6.0"
+          memory: 8G
 
   # ---------------------------------------------------------------------------
   # micro-ROS Agent -- MCU bridge
@@ -59,8 +71,20 @@ services:
     networks:
       - miracle_net
     depends_on:
-      - ros2_miracle
+      ros2_miracle:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f micro_ros_agent || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   # ---------------------------------------------------------------------------
   # Dashboard -- Web monitoring UI
@@ -76,8 +100,20 @@ services:
     networks:
       - miracle_net
     depends_on:
-      - ros2_miracle
+      ros2_miracle:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   # ---------------------------------------------------------------------------
   # MQTT Broker -- Eclipse Mosquitto
@@ -103,9 +139,21 @@ services:
         echo "persistence true"           >> /mosquitto/config/mosquitto.conf &&
         echo "persistence_location /mosquitto/data/" >> /mosquitto/config/mosquitto.conf &&
         echo "log_dest file /mosquitto/log/mosquitto.log" >> /mosquitto/config/mosquitto.conf &&
+        touch /mosquitto/config/passwd &&
         exec mosquitto -c /mosquitto/config/mosquitto.conf
       '
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/broker/uptime' -C 1 -W 3 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
   # ---------------------------------------------------------------------------
   # ZooKeeper -- Kafka dependency
@@ -117,11 +165,26 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr,stat,mntr"
     ports:
       - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
     networks:
       - miracle_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
 
   # ---------------------------------------------------------------------------
   # Kafka -- Event streaming platform
@@ -141,11 +204,25 @@ services:
     ports:
       - "9092:9092"
       - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     networks:
       - miracle_net
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
 
 # =============================================================================
 # Networks
@@ -163,3 +240,9 @@ volumes:
     name: miracle_data
   miracle_logs:
     name: miracle_logs
+  kafka_data:
+    name: miracle_kafka_data
+  zookeeper_data:
+    name: miracle_zookeeper_data
+  zookeeper_logs:
+    name: miracle_zookeeper_logs

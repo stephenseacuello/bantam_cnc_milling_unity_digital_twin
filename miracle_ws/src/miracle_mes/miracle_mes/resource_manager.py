@@ -44,7 +44,7 @@ class ResourceManagerNode(MiracleLifecycleNode):
         check_interval_sec (float): Resource check interval.
 
     Subscribed Topics:
-        /miracle/+/tool_wear (ToolWearEstimate): Tool wear updates.
+        /miracle/{machine_id}/tool_wear (ToolWearEstimate): Tool wear updates.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -56,7 +56,7 @@ class ResourceManagerNode(MiracleLifecycleNode):
         self._tools: Dict[str, ToolResource] = {}
         self._materials: Dict[str, MaterialResource] = {}
         self._resources_lock = threading.Lock()
-        self._tool_wear_sub = None
+        self._tool_wear_subs = None
         self._check_timer = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
@@ -77,13 +77,20 @@ class ResourceManagerNode(MiracleLifecycleNode):
                 'type': float,
                 'range': (1.0, 300.0),
             },
+            'machine_ids': {
+                'default': 'cnc1,cnc2,cnc3',
+                'type': str,
+            },
         })
 
-        self._tool_wear_sub = self.create_subscription(
+        machine_ids = self.get_machine_ids(params)
+
+        self._tool_wear_subs = self.create_multi_machine_subscriptions(
             ToolWearEstimate,
-            '/miracle/+/tool_wear',
+            'tool_wear',
             self._on_tool_wear,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
         # Initialize default tool inventory

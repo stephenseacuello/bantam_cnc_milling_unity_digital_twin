@@ -12,20 +12,23 @@ class SelfHealerNode(MiracleLifecycleNode):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__('self_healer', criticality=self.CRITICALITY_HIGH, **kwargs)
         self._health_sub = None
-        self._anomaly_sub = None
+        self._anomaly_subs = []
 
     def _do_configure(self) -> TransitionCallbackReturn:
-        self.declare_and_validate_parameters({
+        params = self.declare_and_validate_parameters({
             'healing_threshold': {'default': 0.7, 'type': float, 'range': (0.1, 1.0)},
             'max_healing_attempts': {'default': 3, 'type': int, 'range': (1, 10)},
+            'machine_ids': {'default': 'cnc1,cnc2,cnc3', 'type': str},
         })
+        machine_ids = self.get_machine_ids(params)
+
         self._health_sub = self.create_subscription(
             FleetHealth, '/miracle/resiliency/fleet_health',
             self._on_health, QoSProfiles.state_data(),
         )
-        self._anomaly_sub = self.create_subscription(
-            AnomalyAlert, '/miracle/+/anomaly',
-            self._on_anomaly, QoSProfiles.alert(),
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
+            AnomalyAlert, 'anomaly',
+            self._on_anomaly, QoSProfiles.alert(), machine_ids,
         )
         self.get_logger().info("Self-healer configured")
         return TransitionCallbackReturn.SUCCESS

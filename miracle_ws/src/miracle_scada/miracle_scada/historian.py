@@ -29,9 +29,9 @@ class HistorianNode(MiracleLifecycleNode):
         retention_days (int): Data retention period in days.
 
     Subscribed Topics:
-        /miracle/+/state (MachineState): Machine states.
-        /miracle/+/anomaly (AnomalyAlert): Anomaly events.
-        /miracle/+/job_status (JobStatus): Job status updates.
+        /miracle/{machine_id}/state (MachineState): Machine states.
+        /miracle/{machine_id}/anomaly (AnomalyAlert): Anomaly events.
+        /miracle/{machine_id}/job_status (JobStatus): Job status updates.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -40,9 +40,9 @@ class HistorianNode(MiracleLifecycleNode):
             criticality=self.CRITICALITY_MEDIUM,
             **kwargs,
         )
-        self._state_sub = None
-        self._anomaly_sub = None
-        self._job_sub = None
+        self._state_subs = None
+        self._anomaly_subs = None
+        self._job_subs = None
         self._flush_timer = None
 
         self._buffer: deque = deque()
@@ -73,32 +73,41 @@ class HistorianNode(MiracleLifecycleNode):
                 'type': int,
                 'range': (1, 3650),
             },
+            'machine_ids': {
+                'default': 'cnc1,cnc2,cnc3',
+                'type': str,
+            },
         })
+
+        machine_ids = self.get_machine_ids(params)
 
         self._storage_path = params['storage_path']
         self._buffer_size = params['buffer_size']
 
         os.makedirs(self._storage_path, exist_ok=True)
 
-        self._state_sub = self.create_subscription(
+        self._state_subs = self.create_multi_machine_subscriptions(
             MachineState,
-            '/miracle/+/state',
+            'state',
             self._on_state,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
-        self._anomaly_sub = self.create_subscription(
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
             AnomalyAlert,
-            '/miracle/+/anomaly',
+            'anomaly',
             self._on_anomaly,
             QoSProfiles.alert(),
+            machine_ids,
         )
 
-        self._job_sub = self.create_subscription(
+        self._job_subs = self.create_multi_machine_subscriptions(
             JobStatus,
-            '/miracle/+/job_status',
+            'job_status',
             self._on_job_status,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
         self.get_logger().info(f"Historian configured (path={self._storage_path})")

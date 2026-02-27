@@ -97,8 +97,8 @@ class BehaviorTreeExecutorNode(MiracleLifecycleNode):
         tree_library_path (str): Path to BT XML files.
 
     Subscribed Topics:
-        /miracle/+/state (MachineState): Machine states for blackboard.
-        /miracle/+/anomaly (AnomalyAlert): Anomalies for blackboard.
+        /miracle/{machine_id}/state (MachineState): Machine states for blackboard.
+        /miracle/{machine_id}/anomaly (AnomalyAlert): Anomalies for blackboard.
 
     Published Topics:
         ~/tree_status (BehaviorTreeStatus): Tree execution status.
@@ -109,27 +109,29 @@ class BehaviorTreeExecutorNode(MiracleLifecycleNode):
         self._active_trees: Dict[str, tuple] = {}  # id -> (root, blackboard)
         self._tick_timer = None
         self._status_pub = None
-        self._state_sub = None
-        self._anomaly_sub = None
+        self._state_subs = []
+        self._anomaly_subs = []
         self._blackboard: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
     def _do_configure(self) -> TransitionCallbackReturn:
-        self.declare_and_validate_parameters({
+        params = self.declare_and_validate_parameters({
             'tick_rate_hz': {'default': 10.0, 'type': float, 'range': (1.0, 100.0)},
             'tree_library_path': {'default': '', 'type': str},
+            'machine_ids': {'default': 'cnc1,cnc2,cnc3', 'type': str},
         })
+        machine_ids = self.get_machine_ids(params)
 
         self._status_pub = self.create_publisher(
             BehaviorTreeStatus, 'tree_status', QoSProfiles.state_data(),
         )
-        self._state_sub = self.create_subscription(
-            MachineState, '/miracle/+/state',
-            self._on_state, QoSProfiles.state_data(),
+        self._state_subs = self.create_multi_machine_subscriptions(
+            MachineState, 'state',
+            self._on_state, QoSProfiles.state_data(), machine_ids,
         )
-        self._anomaly_sub = self.create_subscription(
-            AnomalyAlert, '/miracle/+/anomaly',
-            self._on_anomaly, QoSProfiles.alert(),
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
+            AnomalyAlert, 'anomaly',
+            self._on_anomaly, QoSProfiles.alert(), machine_ids,
         )
 
         self._blackboard = {'machine_states': {}, 'anomalies': [], 'jobs': {}}

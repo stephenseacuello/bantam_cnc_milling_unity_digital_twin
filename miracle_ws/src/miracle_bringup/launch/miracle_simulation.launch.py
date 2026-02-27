@@ -23,12 +23,13 @@ from launch.actions import (
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import LifecycleNode, PushRosNamespace, SetParameter
+from launch_ros.actions import LifecycleNode, Node as LaunchNode, PushRosNamespace, SetParameter
 
 
 def launch_setup(context, *args, **kwargs):
     """Build the simulation launch dynamically."""
     machine_count = int(LaunchConfiguration('machine_count').perform(context))
+    use_sim_time = LaunchConfiguration('use_sim_time').perform(context).lower() == 'true'
 
     bringup_share = get_package_share_directory('miracle_bringup')
     params_file = os.path.join(bringup_share, 'config', 'miracle_params.yaml')
@@ -37,10 +38,10 @@ def launch_setup(context, *args, **kwargs):
 
     actions.append(LogInfo(msg='--- MIRACLE Simulation Mode ---'))
     actions.append(LogInfo(msg=f'    Machines: {machine_count}'))
-    actions.append(LogInfo(msg='    use_sim_time: true'))
+    actions.append(LogInfo(msg=f'    use_sim_time: {use_sim_time}'))
 
     # Global sim time
-    actions.append(SetParameter(name='use_sim_time', value=True))
+    actions.append(SetParameter(name='use_sim_time', value=use_sim_time))
 
     # ---------------------------------------------------------------
     # CNC Machine nodes (L1)
@@ -82,7 +83,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='discovery_server',
                     name='discovery_server',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -90,7 +91,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='traffic_manager',
                     name='traffic_manager',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -98,7 +99,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='alarm_manager',
                     name='alarm_manager',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -106,7 +107,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='historian',
                     name='historian',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -114,7 +115,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='hmi_bridge',
                     name='hmi_bridge',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
             ]
@@ -133,7 +134,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='job_scheduler',
                     name='job_scheduler',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -141,7 +142,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='fleet_manager',
                     name='fleet_manager',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -149,7 +150,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='digital_thread',
                     name='digital_thread',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -157,7 +158,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='resource_manager',
                     name='resource_manager',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -165,7 +166,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='oee_calculator',
                     name='oee_calculator',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
             ]
@@ -184,7 +185,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='sync_engine',
                     name='sync_engine',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -192,7 +193,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='gazebo_bridge',
                     name='gazebo_bridge',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -200,7 +201,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='prediction_runner',
                     name='prediction_runner',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -208,7 +209,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='scenario_manager',
                     name='scenario_manager',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
             ]
@@ -227,7 +228,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='anomaly_detector',
                     name='anomaly_detector',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -235,7 +236,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='phm_predictor',
                     name='phm_predictor',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -243,7 +244,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='tool_wear_estimator',
                     name='tool_wear_estimator',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -251,7 +252,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='chatter_detector',
                     name='chatter_detector',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
                 LifecycleNode(
@@ -259,7 +260,7 @@ def launch_setup(context, *args, **kwargs):
                     executable='model_manager',
                     name='model_manager',
                     namespace='',
-                    parameters=[params_file, {'use_sim_time': True}],
+                    parameters=[params_file, {'use_sim_time': use_sim_time}],
                     output='screen',
                 ),
             ]
@@ -305,6 +306,25 @@ def launch_setup(context, *args, **kwargs):
         )
     )
 
+    # ---------------------------------------------------------------
+    # Auto-start: configure + activate all lifecycle nodes
+    # ---------------------------------------------------------------
+    actions.append(
+        LaunchNode(
+            package='miracle_bringup',
+            executable='lifecycle_autostart',
+            name='lifecycle_autostart',
+            namespace='miracle',
+            parameters=[{
+                'startup_delay': 15.0,
+                'per_node_timeout': 10.0,
+                'max_retries': 2,
+                'use_sim_time': use_sim_time,
+            }],
+            output='screen',
+        )
+    )
+
     return actions
 
 
@@ -315,6 +335,11 @@ def generate_launch_description():
             'machine_count',
             default_value='3',
             description='Number of CNC machines to simulate',
+        ),
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='true',
+            description='Use simulated clock (requires /clock publisher)',
         ),
 
         OpaqueFunction(function=launch_setup),

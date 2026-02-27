@@ -37,7 +37,7 @@ class FleetManagerNode(MiracleLifecycleNode):
         status_publish_rate_hz (float): Fleet status publish rate.
 
     Subscribed Topics:
-        /miracle/+/state (MachineState): Machine states.
+        /miracle/{machine_id}/state (MachineState): Machine states.
 
     Published Topics:
         ~/fleet_health (FleetHealth): Aggregated fleet health.
@@ -54,7 +54,7 @@ class FleetManagerNode(MiracleLifecycleNode):
         )
         self._machines: Dict[str, MachineInfo] = {}
         self._machines_lock = threading.Lock()
-        self._state_sub = None
+        self._state_subs = None
         self._health_pub = None
         self._status_srv = None
         self._publish_timer = None
@@ -72,13 +72,20 @@ class FleetManagerNode(MiracleLifecycleNode):
                 'type': float,
                 'range': (0.1, 10.0),
             },
+            'machine_ids': {
+                'default': 'cnc1,cnc2,cnc3',
+                'type': str,
+            },
         })
 
-        self._state_sub = self.create_subscription(
+        machine_ids = self.get_machine_ids(params)
+
+        self._state_subs = self.create_multi_machine_subscriptions(
             MachineState,
-            '/miracle/+/state',
+            'state',
             self._on_machine_state,
             QoSProfiles.state_data(),
+            machine_ids,
         )
 
         self._health_pub = self.create_publisher(

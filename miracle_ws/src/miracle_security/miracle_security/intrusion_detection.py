@@ -6,10 +6,11 @@ indicative of cyber attacks. Uses behavioral analysis and
 signature-based detection.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict, deque
 import threading
 import hashlib
+import time
 
 from rclpy.lifecycle import TransitionCallbackReturn
 
@@ -47,10 +48,13 @@ class IntrusionDetectionNode(MiracleLifecycleNode):
         self._known_nodes: set = set()
         self._msg_counts: Dict[str, int] = defaultdict(int)
         self._msg_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self._burst_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
         self._lock = threading.Lock()
         self._max_rate: int = 1000
         self._alert_unknown: bool = True
         self._alert_count: int = 0
+        # Maximum allowed axis position in mm (anything beyond is suspicious)
+        self._max_axis_position_mm: float = 10000.0
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure IDS."""
@@ -113,11 +117,11 @@ class IntrusionDetectionNode(MiracleLifecycleNode):
         node_id = f"{msg.node_namespace}/{msg.node_name}"
 
         with self._lock:
-            # Track message rate
+            # Track message rate using monotonic clock for precision
+            now = time.monotonic()
             self._msg_counts[node_id] += 1
-            self._msg_history[node_id].append(
-                self.get_clock().now().nanoseconds / 1e9
-            )
+            self._msg_history[node_id].append(now)
+            self._burst_history[node_id].append(now)
 
             # Check for unknown nodes
             if node_id not in self._known_nodes:
@@ -152,8 +156,31 @@ class IntrusionDetectionNode(MiracleLifecycleNode):
                         confidence=0.85,
                     )
 
+            # Burst detection: check if >10x normal rate in 1s window
+            now = time.monotonic()
+            for node_id, timestamps in self._burst_history.items():
+                if len(timestamps) < 2:
+                    continue
+                # Count messages in the last 1 second
+                one_sec_ago = now - 1.0
+                burst_count = sum(1 for ts in timestamps if ts >= one_sec_ago)
+                # Normal rate per second
+                normal_rate = self._max_rate / interval if interval > 0 else 1
+                if burst_count > normal_rate * 10:
+                    self._publish_alert(
+                        severity='CRITICAL',
+                        category='BURST_DETECTED',
+                        source=node_id,
+                        description=(
+                            f'Burst detected from {node_id}: '
+                            f'{burst_count} msgs in 1s window '
+                            f'(>{normal_rate * 10:.0f} threshold)'
+                        ),
+                        affected=[node_id],
+                        confidence=0.95,
+                    )
+
             # Check for disappeared nodes (potential DoS)
-            now = self.get_clock().now().nanoseconds / 1e9
             for node_id in list(self._known_nodes):
                 if node_id in self._msg_history:
                     history = self._msg_history[node_id]
@@ -196,12 +223,72 @@ class IntrusionDetectionNode(MiracleLifecycleNode):
         self._alert_pub.publish(msg)
         self.get_logger().warn(f"Security alert: [{severity}] {description}")
 
+    def _inspect_payload(self, node_id: str, payload: Dict) -> bool:
+        """Inspect message payload for unreasonable values.
+
+        Checks axis positions and other numeric fields for values that
+        would indicate a spoofed or corrupted message.
+
+        Args:
+            node_id: Source node identifier.
+            payload: Message payload as a dictionary.
+
+        Returns:
+            True if the payload is safe, False if suspicious.
+        """
+        # Check axis positions (x, y, z) for unreasonable values
+        for axis in ('x', 'y', 'z', 'position_x', 'position_y', 'position_z'):
+            value = payload.get(axis)
+            if value is not None:
+                try:
+                    pos = float(value)
+                    if abs(pos) > self._max_axis_position_mm:
+                        self._publish_alert(
+                            severity='CRITICAL',
+                            category='PAYLOAD_ANOMALY',
+                            source=node_id,
+                            description=(
+                                f'Unreasonable axis position from {node_id}: '
+                                f'{axis}={pos}mm (max={self._max_axis_position_mm}mm)'
+                            ),
+                            affected=[node_id],
+                            confidence=0.99,
+                        )
+                        return False
+                except (ValueError, TypeError):
+                    pass
+
+        # Check spindle speed for unreasonable values
+        spindle = payload.get('spindle_speed') or payload.get('rpm')
+        if spindle is not None:
+            try:
+                rpm = float(spindle)
+                if rpm < -1 or rpm > 100000:
+                    self._publish_alert(
+                        severity='HIGH',
+                        category='PAYLOAD_ANOMALY',
+                        source=node_id,
+                        description=(
+                            f'Unreasonable spindle speed from {node_id}: '
+                            f'{rpm} RPM'
+                        ),
+                        affected=[node_id],
+                        confidence=0.95,
+                    )
+                    return False
+            except (ValueError, TypeError):
+                pass
+
+        return True
+
     @staticmethod
     def _get_recommendation(category: str) -> str:
         """Get recommended action for alert category."""
         recommendations = {
             'UNKNOWN_NODE': 'Verify node identity and authorize if legitimate',
             'RATE_ANOMALY': 'Investigate source for potential flood attack',
+            'BURST_DETECTED': 'Immediately rate-limit or isolate the source node',
+            'PAYLOAD_ANOMALY': 'Isolate node and inspect for compromise or sensor malfunction',
             'NODE_DISAPPEARED': 'Check node health and network connectivity',
             'SIGNATURE_MATCH': 'Isolate affected node immediately',
         }

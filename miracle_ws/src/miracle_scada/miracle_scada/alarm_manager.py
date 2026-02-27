@@ -50,7 +50,7 @@ class AlarmManagerNode(MiracleLifecycleNode):
         history_size (int): Number of alarms to retain in history.
 
     Subscribed Topics:
-        /miracle/+/anomaly (AnomalyAlert): Anomaly alerts from machines.
+        /miracle/{machine_id}/anomaly (AnomalyAlert): Anomaly alerts from machines.
         /miracle/security/alerts (SecurityAlert): Security alerts.
 
     Published Topics:
@@ -66,7 +66,7 @@ class AlarmManagerNode(MiracleLifecycleNode):
         self._active_alarms: Dict[str, Alarm] = {}
         self._alarm_history: List[Alarm] = []
         self._alarms_lock = threading.Lock()
-        self._anomaly_sub = None
+        self._anomaly_subs = None
         self._security_sub = None
         self._escalation_timer = None
         self._max_alarms: int = 1000
@@ -91,17 +91,24 @@ class AlarmManagerNode(MiracleLifecycleNode):
                 'type': int,
                 'range': (100, 1000000),
             },
+            'machine_ids': {
+                'default': 'cnc1,cnc2,cnc3',
+                'type': str,
+            },
         })
+
+        machine_ids = self.get_machine_ids(params)
 
         self._max_alarms = params['max_active_alarms']
         self._escalation_timeout = params['escalation_timeout_sec']
         self._history_size = params['history_size']
 
-        self._anomaly_sub = self.create_subscription(
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
             AnomalyAlert,
-            '/miracle/+/anomaly',
+            'anomaly',
             self._on_anomaly,
             QoSProfiles.alert(),
+            machine_ids,
         )
 
         self._security_sub = self.create_subscription(

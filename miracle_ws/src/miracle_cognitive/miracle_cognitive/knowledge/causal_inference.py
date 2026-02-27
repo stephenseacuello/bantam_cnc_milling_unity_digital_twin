@@ -35,20 +35,22 @@ class CausalInferenceNode(MiracleLifecycleNode):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__('causal_inference', criticality=self.CRITICALITY_MEDIUM, **kwargs)
         self._causal_graph: Dict[str, List[CausalLink]] = {}
-        self._anomaly_sub = None
+        self._anomaly_subs = []
         self._inference_pub = None
         self._analysis_timer = None
         self._lock = threading.Lock()
 
     def _do_configure(self) -> TransitionCallbackReturn:
-        self.declare_and_validate_parameters({
+        params = self.declare_and_validate_parameters({
             'min_evidence': {'default': 3, 'type': int, 'range': (1, 100)},
             'analysis_interval_sec': {'default': 30.0, 'type': float, 'range': (5.0, 300.0)},
+            'machine_ids': {'default': 'cnc1,cnc2,cnc3', 'type': str},
         })
+        machine_ids = self.get_machine_ids(params)
 
-        self._anomaly_sub = self.create_subscription(
-            AnomalyAlert, '/miracle/+/anomaly',
-            self._on_anomaly, QoSProfiles.alert(),
+        self._anomaly_subs = self.create_multi_machine_subscriptions(
+            AnomalyAlert, 'anomaly',
+            self._on_anomaly, QoSProfiles.alert(), machine_ids,
         )
         self._inference_pub = self.create_publisher(
             KnowledgeUpdate, 'causal_inferences', QoSProfiles.state_data(),

@@ -224,6 +224,57 @@ services:
           cpus: "2.0"
           memory: 2G
 
+  # ---------------------------------------------------------------------------
+  # Prometheus -- Metrics collection
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: miracle_prometheus
+    hostname: miracle-prometheus
+    ports:
+      - "9190:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - miracle_net
+    depends_on:
+      ros2_miracle:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Grafana -- Dashboards and visualization
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: miracle_grafana
+    hostname: miracle-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=miracle
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - miracle_net
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
 # =============================================================================
 # Networks
 # =============================================================================
@@ -246,3 +297,5 @@ volumes:
     name: miracle_zookeeper_data
   zookeeper_logs:
     name: miracle_zookeeper_logs
+  grafana_data:
+    name: miracle_grafana_data

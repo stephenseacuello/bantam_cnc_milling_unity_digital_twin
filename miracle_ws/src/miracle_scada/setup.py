@@ -25,6 +25,7 @@ setup(
             'alarm_manager = miracle_scada.alarm_manager:main',
             'historian = miracle_scada.historian:main',
             'hmi_bridge = miracle_scada.hmi_bridge:main',
+            'prometheus_exporter = miracle_scada.prometheus_exporter:main',
         ],
     },
 )

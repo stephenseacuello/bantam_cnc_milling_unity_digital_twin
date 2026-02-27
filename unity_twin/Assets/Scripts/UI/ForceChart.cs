@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UIElements;
+using Unity.Profiling;
 using MiracleTwin.Core;
 
 namespace MiracleTwin.UI
@@ -30,6 +31,10 @@ namespace MiracleTwin.UI
         private static readonly Color GridColor = new(0.3f, 0.3f, 0.3f, 0.5f);
         private static readonly Color BackgroundColor = new(0.1f, 0.1f, 0.12f, 0.9f);
         private static readonly Color AxisLabelColor = new(0.7f, 0.7f, 0.7f, 1f);
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+        private static readonly ProfilerMarker s_GenerateVisualContentMarker = new("ForceChart.OnGenerateVisualContent");
+#endif
 
         private readonly Queue<Vector3> forceSamples = new();
         private float lastSampleTime;
@@ -97,6 +102,11 @@ namespace MiracleTwin.UI
             var painter = ctx.painter2D;
             Rect rect = chartElement.contentRect;
             if (rect.width < 10 || rect.height < 10) return;
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            using (s_GenerateVisualContentMarker.Auto())
+            {
+#endif
 
             float padding = 40f;     // Left padding for Y-axis labels
             float rightPad = 10f;
@@ -201,6 +211,10 @@ namespace MiracleTwin.UI
             painter.LineTo(new Vector2(legendX + keySpacing * 2, legendY + keySize));
             painter.ClosePath();
             painter.Fill();
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            }
+#endif
         }
 
         /// <summary>

@@ -1,5 +1,6 @@
 using UnityEngine;
 using Unity.Mathematics;
+using Unity.Profiling;
 
 namespace MiracleTwin.Cutting
 {
@@ -28,6 +29,12 @@ namespace MiracleTwin.Cutting
 
         private static readonly int3 ChunkSize = new(16, 16, 16);
         private static readonly int3 ChunksCount = new(16, 11, 16); // ceil(GridSize / ChunkSize)
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+        private static readonly ProfilerMarker s_SubtractToolMarker = new("VoxelWorkpiece.SubtractTool");
+        private static readonly ProfilerMarker s_RenderMeshMarker = new("VoxelWorkpiece.RenderMesh");
+        private static readonly ProfilerMarker s_CountEngagedMarker = new("VoxelWorkpiece.CountEngaged");
+#endif
 
         [Header("Compute Shaders")]
         [SerializeField] private ComputeShader subtractShader;
@@ -87,6 +94,27 @@ namespace MiracleTwin.Cutting
         {
             if (IsInitialized) return;
 
+            if (!SystemInfo.supportsComputeShaders)
+            {
+                Debug.LogWarning("[VoxelWorkpiece] Compute shaders not supported on this GPU. Using fallback mesh.");
+                CreateFallbackMesh();
+                return;
+            }
+
+            try
+            {
+                InitializeGPU();
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[VoxelWorkpiece] GPU initialization failed: {ex.Message}. Using fallback mesh.");
+                ReleaseGPUResources();
+                CreateFallbackMesh();
+            }
+        }
+
+        private void InitializeGPU()
+        {
             TotalVoxels = GridSize.x * GridSize.y * GridSize.z;
             totalBitWords = (TotalVoxels + 31) / 32;
             totalChunks = ChunksCount.x * ChunksCount.y * ChunksCount.z;
@@ -136,12 +164,69 @@ namespace MiracleTwin.Cutting
         }
 
         /// <summary>
+        /// Fallback for systems without compute shader support.
+        /// Creates a simple box mesh matching the workpiece dimensions.
+        /// </summary>
+        private void CreateFallbackMesh()
+        {
+            TotalVoxels = GridSize.x * GridSize.y * GridSize.z;
+
+            var meshFilter = gameObject.GetComponent<MeshFilter>();
+            if (meshFilter == null)
+                meshFilter = gameObject.AddComponent<MeshFilter>();
+
+            var meshRenderer = gameObject.GetComponent<MeshRenderer>();
+            if (meshRenderer == null)
+                meshRenderer = gameObject.AddComponent<MeshRenderer>();
+
+            if (workpieceMaterial != null)
+                meshRenderer.material = workpieceMaterial;
+
+            // Create a box mesh matching WorkpieceSize
+            var mesh = new Mesh { name = "VoxelWorkpiece_Fallback" };
+            Vector3 size = WorkpieceSize;
+            Vector3 half = size * 0.5f;
+
+            mesh.vertices = new Vector3[]
+            {
+                // Front face
+                new(-half.x, -half.y, -half.z), new(half.x, -half.y, -half.z),
+                new(half.x, half.y, -half.z), new(-half.x, half.y, -half.z),
+                // Back face
+                new(-half.x, -half.y, half.z), new(half.x, -half.y, half.z),
+                new(half.x, half.y, half.z), new(-half.x, half.y, half.z),
+            };
+
+            mesh.triangles = new int[]
+            {
+                0,2,1, 0,3,2,  // Front
+                5,6,4, 4,6,7,  // Back
+                4,3,0, 4,7,3,  // Left
+                1,2,5, 5,2,6,  // Right
+                3,6,2, 3,7,6,  // Top
+                4,1,5, 4,0,1,  // Bottom
+            };
+
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+            meshFilter.mesh = mesh;
+
+            IsInitialized = true;
+            Debug.Log("[VoxelWorkpiece] Fallback mesh created (compute shaders unavailable).");
+        }
+
+        /// <summary>
         /// Subtract tool volume from the voxel grid along a line segment.
         /// Call once per simulation step with previous and current tool tip positions.
         /// </summary>
         public int SubtractTool(Vector3 prevTipWorld, Vector3 currTipWorld, float toolRadius)
         {
             if (!IsInitialized || subtractShader == null) return 0;
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            using (s_SubtractToolMarker.Auto())
+            {
+#endif
 
             // Transform to local space
             Vector3 prevLocal = transform.InverseTransformPoint(prevTipWorld);
@@ -173,6 +258,9 @@ namespace MiracleTwin.Cutting
             int newlyRemoved = removedCountReadback[0];
             RemovedVoxels += newlyRemoved;
 
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            }
+#endif
             return newlyRemoved;
         }
 
@@ -183,6 +271,11 @@ namespace MiracleTwin.Cutting
         public int CountEngagedVoxels(Vector3 prevTipWorld, Vector3 currTipWorld, float toolRadius)
         {
             if (!IsInitialized || subtractShader == null) return 0;
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            using (s_CountEngagedMarker.Auto())
+            {
+#endif
 
             Vector3 prevLocal = transform.InverseTransformPoint(prevTipWorld);
             Vector3 currLocal = transform.InverseTransformPoint(currTipWorld);
@@ -205,6 +298,10 @@ namespace MiracleTwin.Cutting
 
             engagedCountBuffer.GetData(engagedCountReadback);
             EngagedVoxelCount = engagedCountReadback[0];
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            }
+#endif
             return EngagedVoxelCount;
         }
 
@@ -212,6 +309,11 @@ namespace MiracleTwin.Cutting
         public void RenderMesh()
         {
             if (!IsInitialized || marchingCubesShader == null || workpieceMaterial == null) return;
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            using (s_RenderMeshMarker.Auto())
+            {
+#endif
 
             vertexBuffer.SetCounterValue(0);
 
@@ -263,6 +365,10 @@ namespace MiracleTwin.Cutting
                 MeshTopology.Triangles,
                 triCountBuffer
             );
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            }
+#endif
         }
 
         /// <summary>

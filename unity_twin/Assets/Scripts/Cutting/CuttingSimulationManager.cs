@@ -404,5 +404,13 @@ namespace MiracleTwin.Cutting
             toolEndOfLifePauseTriggered = false;
             Debug.Log("[CuttingSimulationManager] Tool wear reset (tool change).");
         }
+
+        /// <summary>
+        /// Replace the VoxelWorkpiece reference at runtime (for machine switching).
+        /// </summary>
+        public void SetVoxelWorkpiece(VoxelWorkpiece wp)
+        {
+            voxelWorkpiece = wp;
+        }
     }
 }

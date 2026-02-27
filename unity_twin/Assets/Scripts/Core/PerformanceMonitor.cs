@@ -63,6 +63,15 @@ namespace MiracleTwin.Core
         /// <summary>True when FPS is currently below the low FPS threshold.</summary>
         public bool IsLowFPS { get; private set; }
 
+        /// <summary>Number of dirty voxel chunks processed this frame.</summary>
+        public int DirtyChunksPerFrame { get; set; }
+
+        /// <summary>Total triangle count from voxel marching cubes rendering.</summary>
+        public int VoxelTriangleCount { get; set; }
+
+        /// <summary>Percentage of workpiece material removed (0-100).</summary>
+        public float MaterialRemovalPct { get; set; }
+
         /// <summary>Fired when FPS drops below the threshold. Parameter: current average FPS.</summary>
         public event Action<float> OnLowFPS;
 
@@ -174,6 +183,7 @@ namespace MiracleTwin.Core
             return $"FPS: {AverageFPS:F0} (min:{MinFPS:F0} max:{MaxFPS:F0}) | " +
                    $"GPU: {GpuFrameTimeMs:F1}ms | CPU: {CpuFrameTimeMs:F1}ms | " +
                    $"Draws: {TotalDrawCalls} | Tris: {TotalTriangles} | " +
+                   $"Voxel: {DirtyChunksPerFrame} chunks, {VoxelTriangleCount} tris, {MaterialRemovalPct:F1}% removed | " +
                    $"Mem: {TotalAllocatedMemoryMB:F0}MB";
         }
 

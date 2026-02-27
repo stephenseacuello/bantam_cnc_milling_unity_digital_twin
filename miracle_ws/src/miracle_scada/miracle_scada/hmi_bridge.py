@@ -269,6 +269,12 @@ class HMIBridgeNode(MiracleLifecycleNode):
                 self._broadcast_to_clients(payload),
                 self._ws_loop,
             )
+        except RuntimeError as exc:
+            # Event loop may be shutting down during node deactivation
+            self.get_logger().debug(
+                f"Broadcast skipped (event loop shutdown): {exc}",
+                throttle_duration_sec=30.0,
+            )
         except Exception as exc:
             self.get_logger().debug(
                 f"Broadcast error: {exc}", throttle_duration_sec=10.0

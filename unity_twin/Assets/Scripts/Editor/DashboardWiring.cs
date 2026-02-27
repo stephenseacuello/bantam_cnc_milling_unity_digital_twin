@@ -322,6 +322,13 @@ namespace MiracleTwin.Editor
             selectorSO.ApplyModifiedProperties();
             Debug.Log($"[DashboardWiring] Wired CNCMachineSelector with {wiredControllers.Count} machine(s).");
 
+            if (wiredControllers.Count == 0)
+            {
+                Debug.LogWarning("[DashboardWiring] WARNING: No CNC machines were wired! " +
+                    $"Expected GameObjects named: {string.Join(", ", BantamNames)} or {string.Join(", ", CR1Names)}. " +
+                    "The dashboard will have no machine data.");
+            }
+
             // ── Step 9: Add LocalCNCTestDriver for testing without ROS2 ──
             LocalCNCTestDriver testDriver = dashboardGO.GetComponent<LocalCNCTestDriver>();
             if (testDriver == null)

@@ -11,6 +11,7 @@ using MiracleTwin.Testing;
 using MiracleTwin.Cutting;
 using MiracleTwin.Robots;
 using MiracleTwin.Visualization;
+using MiracleTwin.Audio;
 
 namespace MiracleTwin.Editor
 {
@@ -362,7 +363,116 @@ namespace MiracleTwin.Editor
                 Debug.Log("[DashboardWiring] Wired CuttingSimulationManager → DashboardOverlay.");
             }
 
-            // ── Step 11: Save scene ──
+            // ── Step 11: Wire GCodeExecutor on ALL CNC machines + GCodeEditor on DashboardUI ──
+            GCodeExecutor primaryExecutor = null;
+            foreach (var controller in wiredControllers)
+            {
+                var exec = controller.gameObject.GetComponent<GCodeExecutor>();
+                if (exec == null)
+                    exec = controller.gameObject.AddComponent<GCodeExecutor>();
+
+                var simMgr = controller.gameObject.GetComponent<CuttingSimulationManager>();
+                var execSO = new SerializedObject(exec);
+                execSO.FindProperty("cncControllerObject").objectReferenceValue = controller;
+                if (simMgr != null)
+                    execSO.FindProperty("cuttingSimManager").objectReferenceValue = simMgr;
+                execSO.ApplyModifiedProperties();
+
+                if (primaryExecutor == null)
+                    primaryExecutor = exec;
+
+                Debug.Log($"[DashboardWiring] Wired GCodeExecutor on {(controller as ICNCController)?.MachineName ?? controller.name}.");
+            }
+
+            if (primaryExecutor != null)
+            {
+                // GCodeEditor on the DashboardUI
+                GCodeEditor gCodeEditor = dashboardGO.GetComponent<GCodeEditor>();
+                if (gCodeEditor == null)
+                    gCodeEditor = dashboardGO.AddComponent<GCodeEditor>();
+
+                var editorSO = new SerializedObject(gCodeEditor);
+                editorSO.FindProperty("uiDocument").objectReferenceValue = uiDocument;
+                editorSO.FindProperty("gCodeExecutor").objectReferenceValue = primaryExecutor;
+                editorSO.ApplyModifiedProperties();
+                Debug.Log("[DashboardWiring] Wired GCodeEditor on DashboardUI.");
+
+                // ToolpathPreview under _Managers
+                var toolpathPreviewGO = managersRoot.transform.Find("ToolpathPreview");
+                GameObject tpGO;
+                if (toolpathPreviewGO != null)
+                    tpGO = toolpathPreviewGO.gameObject;
+                else
+                {
+                    tpGO = new GameObject("ToolpathPreview");
+                    tpGO.transform.SetParent(managersRoot.transform);
+                    Undo.RegisterCreatedObjectUndo(tpGO, "Create ToolpathPreview");
+                }
+
+                var toolpathPreview = tpGO.GetComponent<Visualization.ToolpathPreview>();
+                if (toolpathPreview == null)
+                    toolpathPreview = tpGO.AddComponent<Visualization.ToolpathPreview>();
+
+                var tpSO = new SerializedObject(toolpathPreview);
+                tpSO.FindProperty("gCodeExecutor").objectReferenceValue = primaryExecutor;
+                tpSO.ApplyModifiedProperties();
+                Debug.Log("[DashboardWiring] Wired ToolpathPreview under _Managers.");
+            }
+
+            // ── Step 12: Wire audio controllers on CNC machines ──
+            var cuttingStateAsset = AssetDatabase.LoadAssetAtPath<CuttingStateEventSO>($"{EventFolder}/CuttingStateEvent.asset");
+            foreach (var controller in wiredControllers)
+            {
+                var machineGO = controller.gameObject;
+                string mName = (controller as ICNCController)?.MachineName ?? machineGO.name;
+
+                // SpindleSoundController
+                var spindleSound = machineGO.GetComponent<SpindleSoundController>();
+                if (spindleSound == null)
+                    spindleSound = machineGO.AddComponent<SpindleSoundController>();
+
+                var ssSO = new SerializedObject(spindleSound);
+                ssSO.FindProperty("machineStateEvent").objectReferenceValue = machineStateAsset;
+                ssSO.ApplyModifiedProperties();
+
+                // CuttingSoundController
+                var cuttingSound = machineGO.GetComponent<CuttingSoundController>();
+                if (cuttingSound == null)
+                    cuttingSound = machineGO.AddComponent<CuttingSoundController>();
+
+                var csSO = new SerializedObject(cuttingSound);
+                csSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateAsset;
+                csSO.ApplyModifiedProperties();
+
+                Debug.Log($"[DashboardWiring] Wired SpindleSoundController + CuttingSoundController on {mName}.");
+            }
+
+            // ── Step 13: Wire live charts on DashboardUI ──
+            WireLiveCharts(dashboardGO, uiDocument, cuttingStateAsset);
+
+            // ── Step 14: Wire VoxelWorkpiece + HeatMapOverlay + ForceArrowRenderer on CNC machines ──
+            foreach (var controller in wiredControllers)
+            {
+                WireVoxelWorkpiece(controller.gameObject, controller.name);
+                WireHeatMapOverlay(controller.gameObject, cuttingStateAsset);
+                WireForceArrowRenderer(controller.gameObject, cuttingStateAsset);
+            }
+
+            // Re-link VoxelWorkpiece into CuttingSimulationManagers (now that we created them)
+            foreach (var controller in wiredControllers)
+            {
+                var vw = controller.GetComponentInChildren<VoxelWorkpiece>();
+                var sm = controller.GetComponent<CuttingSimulationManager>();
+                if (vw != null && sm != null)
+                {
+                    var smSO2 = new SerializedObject(sm);
+                    smSO2.FindProperty("voxelWorkpiece").objectReferenceValue = vw;
+                    smSO2.ApplyModifiedProperties();
+                    Debug.Log($"[DashboardWiring] Linked VoxelWorkpiece → CuttingSimulationManager on {controller.name}.");
+                }
+            }
+
+            // ── Step 15: Save scene ──
             EditorSceneManager.MarkSceneDirty(UnityEngine.SceneManagement.SceneManager.GetActiveScene());
             EditorSceneManager.SaveOpenScenes();
             Debug.Log("[DashboardWiring] Dashboard wiring complete. Scene saved.");
@@ -856,6 +966,237 @@ namespace MiracleTwin.Editor
 
             foreach (Transform child in t)
                 LogHierarchy(child, depth + 1);
+        }
+
+        /// <summary>
+        /// Wire ForceChart, ThermalChart, ToolWearChart, and PowerChart onto the DashboardUI.
+        /// Each chart finds its target VisualElement by name in the UIDocument.
+        /// </summary>
+        private static void WireLiveCharts(GameObject dashboardGO, UIDocument uiDocument,
+            CuttingStateEventSO cuttingStateEvent)
+        {
+            if (cuttingStateEvent == null)
+            {
+                Debug.LogWarning("[DashboardWiring] CuttingStateEvent missing — cannot wire charts.");
+                return;
+            }
+
+            // ForceChart
+            var forceChart = dashboardGO.GetComponent<ForceChart>();
+            if (forceChart == null)
+                forceChart = dashboardGO.AddComponent<ForceChart>();
+            var fcSO = new SerializedObject(forceChart);
+            fcSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateEvent;
+            fcSO.FindProperty("uiDocument").objectReferenceValue = uiDocument;
+            fcSO.ApplyModifiedProperties();
+
+            // ThermalChart
+            var thermalChart = dashboardGO.GetComponent<ThermalChart>();
+            if (thermalChart == null)
+                thermalChart = dashboardGO.AddComponent<ThermalChart>();
+            var tcSO = new SerializedObject(thermalChart);
+            tcSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateEvent;
+            tcSO.FindProperty("uiDocument").objectReferenceValue = uiDocument;
+            tcSO.ApplyModifiedProperties();
+
+            // ToolWearChart
+            var toolWearChart = dashboardGO.GetComponent<ToolWearChart>();
+            if (toolWearChart == null)
+                toolWearChart = dashboardGO.AddComponent<ToolWearChart>();
+            var twSO = new SerializedObject(toolWearChart);
+            twSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateEvent;
+            twSO.FindProperty("uiDocument").objectReferenceValue = uiDocument;
+            twSO.ApplyModifiedProperties();
+
+            // PowerChart
+            var powerChart = dashboardGO.GetComponent<PowerChart>();
+            if (powerChart == null)
+                powerChart = dashboardGO.AddComponent<PowerChart>();
+            var pcSO = new SerializedObject(powerChart);
+            pcSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateEvent;
+            pcSO.FindProperty("uiDocument").objectReferenceValue = uiDocument;
+            pcSO.ApplyModifiedProperties();
+
+            Debug.Log("[DashboardWiring] Wired 4 live charts (Force, Thermal, ToolWear, Power) on DashboardUI.");
+        }
+
+        /// <summary>
+        /// Create a Workpiece child GameObject under the CNC machine with VoxelWorkpiece component.
+        /// Assigns compute shaders and creates a ProceduralWorkpiece material instance.
+        /// </summary>
+        private static void WireVoxelWorkpiece(GameObject machineGO, string machineName)
+        {
+            // Check if VoxelWorkpiece already exists on this machine
+            var existing = machineGO.GetComponentInChildren<VoxelWorkpiece>();
+            if (existing != null)
+            {
+                Debug.Log($"[DashboardWiring] VoxelWorkpiece already exists on {machineName} — skipping.");
+                return;
+            }
+
+            // Load compute shaders
+            var subtractShader = AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Compute/VoxelSubtraction.compute");
+            var marchingCubesShader = AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Compute/MarchingCubes.compute");
+            var engagementShader = AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Compute/VoxelEngagement.compute");
+
+            if (subtractShader == null || marchingCubesShader == null)
+            {
+                Debug.LogWarning($"[DashboardWiring] Compute shaders not found — cannot create VoxelWorkpiece on {machineName}. " +
+                    "Ensure Assets/Compute/VoxelSubtraction.compute and MarchingCubes.compute exist.");
+                return;
+            }
+
+            // Load or create the procedural workpiece material
+            const string materialPath = "Assets/Materials/ProceduralWorkpiece.mat";
+            Material workpieceMat = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+            if (workpieceMat == null)
+            {
+                var shader = Shader.Find("MIRACLE/ProceduralWorkpiece");
+                if (shader == null)
+                {
+                    Debug.LogWarning("[DashboardWiring] Shader 'MIRACLE/ProceduralWorkpiece' not found. " +
+                        "Ensure Assets/Shaders/ProceduralWorkpiece.shader exists and compiles.");
+                    return;
+                }
+                workpieceMat = new Material(shader);
+                workpieceMat.name = "ProceduralWorkpiece";
+                EnsureFolderExists("Assets/Materials");
+                AssetDatabase.CreateAsset(workpieceMat, materialPath);
+                AssetDatabase.SaveAssets();
+                Debug.Log($"[DashboardWiring] Created ProceduralWorkpiece material at {materialPath}.");
+            }
+
+            // Create Workpiece child GameObject
+            Transform workpieceTransform = machineGO.transform.Find("Workpiece");
+            GameObject workpieceGO;
+            if (workpieceTransform != null)
+            {
+                workpieceGO = workpieceTransform.gameObject;
+            }
+            else
+            {
+                workpieceGO = new GameObject("Workpiece");
+                workpieceGO.transform.SetParent(machineGO.transform);
+                workpieceGO.transform.localPosition = Vector3.zero;
+                workpieceGO.transform.localRotation = Quaternion.identity;
+                Undo.RegisterCreatedObjectUndo(workpieceGO, $"Create Workpiece ({machineName})");
+            }
+
+            // Add VoxelWorkpiece component
+            var voxelWorkpiece = workpieceGO.GetComponent<VoxelWorkpiece>();
+            if (voxelWorkpiece == null)
+                voxelWorkpiece = workpieceGO.AddComponent<VoxelWorkpiece>();
+
+            var vwSO = new SerializedObject(voxelWorkpiece);
+            vwSO.FindProperty("subtractShader").objectReferenceValue = subtractShader;
+            vwSO.FindProperty("marchingCubesShader").objectReferenceValue = marchingCubesShader;
+            vwSO.FindProperty("engagementShader").objectReferenceValue = engagementShader;
+            vwSO.FindProperty("workpieceMaterial").objectReferenceValue = workpieceMat;
+            vwSO.ApplyModifiedProperties();
+
+            Debug.Log($"[DashboardWiring] Created VoxelWorkpiece on {machineName}/Workpiece with compute shaders + ProceduralWorkpiece material.");
+        }
+
+        /// <summary>
+        /// Wire HeatMapOverlay onto a CNC machine. Creates a child MeshRenderer quad
+        /// that the overlay shader renders onto, positioned over the workpiece area.
+        /// </summary>
+        private static void WireHeatMapOverlay(GameObject machineGO, CuttingStateEventSO cuttingStateEvent)
+        {
+            var existing = machineGO.GetComponentInChildren<HeatMapOverlay>();
+            if (existing != null) return;
+
+            // Load heat map material
+            const string heatMatPath = "Assets/Materials/WorkpieceHeatMap.mat";
+            var heatShader = Shader.Find("MIRACLE/WorkpieceHeatMap");
+            Material heatMat = AssetDatabase.LoadAssetAtPath<Material>(heatMatPath);
+            if (heatMat == null && heatShader != null)
+            {
+                heatMat = new Material(heatShader);
+                heatMat.name = "WorkpieceHeatMap";
+                EnsureFolderExists("Assets/Materials");
+                AssetDatabase.CreateAsset(heatMat, heatMatPath);
+                AssetDatabase.SaveAssets();
+                Debug.Log($"[DashboardWiring] Created WorkpieceHeatMap material at {heatMatPath}.");
+            }
+
+            if (heatMat == null)
+            {
+                Debug.LogWarning("[DashboardWiring] WorkpieceHeatMap material/shader not available — skipping HeatMapOverlay.");
+                return;
+            }
+
+            // Find the workpiece renderer (VoxelWorkpiece child, or any mesh on the machine)
+            Renderer workpieceRenderer = null;
+            var voxelWP = machineGO.GetComponentInChildren<VoxelWorkpiece>();
+            if (voxelWP != null)
+                workpieceRenderer = voxelWP.GetComponent<Renderer>();
+            if (workpieceRenderer == null)
+                workpieceRenderer = machineGO.GetComponentInChildren<MeshRenderer>();
+
+            // Create HeatMapOverlay on the machine root
+            var heatMapOverlay = machineGO.AddComponent<HeatMapOverlay>();
+            var cuttingSimManager = machineGO.GetComponent<CuttingSimulationManager>();
+
+            var hmSO = new SerializedObject(heatMapOverlay);
+            hmSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateEvent;
+            hmSO.FindProperty("heatMapMaterial").objectReferenceValue = heatMat;
+            if (workpieceRenderer != null)
+                hmSO.FindProperty("workpieceRenderer").objectReferenceValue = workpieceRenderer;
+            if (cuttingSimManager != null)
+                hmSO.FindProperty("cuttingSimManager").objectReferenceValue = cuttingSimManager;
+            hmSO.ApplyModifiedProperties();
+
+            Debug.Log($"[DashboardWiring] Wired HeatMapOverlay on {machineGO.name}.");
+        }
+
+        /// <summary>
+        /// Wire ForceArrowRenderer onto a CNC machine for 3D force vector visualization.
+        /// </summary>
+        private static void WireForceArrowRenderer(GameObject machineGO, CuttingStateEventSO cuttingStateEvent)
+        {
+            var existing = machineGO.GetComponentInChildren<ForceArrowRenderer>();
+            if (existing != null) return;
+
+            // Load force arrow material
+            Material arrowMat = AssetDatabase.LoadAssetAtPath<Material>("Assets/Materials/ForceArrow.mat");
+            if (arrowMat == null)
+            {
+                var arrowShader = Shader.Find("MIRACLE/ForceArrow");
+                if (arrowShader != null)
+                {
+                    arrowMat = new Material(arrowShader);
+                    arrowMat.name = "ForceArrow";
+                    EnsureFolderExists("Assets/Materials");
+                    AssetDatabase.CreateAsset(arrowMat, "Assets/Materials/ForceArrow.mat");
+                    AssetDatabase.SaveAssets();
+                }
+            }
+
+            // Create ForceArrows child
+            Transform faTransform = machineGO.transform.Find("ForceArrows");
+            GameObject faGO;
+            if (faTransform != null)
+                faGO = faTransform.gameObject;
+            else
+            {
+                faGO = new GameObject("ForceArrows");
+                faGO.transform.SetParent(machineGO.transform);
+                faGO.transform.localPosition = Vector3.zero;
+                Undo.RegisterCreatedObjectUndo(faGO, $"Create ForceArrows ({machineGO.name})");
+            }
+
+            var forceArrowRenderer = faGO.GetComponent<ForceArrowRenderer>();
+            if (forceArrowRenderer == null)
+                forceArrowRenderer = faGO.AddComponent<ForceArrowRenderer>();
+
+            var faSO = new SerializedObject(forceArrowRenderer);
+            faSO.FindProperty("cuttingStateEvent").objectReferenceValue = cuttingStateEvent;
+            if (arrowMat != null)
+                faSO.FindProperty("arrowMaterial").objectReferenceValue = arrowMat;
+            faSO.ApplyModifiedProperties();
+
+            Debug.Log($"[DashboardWiring] Wired ForceArrowRenderer on {machineGO.name}/ForceArrows.");
         }
 
         private static GameObject FindByNames(string[] names)

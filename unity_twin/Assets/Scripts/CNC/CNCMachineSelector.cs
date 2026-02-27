@@ -3,6 +3,7 @@ using UnityEngine;
 using UnityEngine.UIElements;
 using MiracleTwin.Cutting;
 using MiracleTwin.UI;
+using MiracleTwin.Visualization;
 
 namespace MiracleTwin.CNC
 {
@@ -112,6 +113,19 @@ namespace MiracleTwin.CNC
                 var overlay = Object.FindFirstObjectByType<DashboardOverlay>();
                 if (overlay != null)
                     overlay.SetActiveCuttingSimManager(simManager);
+            }
+
+            // Swap GCodeEditor → GCodeExecutor reference for the active machine
+            var newExecutor = ActiveMachineBehaviour.GetComponent<GCodeExecutor>();
+            if (newExecutor != null)
+            {
+                var gCodeEditor = Object.FindFirstObjectByType<GCodeEditor>();
+                if (gCodeEditor != null)
+                    gCodeEditor.SetExecutor(newExecutor);
+
+                var toolpathPreview = Object.FindFirstObjectByType<ToolpathPreview>();
+                if (toolpathPreview != null)
+                    toolpathPreview.SetExecutor(newExecutor);
             }
 
             // Update dropdown if it exists

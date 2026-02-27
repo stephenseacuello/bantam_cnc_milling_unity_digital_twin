@@ -29,6 +29,10 @@ namespace MiracleTwin.Cutting
         private bool isInitialized;
         private Bounds renderBounds;
 
+        // Chunk dimensions (must match VoxelWorkpiece)
+        private static readonly int3 ChunkSize = new(16, 16, 16);
+        private static readonly int3 ChunksCount = new(16, 11, 16);
+
         public int VertexCount { get; private set; }
         public int ChunksProcessedThisFrame { get; private set; }
 
@@ -43,7 +47,7 @@ namespace MiracleTwin.Cutting
 
             mcKernel = marchingCubesShader.FindKernel("CSMarchingCubes");
 
-            // Load lookup tables from Resources
+            // Load lookup tables using standard Paul Bourke tables
             LoadLookupTables();
 
             // Append buffer for output vertices (position + normal)
@@ -66,39 +70,29 @@ namespace MiracleTwin.Cutting
             var triTableAsset = Resources.Load<TextAsset>("MarchingCubesLUT");
             if (triTableAsset != null)
             {
-                // Load from binary asset
+                // Load from binary asset if available
                 Debug.Log("[MarchingCubesRenderer] Loaded LUT from resources");
             }
             else
             {
-                // Generate standard tables at runtime
-                GenerateStandardTables();
+                // Use standard Paul Bourke tables from MarchingCubesTables
+                LoadStandardTables();
             }
         }
 
-        private void GenerateStandardTables()
+        private void LoadStandardTables()
         {
-            // Edge table: 256 entries
-            int[] edgeTable = new int[256];
-            // Tri table: 256 * 16 entries
-            int[] triTable = new int[256 * 16];
-
-            // Initialize with -1
-            for (int i = 0; i < triTable.Length; i++)
-                triTable[i] = -1;
-
-            // Standard MC tables would be populated here
-            // For brevity, allocate buffers with placeholder data
             edgeTableBuffer = new ComputeBuffer(256, sizeof(int));
-            edgeTableBuffer.SetData(edgeTable);
+            edgeTableBuffer.SetData(MarchingCubesTables.EdgeTable);
 
             triTableBuffer = new ComputeBuffer(256 * 16, sizeof(int));
-            triTableBuffer.SetData(triTable);
+            triTableBuffer.SetData(MarchingCubesTables.TriTable);
         }
 
         void LateUpdate()
         {
             if (!isInitialized || !renderEnabled) return;
+            if (voxelWorkpiece == null || !voxelWorkpiece.IsInitialized) return;
 
             RenderWorkpiece();
         }
@@ -108,14 +102,21 @@ namespace MiracleTwin.Cutting
             if (workpieceMaterial == null) return;
 
             vertexAppendBuffer.SetCounterValue(0);
+            ChunksProcessedThisFrame = 0;
 
-            // Dispatch marching cubes
-            // In full implementation, iterate dirty chunks only
-            // For now, do a full-grid pass
+            // Delegate chunk iteration to VoxelWorkpiece.RenderMesh() which
+            // handles dirty chunk tracking and per-chunk dispatch internally.
+            // This renderer provides the standalone rendering path when
+            // VoxelWorkpiece rendering is handled externally.
+            voxelWorkpiece.RenderMesh();
 
+            // Copy append buffer count to indirect args for our own draw call
             ComputeBuffer.CopyCount(vertexAppendBuffer, argsBuffer, 0);
 
             workpieceMaterial.SetBuffer("_Vertices", vertexAppendBuffer);
+            workpieceMaterial.SetBuffer("_EdgeTable", edgeTableBuffer);
+            workpieceMaterial.SetBuffer("_TriTable", triTableBuffer);
+
             Graphics.DrawProceduralIndirect(
                 workpieceMaterial,
                 renderBounds,

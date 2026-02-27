@@ -76,6 +76,7 @@ namespace MiracleTwin.Cutting
         private Bounds renderBounds;
         private int[] removedCountReadback = new int[1];
         private int[] engagedCountReadback = new int[1];
+        private uint[] dirtyChunkReadback;
 
         void Start()
         {
@@ -124,6 +125,8 @@ namespace MiracleTwin.Cutting
 
             renderBounds = new Bounds(transform.position + (Vector3)(float3)WorkpieceSize * 0.5f,
                                       (Vector3)(float3)WorkpieceSize * 1.5f);
+
+            dirtyChunkReadback = new uint[totalChunks];
 
             RemovedVoxels = 0;
             IsInitialized = true;
@@ -212,8 +215,43 @@ namespace MiracleTwin.Cutting
 
             vertexBuffer.SetCounterValue(0);
 
-            // TODO: Iterate dirty chunks and dispatch marching cubes per chunk
-            // For now, render using DrawProceduralIndirect
+            // Read dirty chunk flags from GPU
+            dirtyChunkBuffer.GetData(dirtyChunkReadback);
+
+            // Collect dirty chunk indices, capped at maxDirtyChunksPerFrame
+            int chunksDispatched = 0;
+            for (int i = 0; i < totalChunks && chunksDispatched < maxDirtyChunksPerFrame; i++)
+            {
+                if (dirtyChunkReadback[i] == 0) continue;
+
+                // Compute 3D chunk coordinates from flat index
+                int cx = i % ChunksCount.x;
+                int cy = (i / ChunksCount.x) % ChunksCount.y;
+                int cz = i / (ChunksCount.x * ChunksCount.y);
+
+                // Set chunk origin in voxel-space for the compute shader
+                marchingCubesShader.SetInts("_ChunkOrigin",
+                    cx * ChunkSize.x, cy * ChunkSize.y, cz * ChunkSize.z);
+                marchingCubesShader.SetInts("_ChunkSize", ChunkSize.x, ChunkSize.y, ChunkSize.z);
+                marchingCubesShader.SetInts("_GridDim", GridSize.x, GridSize.y, GridSize.z);
+                marchingCubesShader.SetVector("_VoxelSize", (Vector3)(float3)VoxelSize);
+                marchingCubesShader.SetBuffer(marchingCubesKernel, "_VoxelGrid", voxelBuffer);
+                marchingCubesShader.SetBuffer(marchingCubesKernel, "_Vertices", vertexBuffer);
+
+                // Dispatch per-chunk: thread groups = ChunkSize / 8
+                marchingCubesShader.Dispatch(marchingCubesKernel,
+                    Mathf.CeilToInt(ChunkSize.x / 8f),
+                    Mathf.CeilToInt(ChunkSize.y / 8f),
+                    Mathf.CeilToInt(ChunkSize.z / 8f));
+
+                // Clear dirty flag for this chunk
+                dirtyChunkReadback[i] = 0;
+                chunksDispatched++;
+            }
+
+            // Write cleared dirty flags back to GPU
+            if (chunksDispatched > 0)
+                dirtyChunkBuffer.SetData(dirtyChunkReadback);
 
             // Copy append buffer count to indirect args
             ComputeBuffer.CopyCount(vertexBuffer, triCountBuffer, 0);

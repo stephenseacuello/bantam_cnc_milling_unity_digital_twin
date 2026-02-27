@@ -63,6 +63,12 @@ namespace MiracleTwin.Robots
         [SerializeField] private float waypointReachThreshold = 0.01f;
         [SerializeField] private float stateTimeout = 30f;
 
+        [Header("Safety")]
+        [Tooltip("Minimum grip force (N) required to confirm a successful grasp.")]
+        [SerializeField] private float gripForceThreshold = 5f;
+        [Tooltip("Enable collision-based safety stop.")]
+        [SerializeField] private bool enableCollisionSafety = true;
+
         public TendingState CurrentState { get; private set; } = TendingState.Idle;
         public bool IsActive => CurrentState != TendingState.Idle && CurrentState != TendingState.Fault;
         public string AssignedJobId { get; private set; }
@@ -134,9 +140,21 @@ namespace MiracleTwin.Robots
 
                 case TendingState.PickRawBlock:
                     if (!gripper.IsGripping)
+                    {
                         gripper.Close();
+                    }
                     else
-                        TransitionTo(TendingState.ApproachCNC);
+                    {
+                        // Verify gripper is fully closed before proceeding
+                        if (gripper.CurrentWidth > 0.01f)
+                        {
+                            EnterFault($"Gripper not fully closed (width={gripper.CurrentWidth:F3}m) — possible missed grasp");
+                        }
+                        else
+                        {
+                            TransitionTo(TendingState.ApproachCNC);
+                        }
+                    }
                     break;
 
                 case TendingState.ApproachCNC:
@@ -167,7 +185,17 @@ namespace MiracleTwin.Robots
 
                 case TendingState.WaitViseClose:
                     if (viseController == null || !viseController.IsMoving)
-                        TransitionTo(TendingState.RetractFromCNC);
+                    {
+                        // Confirm vise is fully closed and workpiece is secured
+                        if (viseController != null && viseController.IsOpen)
+                        {
+                            EnterFault("Vise failed to close — workpiece may not be secured");
+                        }
+                        else
+                        {
+                            TransitionTo(TendingState.RetractFromCNC);
+                        }
+                    }
                     break;
 
                 case TendingState.RetractFromCNC:
@@ -275,6 +303,36 @@ namespace MiracleTwin.Robots
                 TransitionTo(TendingState.Idle);
                 robotController.GoHome();
             }
+        }
+
+        /// <summary>
+        /// Collision-based safety handler. If the robot arm collides with
+        /// an unexpected object during tending, immediately enter fault state
+        /// to prevent damage or injury.
+        /// </summary>
+        void OnCollisionEnter(Collision collision)
+        {
+            if (!enableCollisionSafety) return;
+            if (!IsActive) return;
+
+            // Ignore expected contacts (gripper touching workpiece, vise, tray)
+            string colTag = collision.gameObject.tag;
+            if (colTag == "Workpiece" || colTag == "Vise" || colTag == "Tray")
+                return;
+
+            float impactForce = collision.impulse.magnitude;
+            string collidedWith = collision.gameObject.name;
+
+            Debug.LogError(
+                $"[RobotTendingSequence] {robotController.RobotId} COLLISION with " +
+                $"{collidedWith} (force={impactForce:F1}N) during {CurrentState}");
+
+            // Release gripper to drop any held part safely
+            gripper.Release();
+
+            EnterFault(
+                $"Unexpected collision with {collidedWith} " +
+                $"(force={impactForce:F1}N) during {CurrentState}");
         }
     }
 }

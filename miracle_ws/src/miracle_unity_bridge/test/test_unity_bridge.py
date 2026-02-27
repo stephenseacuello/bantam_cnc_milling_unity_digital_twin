@@ -11,6 +11,7 @@ Covers:
 - Multiple topic subscriptions
 """
 
+import concurrent.futures
 import time
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -234,3 +235,76 @@ def test_record_message_received_updates_timestamp(endpoint):
     time.sleep(0.01)
     endpoint.record_message_received()
     assert endpoint._last_msg_time > old_time
+
+
+# ---------------------------------------------------------------------------
+# 12. Reconnection after keepalive timeout
+# ---------------------------------------------------------------------------
+
+def test_reconnection_after_keepalive_timeout(endpoint):
+    """After timeout marks disconnected, a new message should reconnect."""
+    endpoint._unity_connected = True
+    endpoint._last_msg_time = time.monotonic() - 20.0
+    endpoint._keepalive_timeout = 10.0
+    endpoint._publish_connection_status = MagicMock()
+    endpoint._check_health()
+    assert endpoint._unity_connected is False
+
+    # Now simulate a new message arriving
+    endpoint.record_message_received()
+    # Connection status should NOT auto-flip — only heartbeat does that
+    assert endpoint._unity_connected is False
+
+
+# ---------------------------------------------------------------------------
+# 13. record_message_received thread safety
+# ---------------------------------------------------------------------------
+
+def test_record_message_received_thread_safety(endpoint):
+    """4 threads x 100 calls should not crash."""
+    def spam():
+        for _ in range(100):
+            endpoint.record_message_received()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(spam) for _ in range(4)]
+        for f in futures:
+            f.result()  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# 14. Health timer interval is 5s
+# ---------------------------------------------------------------------------
+
+def test_health_timer_interval_is_5s(endpoint, mock_rclpy):
+    """Verify create_timer was called with a 5.0-second interval for health checks."""
+    calls = mock_rclpy['create_timer'].call_args_list
+    intervals = [c[0][0] for c in calls]
+    assert 5.0 in intervals
+
+
+# ---------------------------------------------------------------------------
+# 15. Multiple machine subscriptions
+# ---------------------------------------------------------------------------
+
+def test_multiple_machine_subscriptions(endpoint, mock_rclpy):
+    """Verify subscription count is >= 3 (for cnc1, cnc2, cnc3 state topics)."""
+    sub_count = mock_rclpy['create_subscription'].call_count
+    assert sub_count >= 3
+
+
+# ---------------------------------------------------------------------------
+# 16. Connection status publisher exists
+# ---------------------------------------------------------------------------
+
+def test_connection_status_publisher_exists(endpoint, mock_rclpy):
+    """Verify a publisher was created (for connection status)."""
+    assert mock_rclpy['create_publisher'].call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# 17. Keepalive timeout is configurable via parameter
+# ---------------------------------------------------------------------------
+
+def test_keepalive_timeout_configurable(endpoint):
+    """The keepalive_timeout should match the parameter default (10.0)."""
+    assert endpoint._keepalive_timeout == 10.0

@@ -4,6 +4,7 @@ Tests the data caching, anomaly buffering, and dashboard data assembly
 without requiring a live WebSocket server or ROS2 runtime.
 """
 
+import copy
 import json
 import threading
 import pytest
@@ -53,13 +54,16 @@ class _HMIDataStore:
                 self._recent_anomalies = self._recent_anomalies[-self._max_anomalies:]
 
     def get_dashboard_data(self) -> Dict[str, Any]:
-        """Get current dashboard data snapshot (mirrors get_dashboard_data)."""
+        """Get current dashboard data snapshot (mirrors get_dashboard_data).
+
+        Uses deep copy so callers get an independent snapshot.
+        """
         with self._data_lock:
             return {
-                'machines': dict(self._latest_states),
-                'kpis': self._latest_kpis,
-                'fleet_health': self._latest_health,
-                'recent_anomalies': list(self._recent_anomalies),
+                'machines': copy.deepcopy(self._latest_states),
+                'kpis': copy.deepcopy(self._latest_kpis),
+                'fleet_health': copy.deepcopy(self._latest_health),
+                'recent_anomalies': copy.deepcopy(self._recent_anomalies),
             }
 
     @property

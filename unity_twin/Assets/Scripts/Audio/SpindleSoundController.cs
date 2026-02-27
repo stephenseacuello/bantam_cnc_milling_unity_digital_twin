@@ -27,6 +27,7 @@ namespace MiracleTwin.Audio
         private float phase;
         private float spindleRPM;
         private bool spindleOn;
+        private float bearingPhase;
 
         void Awake()
         {
@@ -56,8 +57,9 @@ namespace MiracleTwin.Audio
 
         void Update()
         {
+            float normalized = Mathf.Clamp01(spindleRPM / 23000f);
             targetFrequency = Mathf.Lerp(baseFrequency, maxFrequency,
-                Mathf.Clamp01(spindleRPM / 23000f));
+                Mathf.Pow(normalized, 0.7f));
             currentFrequency = Mathf.Lerp(currentFrequency, targetFrequency,
                 fadeSpeed * Time.deltaTime);
 
@@ -80,11 +82,16 @@ namespace MiracleTwin.Audio
                 sample += Mathf.Sin(4f * Mathf.PI * currentFrequency * phase) * currentVol * 0.3f;
                 sample += Mathf.Sin(6f * Mathf.PI * currentFrequency * phase) * currentVol * 0.1f;
 
+                // 30Hz bearing rumble undertone
+                sample += Mathf.Sin(2f * Mathf.PI * 30f * bearingPhase) * currentVol * 0.05f;
+
                 for (int ch = 0; ch < channels; ch++)
                     data[i + ch] += sample;
 
                 phase += 1f / sampleRate;
                 if (phase > 1f) phase -= 1f;
+                bearingPhase += 1f / sampleRate;
+                if (bearingPhase > 1f) bearingPhase -= 1f;
             }
         }
     }

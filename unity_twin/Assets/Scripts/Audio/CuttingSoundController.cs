@@ -27,6 +27,7 @@ namespace MiracleTwin.Audio
         private float power;
         private float phase;
         private bool isCutting;
+        private float filteredNoise;
 
         private System.Random rng = new(42);
 
@@ -71,11 +72,19 @@ namespace MiracleTwin.Audio
 
             for (int i = 0; i < data.Length; i += channels)
             {
-                // Tooth-passing tone
+                // Tooth-passing tone (fundamental)
                 float tone = Mathf.Sin(2f * Mathf.PI * toothFrequency * phase);
 
-                // Filtered noise (cutting broadband)
-                float noise = ((float)rng.NextDouble() * 2f - 1f) * noiseVolume;
+                // 2nd harmonic (0.4x amplitude)
+                tone += Mathf.Sin(2f * Mathf.PI * toothFrequency * 2f * phase) * 0.4f;
+
+                // 3rd harmonic (0.15x amplitude)
+                tone += Mathf.Sin(2f * Mathf.PI * toothFrequency * 3f * phase) * 0.15f;
+
+                // IIR low-pass filtered noise (cutting broadband)
+                float rawNoise = (float)rng.NextDouble() * 2f - 1f;
+                filteredNoise = filteredNoise * 0.9f + rawNoise * 0.1f;
+                float noise = filteredNoise * noiseVolume;
 
                 // Combined signal
                 float sample = (tone * 0.6f + noise * 0.4f) * currentVolume;

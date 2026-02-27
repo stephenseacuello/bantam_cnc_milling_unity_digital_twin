@@ -22,6 +22,8 @@ namespace MiracleTwin.Core
         [SerializeField] private string rosBridgeIP = "127.0.0.1";
         [SerializeField] private int rosBridgePort = 10000;
         [SerializeField] private string machineId = "cnc1";
+        [Tooltip("Additional machine IDs to subscribe to for multi-machine monitoring.")]
+        [SerializeField] private string[] additionalMachineIds = new string[0];
         [Tooltip("Enable heartbeat publishing. Disable if ros_tcp_endpoint doesn't have miracle_msgs.")]
         [SerializeField] private bool enableHeartbeat = false;
         [Tooltip("Enable ROS service registration (E-Stop, ValidateGCode, FleetStatus). Disable if no ROS2 service servers are running.")]
@@ -128,15 +130,18 @@ namespace MiracleTwin.Core
 
         private void RegisterSubscriptions()
         {
-            // Per-machine subscriptions
-            ros.Subscribe<MachineStateMsg>(
-                $"/miracle/{machineId}/state", OnMachineState);
-            ros.Subscribe<AnomalyAlertMsg>(
-                $"/miracle/{machineId}/anomaly", OnAnomaly);
-            ros.Subscribe<ToolWearEstimateMsg>(
-                $"/miracle/{machineId}/tool_wear", OnToolWear);
-            ros.Subscribe<JobStatusMsg>(
-                $"/miracle/{machineId}/job_status", OnJobStatus);
+            // Per-machine subscriptions (primary machine)
+            SubscribeMachineTopics(machineId);
+
+            // Subscribe to additional machine IDs for multi-machine monitoring
+            foreach (string additionalId in additionalMachineIds)
+            {
+                if (!string.IsNullOrEmpty(additionalId) && additionalId != machineId)
+                {
+                    SubscribeMachineTopics(additionalId);
+                    Debug.Log($"[MiracleBridge] Subscribed to additional machine: {additionalId}");
+                }
+            }
 
             // System-wide subscriptions
             ros.Subscribe<TwinSyncStatusMsg>(
@@ -151,6 +156,18 @@ namespace MiracleTwin.Core
                 "/miracle/robots/joint_states", OnRobotJointState);
 
             Debug.Log("[MiracleBridge] All subscriptions registered");
+        }
+
+        private void SubscribeMachineTopics(string targetMachineId)
+        {
+            ros.Subscribe<MachineStateMsg>(
+                $"/miracle/{targetMachineId}/state", OnMachineState);
+            ros.Subscribe<AnomalyAlertMsg>(
+                $"/miracle/{targetMachineId}/anomaly", OnAnomaly);
+            ros.Subscribe<ToolWearEstimateMsg>(
+                $"/miracle/{targetMachineId}/tool_wear", OnToolWear);
+            ros.Subscribe<JobStatusMsg>(
+                $"/miracle/{targetMachineId}/job_status", OnJobStatus);
         }
 
         private void RegisterPublishers()

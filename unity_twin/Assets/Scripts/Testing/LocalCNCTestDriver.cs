@@ -49,12 +49,18 @@ namespace MiracleTwin.Testing
         // When CuttingSimulationManager is active, skip fake cutting data
         private bool physicsSimActive;
 
+        // When GCodeExecutor is running, skip synthetic machine state to avoid fighting
+        private GCodeExecutor gCodeExecutor;
+
         void Start()
         {
             DisableURDFImporterComponents();
             FindCNCMachines();
             EnsureRobotControllers();
             FindRobots();
+
+            // Find GCodeExecutor so we can yield when it's running
+            gCodeExecutor = Object.FindFirstObjectByType<GCodeExecutor>();
 
             // Detect if real cutting physics pipeline is wired
             var simManager = Object.FindFirstObjectByType<CuttingSimulationManager>();
@@ -146,13 +152,14 @@ namespace MiracleTwin.Testing
             timer -= interval;
             elapsed += interval;
 
-            if (!MiracleBridge.RosMachineStateActive)
+            bool gcodeRunning = gCodeExecutor != null && gCodeExecutor.IsExecuting;
+            if (!MiracleBridge.RosMachineStateActive && !gcodeRunning)
             {
                 PublishMachineState();
                 AnimateBantam();
                 AnimateCoastRunner();
             }
-            if (!physicsSimActive)
+            if (!physicsSimActive && !gcodeRunning)
                 PublishCuttingState();
             PublishSystemKPIs();
 

@@ -39,6 +39,8 @@ namespace MiracleTwin.UI
             "pocket_50x50.nc", "face_3x3_block.nc", "contour_circle.nc", "full_demo.nc"
         };
 
+        private RuntimeFileBrowser runtimeBrowser;
+
         void Start()
         {
             if (uiDocument == null) return;
@@ -132,8 +134,7 @@ namespace MiracleTwin.UI
                 Debug.Log($"[GCodeEditor] Loaded G-code file: {path}");
             }
 #else
-            Debug.LogWarning("[GCodeEditor] File browser is only available in the Unity Editor. " +
-                "Use LoadFromFile(path) or LoadProgram(text) programmatically at runtime.");
+            ShowRuntimeFileBrowser();
 #endif
         }
 
@@ -234,6 +235,28 @@ namespace MiracleTwin.UI
             {
                 Debug.LogWarning($"[GCodeEditor] Sample program not found: {path}");
             }
+        }
+
+        /// <summary>
+        /// Show the runtime file browser for standalone builds.
+        /// </summary>
+        private void ShowRuntimeFileBrowser()
+        {
+            if (uiDocument == null) return;
+
+            if (runtimeBrowser == null)
+                runtimeBrowser = new RuntimeFileBrowser();
+
+            if (runtimeBrowser.IsOpen) return;
+
+            runtimeBrowser.Show(uiDocument.rootVisualElement, path =>
+            {
+                if (!string.IsNullOrEmpty(path))
+                {
+                    LoadFromFile(path);
+                    Debug.Log($"[GCodeEditor] Loaded G-code from runtime browser: {path}");
+                }
+            });
         }
     }
 }

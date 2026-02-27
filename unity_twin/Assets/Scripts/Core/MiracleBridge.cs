@@ -55,6 +55,7 @@ namespace MiracleTwin.Core
         private float lastHeartbeatTime;
         private bool registered;
         private const float HEARTBEAT_INTERVAL = 1f;
+        private DataRecorder dataRecorder;
 
         void Awake()
         {
@@ -73,6 +74,7 @@ namespace MiracleTwin.Core
             // but real ROS connection is still needed for robot joint commands, sensor data,
             // and bidirectional communication when available.
             ConnectToROS();
+            dataRecorder = Object.FindFirstObjectByType<DataRecorder>();
         }
 
         void Update()
@@ -126,6 +128,32 @@ namespace MiracleTwin.Core
             IsConnected = connected;
             ConnectionStatusChanged?.Invoke(connected);
             Debug.Log($"[MiracleBridge] Connection status: {(connected ? "CONNECTED" : "DISCONNECTED")}");
+        }
+
+        /// <summary>FNV-1a 32-bit hash for topic name recording.</summary>
+        private static uint HashTopic(string topic)
+        {
+            uint hash = 2166136261u;
+            foreach (char c in topic)
+            {
+                hash ^= (byte)c;
+                hash *= 16777619u;
+            }
+            return hash;
+        }
+
+        private void TryRecord(string topic, Unity.Robotics.ROSTCPConnector.MessageGeneration.Message msg)
+        {
+            if (dataRecorder == null || !dataRecorder.IsRecording) return;
+            try
+            {
+                byte[] data = msg.Serialize();
+                dataRecorder.RecordMessage(HashTopic(topic), data);
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[MiracleBridge] Recording failed for {topic}: {ex.Message}");
+            }
         }
 
         private void RegisterSubscriptions()
@@ -199,15 +227,32 @@ namespace MiracleTwin.Core
                 RosMachineStateActive = true;
                 Debug.Log("[MiracleBridge] ROS MachineState received — fake CNC data will stop.");
             }
+            TryRecord($"/miracle/{msg.machine_id}/state", msg);
             onMachineState?.Raise(msg);
         }
-        private void OnAnomaly(AnomalyAlertMsg msg) => onAnomalyAlert?.Raise(msg);
+        private void OnAnomaly(AnomalyAlertMsg msg)
+        {
+            TryRecord($"/miracle/{machineId}/anomaly", msg);
+            onAnomalyAlert?.Raise(msg);
+        }
         private void OnToolWear(ToolWearEstimateMsg msg) => onToolWear?.Raise(msg);
         private void OnTwinSync(TwinSyncStatusMsg msg) => onTwinSync?.Raise(msg);
-        private void OnKPIs(SystemKPIsMsg msg) => onSystemKPIs?.Raise(msg);
-        private void OnJobStatus(JobStatusMsg msg) => onJobStatus?.Raise(msg);
+        private void OnKPIs(SystemKPIsMsg msg)
+        {
+            TryRecord("/miracle/system_kpis", msg);
+            onSystemKPIs?.Raise(msg);
+        }
+        private void OnJobStatus(JobStatusMsg msg)
+        {
+            TryRecord($"/miracle/{machineId}/job_status", msg);
+            onJobStatus?.Raise(msg);
+        }
         private void OnTaskAward(TaskAwardMsg msg) => onTaskAward?.Raise(msg);
-        private void OnSecurityAlert(SecurityAlertMsg msg) => onSecurityAlert?.Raise(msg);
+        private void OnSecurityAlert(SecurityAlertMsg msg)
+        {
+            TryRecord("/miracle/security/alerts", msg);
+            onSecurityAlert?.Raise(msg);
+        }
 
         private void OnRobotJointState(RobotJointStateMsg msg)
         {

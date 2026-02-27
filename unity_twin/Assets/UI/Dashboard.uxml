@@ -221,6 +221,10 @@
             <Label name="speed-label" text="1.0x" class="speed-text" />
             <DropdownField name="mode-dropdown" label="Mode" class="mode-dropdown" />
             <Button name="load-gcode-btn" text="Load G-code" class="control-btn" />
+            <Button name="record-btn" text="REC" class="control-btn record" />
+            <Button name="replay-btn" text="Replay" class="control-btn" />
+            <Slider name="replay-timeline" low-value="0" high-value="1" value="0" class="replay-slider" />
+            <Label name="replay-time-label" text="" class="replay-time" />
             <Label name="sim-time-value" text="00:00:00.0" class="sim-time" />
             <VisualElement class="spacer" />
             <Label name="ned2-status" text="Ned2: IDLE" class="robot-status" />

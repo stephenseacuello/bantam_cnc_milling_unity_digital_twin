@@ -128,6 +128,29 @@ namespace MiracleTwin.CNC
                     toolpathPreview.SetExecutor(newExecutor);
             }
 
+            // Clear all chart buffers on machine switch
+            Object.FindFirstObjectByType<ForceChart>()?.Clear();
+            Object.FindFirstObjectByType<ThermalChart>()?.Clear();
+            Object.FindFirstObjectByType<ToolWearChart>()?.Clear();
+            Object.FindFirstObjectByType<PowerChart>()?.Clear();
+
+            // Enable/disable per-machine visualization overlays
+            for (int i = 0; i < machineControllers.Count; i++)
+            {
+                bool isActive = (i == index);
+                var mc = machineControllers[i];
+                if (mc == null) continue;
+
+                var heatMap = mc.GetComponentInChildren<HeatMapOverlay>(true);
+                if (heatMap != null) heatMap.enabled = isActive;
+
+                var forceArrows = mc.GetComponentInChildren<ForceArrowRenderer>(true);
+                if (forceArrows != null) forceArrows.enabled = isActive;
+
+                var surfaceRoughness = mc.GetComponentInChildren<SurfaceRoughnessOverlay>(true);
+                if (surfaceRoughness != null) surfaceRoughness.enabled = isActive;
+            }
+
             // Update dropdown if it exists
             if (dropdown != null)
                 dropdown.SetValueWithoutNotify(dropdown.choices[index]);

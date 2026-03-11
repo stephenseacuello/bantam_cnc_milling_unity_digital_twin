@@ -1,0 +1,27 @@
+# PodDisruptionBudgets for MIRACLE system
+# Ensure minimum availability during voluntary disruptions (node drains, upgrades)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ros2-miracle-pdb
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ros2-miracle
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-pdb
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: kafka

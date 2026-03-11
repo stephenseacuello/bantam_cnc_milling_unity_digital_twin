@@ -1,0 +1,37 @@
+# RBAC configuration for MIRACLE system
+# ServiceAccount, Role, and RoleBinding for least-privilege access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: miracle-sa
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: miracle-role
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: miracle-role-binding
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: miracle-role
+subjects:
+  - kind: ServiceAccount
+    name: miracle-sa
+    namespace: miracle-system

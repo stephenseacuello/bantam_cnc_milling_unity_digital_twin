@@ -6,8 +6,13 @@ namespace: miracle-system
 resources:
   - namespace.yaml
   - configmap.yaml
+  - rbac.yaml
+  - secrets.yaml
+  - network-policy.yaml
   - ros2-deployment.yaml
   - kafka-statefulset.yaml
+  - pod-disruption-budget.yaml
+  - hpa.yaml
 
 commonLabels:
   app.kubernetes.io/part-of: miracle

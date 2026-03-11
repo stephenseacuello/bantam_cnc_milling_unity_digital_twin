@@ -1,0 +1,166 @@
+# Network policies for MIRACLE system
+# Default deny all traffic, then allow only required communication paths
+---
+# Default deny all ingress and egress in miracle-system namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Allow DNS resolution for all pods (required for service discovery)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Allow ingress to ros2-miracle on port 10000 (Unity ROS-TCP bridge)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ros2-ingress
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector:
+    matchLabels:
+      app: ros2-miracle
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 10000
+---
+# Allow ros2-miracle egress to kafka (9092), zookeeper (2181), and mqtt (1883/8883)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ros2-egress
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector:
+    matchLabels:
+      app: ros2-miracle
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    - to:
+        - podSelector:
+            matchLabels:
+              app: zookeeper
+      ports:
+        - protocol: TCP
+          port: 2181
+    # MQTT broker (may be in-cluster or external)
+    - ports:
+        - protocol: TCP
+          port: 1883
+        - protocol: TCP
+          port: 8883
+---
+# Allow kafka egress to zookeeper
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kafka-to-zookeeper
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: zookeeper
+      ports:
+        - protocol: TCP
+          port: 2181
+---
+# Allow zookeeper and kafka to receive traffic from their respective clients
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kafka-ingress
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ros2-miracle
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-zookeeper-ingress
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  podSelector:
+    matchLabels:
+      app: zookeeper
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: kafka
+      ports:
+        - protocol: TCP
+          port: 2181
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ros2-miracle
+      ports:
+        - protocol: TCP
+          port: 2181

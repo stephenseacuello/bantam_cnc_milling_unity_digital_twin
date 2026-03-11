@@ -18,6 +18,7 @@ __pycache__/
 Library/
 Temp/
 Obj/
+obj/
 Build/
 Builds/
 Logs/
@@ -27,3 +28,6 @@ UserSettings/
 miracle_ws/build/
 miracle_ws/install/
 miracle_ws/log/
+
+# Docker secrets
+.env

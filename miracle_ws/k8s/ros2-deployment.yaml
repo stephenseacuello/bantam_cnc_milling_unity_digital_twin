@@ -16,9 +16,11 @@ spec:
       labels:
         app: ros2-miracle
     spec:
+      serviceAccountName: miracle-sa
       containers:
         - name: ros2-miracle
           image: miracle/ros2:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 10000
               name: ros-tcp-bridge
@@ -71,7 +73,8 @@ spec:
           persistentVolumeClaim:
             claimName: miracle-data-pvc
         - name: miracle-logs
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: miracle-logs-pvc
         - name: miracle-config-volume
           configMap:
             name: miracle-config
@@ -104,3 +107,17 @@ spec:
   resources:
     requests:
       storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: miracle-logs-pvc
+  namespace: miracle-system
+  labels:
+    app.kubernetes.io/part-of: miracle
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

@@ -49,6 +49,11 @@ services:
       timeout: 15s
       retries: 10
       start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -80,6 +85,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -109,6 +119,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -130,16 +145,20 @@ services:
       - miracle_logs:/mosquitto/log
     networks:
       - miracle_net
+    environment:
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-miracle}
     command: >
       sh -c '
+        touch /mosquitto/config/passwd &&
+        mosquitto_passwd -b /mosquitto/config/passwd miracle "$${MQTT_PASSWORD}" &&
         echo "listener 1883"              >  /mosquitto/config/mosquitto.conf &&
         echo "listener 9001"              >> /mosquitto/config/mosquitto.conf &&
         echo "protocol websockets"        >> /mosquitto/config/mosquitto.conf &&
-        echo "allow_anonymous true"       >> /mosquitto/config/mosquitto.conf &&
+        echo "allow_anonymous false"      >> /mosquitto/config/mosquitto.conf &&
+        echo "password_file /mosquitto/config/passwd" >> /mosquitto/config/mosquitto.conf &&
         echo "persistence true"           >> /mosquitto/config/mosquitto.conf &&
         echo "persistence_location /mosquitto/data/" >> /mosquitto/config/mosquitto.conf &&
         echo "log_dest file /mosquitto/log/mosquitto.log" >> /mosquitto/config/mosquitto.conf &&
-        touch /mosquitto/config/passwd &&
         exec mosquitto -c /mosquitto/config/mosquitto.conf
       '
     restart: unless-stopped
@@ -149,6 +168,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -180,6 +204,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -218,6 +247,11 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -241,6 +275,11 @@ services:
       ros2_miracle:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -255,7 +294,7 @@ services:
     container_name: miracle_grafana
     hostname: miracle-grafana
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=miracle
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-miracle}
       - GF_USERS_ALLOW_SIGN_UP=false
     ports:
       - "3001:3000"
@@ -269,11 +308,60 @@ services:
       prometheus:
         condition: service_started
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Loki -- Log aggregation
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: miracle_loki
+    hostname: miracle-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./docker/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - miracle_net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Promtail -- Log shipping agent
+  # ---------------------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: miracle_promtail
+    hostname: miracle-promtail
+    volumes:
+      - ./docker/promtail/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - miracle_net
+    depends_on:
+      - loki
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
 # =============================================================================
 # Networks
@@ -299,3 +387,5 @@ volumes:
     name: miracle_zookeeper_logs
   grafana_data:
     name: miracle_grafana_data
+  loki_data:
+    name: miracle_loki_data

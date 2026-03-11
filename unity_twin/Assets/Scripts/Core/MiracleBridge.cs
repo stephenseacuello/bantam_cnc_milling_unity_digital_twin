@@ -338,6 +338,22 @@ namespace MiracleTwin.Core
                 "/miracle/mes/validate_gcode", request, callback);
         }
 
+#if UNITY_EDITOR
+        void OnValidate()
+        {
+            if (onMachineState == null) Debug.LogWarning("[MiracleBridge] onMachineState event channel not assigned.", this);
+            if (onAnomalyAlert == null) Debug.LogWarning("[MiracleBridge] onAnomalyAlert event channel not assigned.", this);
+            if (onToolWear == null) Debug.LogWarning("[MiracleBridge] onToolWear event channel not assigned.", this);
+            if (onTwinSync == null) Debug.LogWarning("[MiracleBridge] onTwinSync event channel not assigned.", this);
+            if (onSystemKPIs == null) Debug.LogWarning("[MiracleBridge] onSystemKPIs event channel not assigned.", this);
+            if (onJobStatus == null) Debug.LogWarning("[MiracleBridge] onJobStatus event channel not assigned.", this);
+            if (onTaskAward == null) Debug.LogWarning("[MiracleBridge] onTaskAward event channel not assigned.", this);
+            if (onSecurityAlert == null) Debug.LogWarning("[MiracleBridge] onSecurityAlert event channel not assigned.", this);
+            if (onCuttingState == null) Debug.LogWarning("[MiracleBridge] onCuttingState event channel not assigned.", this);
+            if (onRobotJointState == null) Debug.LogWarning("[MiracleBridge] onRobotJointState event channel not assigned.", this);
+        }
+#endif
+
         void OnDestroy()
         {
             if (Instance == this) Instance = null;

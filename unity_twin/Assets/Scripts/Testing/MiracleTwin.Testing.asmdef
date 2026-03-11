@@ -1,0 +1,17 @@
+{
+    "name": "MiracleTwin.Testing",
+    "rootNamespace": "MiracleTwin.Testing",
+    "references": [
+        "MiracleTwin",
+        "Unity.Robotics.ROSTCPConnector.Messages"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

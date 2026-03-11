@@ -19,6 +19,7 @@ namespace MiracleTwin.Cutting
         [Header("References")]
         [SerializeField] private MonoBehaviour cncControllerObject;
         [SerializeField] private CuttingSimulationManager cuttingSimManager;
+        [SerializeField] private CNCMachineProfileSO machineProfile;
 
         [Header("Settings")]
         [Tooltip("Speed multiplier for G0 rapid moves relative to programmed feedrate.")]
@@ -90,6 +91,18 @@ namespace MiracleTwin.Cutting
             if (segments.Count == 0)
             {
                 Debug.LogWarning("[GCodeExecutor] Program produced zero toolpath segments.");
+                return;
+            }
+
+            // Validate against machine limits
+            var validation = GCodeValidator.ValidateProgram(segments, machineProfile);
+            foreach (var warn in validation.Warnings)
+                Debug.LogWarning($"[GCodeValidator] {warn}");
+            foreach (var err in validation.Errors)
+                Debug.LogError($"[GCodeValidator] {err}");
+            if (!validation.IsValid)
+            {
+                Debug.LogError("[GCodeExecutor] Program failed validation — execution aborted.");
                 return;
             }
 

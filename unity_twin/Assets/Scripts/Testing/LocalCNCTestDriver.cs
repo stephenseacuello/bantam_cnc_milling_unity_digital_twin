@@ -331,5 +331,14 @@ namespace MiracleTwin.Testing
                 robots[r].SetJointTargets(targets);
             }
         }
+
+#if UNITY_EDITOR
+        void OnValidate()
+        {
+            if (machineStateEvent == null) Debug.LogWarning("[LocalCNCTestDriver] machineStateEvent not assigned.", this);
+            if (cuttingStateEvent == null) Debug.LogWarning("[LocalCNCTestDriver] cuttingStateEvent not assigned.", this);
+            if (systemKPIsEvent == null) Debug.LogWarning("[LocalCNCTestDriver] systemKPIsEvent not assigned.", this);
+        }
+#endif
     }
 }

@@ -199,5 +199,12 @@ namespace MiracleTwin.Core
         {
             return VibrationMagnitude > thresholdMmPerS2;
         }
+
+#if UNITY_EDITOR
+        void OnValidate()
+        {
+            if (string.IsNullOrEmpty(machineId)) Debug.LogWarning("[SensorDataBridge] machineId is not set.", this);
+        }
+#endif
     }
 }

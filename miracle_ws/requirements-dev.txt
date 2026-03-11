@@ -1,0 +1,5 @@
+# Development dependencies
+-r requirements.txt
+pytest-xdist>=3.5.0
+pytest-timeout>=2.3.0
+mypy>=1.8.0

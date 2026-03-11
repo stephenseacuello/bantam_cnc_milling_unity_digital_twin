@@ -1,0 +1,28 @@
+# MIRACLE Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core
+setuptools>=69.0
+PyYAML>=6.0.1
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
+
+# Data & Math
+numpy>=1.26.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+
+# Bridges
+kafka-python>=2.0.2
+opcua>=0.98.13
+pymodbus>=3.6.0
+paho-mqtt>=2.0.0
+websockets>=12.0
+
+# SCADA
+prometheus-client>=0.20.0
+
+# Linting
+ruff>=0.3.0

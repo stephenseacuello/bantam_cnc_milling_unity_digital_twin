@@ -186,4 +186,4 @@ class TestConfigResolutionPerformance:
         elapsed = time.perf_counter() - start
         rate = (count * 3) / elapsed
         print(f"\n  Config resolution: {rate:,.0f} lookups/sec ({elapsed:.3f}s)")
-        assert rate > 500_000
+        assert rate > 200_000

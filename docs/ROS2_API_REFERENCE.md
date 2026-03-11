@@ -1,6 +1,27 @@
 # MIRACLE ROS2 API Reference
 
-> Auto-generated reference for all ROS2 topics, services, actions, and message types in the MIRACLE (Manufacturing Intelligence, Resilience, And Cognitive Learning Engine) system.
+> Comprehensive reference for all ROS2 topics, services, actions, and message types in the MIRACLE (Manufacturing Intelligence, Resilience, And Cognitive Learning Engine) digital twin system.
+
+---
+
+## Overview
+
+The MIRACLE system is a distributed ROS2 architecture for CNC milling digital twins. It connects a Unity 3D visualization front-end to a fleet of ROS2 nodes spanning machine control, AI/ML analytics, manufacturing execution, SCADA, security, resiliency, and cognitive planning.
+
+**Key architectural layers:**
+
+- **CNC Layer** (`miracle_cnc`) -- Sensor fusion, G-code execution, SPC monitoring, and machine watchdog.
+- **AI Layer** (`miracle_ai`) -- Anomaly detection, PHM prediction, tool wear estimation, and chatter detection.
+- **MES Layer** (`miracle_mes`) -- Job scheduling, fleet management, OEE calculation, and digital thread traceability.
+- **SCADA Layer** (`miracle_scada`) -- Device discovery, traffic management, alarm aggregation, HMI WebSocket bridge, and Prometheus metrics export.
+- **Twin Layer** (`miracle_twin`) -- State synchronization, Gazebo bridge, prediction runner, and scenario management.
+- **Resiliency Layer** (`miracle_resiliency`) -- Heartbeat monitoring, Erlang-style supervision trees, failover coordination, checkpointing, and chaos testing.
+- **Security Layer** (`miracle_security`) -- Intrusion detection, remote attestation, threat response, access control, and audit logging.
+- **Cognitive Layer** (`miracle_cognitive`) -- Knowledge graphs, planning (GOAP/HTN), multi-agent task allocation, reinforcement learning, federated learning, and self-x autonomic capabilities.
+- **Bridges** (`miracle_bridges`) -- Protocol bridges for OPC-UA, Modbus TCP, MTConnect, Sparkplug B (MQTT), and Apache Kafka.
+- **Unity Client** -- `MiracleBridge` (C#) connects via ROS-TCP-Connector over TCP port 10000.
+
+**Communication model:** All lifecycle nodes extend `MiracleLifecycleNode`, which provides automatic heartbeat publishing to `/miracle/heartbeats`. Per-machine topics use the pattern `/miracle/{machine_id}/...` where `machine_id` defaults to `cnc1`, `cnc2`, `cnc3`. The ROS2 domain ID is **42**.
 
 ---
 
@@ -15,6 +36,7 @@
   - [Messages](#messages)
   - [Services](#services)
   - [Actions](#actions)
+- [Network Ports](#network-ports)
 - [QoS Profiles](#qos-profiles)
 - [Node Summary](#node-summary)
   - [miracle_cnc](#miracle_cnc)
@@ -855,6 +877,36 @@ uint32 updates_expected
 float64 elapsed_sec
 string current_phase
 ```
+
+---
+
+## Network Ports
+
+All port defaults are defined in `miracle_ws/config/miracle_defaults.yaml` and can be overridden via environment variables (`MIRACLE_NETWORK_<KEY>`).
+
+| Port | Protocol | Service | Container Mapping | Description |
+|------|----------|---------|-------------------|-------------|
+| **10000** | TCP | ROS-TCP-Connector | `10000:10000` | Unity-to-ROS2 bridge (ros_tcp_endpoint). Carries all ROS2 topic/service traffic between Unity `MiracleBridge` and the ROS2 system. |
+| **9090** | WebSocket | HMI Bridge | `9091:9090` (host 9091) | WebSocket server for the web-based HMI dashboard. Streams machine state, KPIs, fleet health, and anomaly data to browser clients. |
+| **1883** | MQTT | Eclipse Mosquitto | `1883:1883` | MQTT broker for Sparkplug B IIoT integration. Used by `sparkplug_bridge` for NBIRTH/DBIRTH/NDATA/DDATA messages. |
+| **9092** | TCP | Apache Kafka | `9092:9092` | Kafka broker for enterprise event streaming. Used by `kafka_bridge` to forward machine state, anomalies, job status, and KPIs. |
+| **29092** | TCP | Kafka (host) | `29092:29092` | Kafka external listener for host-side clients. |
+| **502** | TCP | Modbus TCP | -- | Modbus TCP server for PLC/sensor integration. Used by `modbus_bridge` to read holding registers. |
+| **4840** | TCP | OPC-UA | -- | OPC-UA server for industrial data access. Used by `opc_ua_bridge` to read machine state and sensor values. |
+| **9100** | HTTP | Prometheus | -- | Node exporter / Prometheus scrape target for `prometheus_exporter` metrics. |
+| **9190** | HTTP | Prometheus Server | `9190:9090` (host 9190) | Prometheus server UI and query API. |
+| **3001** | HTTP | Grafana | `3001:3000` (host 3001) | Grafana dashboard for visualization of Prometheus metrics and Loki logs. |
+| **3100** | HTTP | Loki | -- | Loki log aggregation endpoint (internal). Used by Promtail to push logs. |
+
+**ROS2 DDS Configuration:**
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `ROS_DOMAIN_ID` | 42 | DDS domain isolation for MIRACLE traffic |
+| Heartbeat interval | 0.5 s | Default heartbeat publish rate for all lifecycle nodes |
+| Keepalive timeout | 10.0 s | Connection keepalive timeout |
+| QoS history depth | 10 | Default DDS history depth |
+| FastDDS profile | `docker/fastdds_profile.xml` | Custom Fast-DDS transport configuration |
 
 ---
 

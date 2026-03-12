@@ -221,6 +221,14 @@
                     <Label text="Fleet Overview" class="panel-title" />
                     <Button name="fleet-close-btn" text="X" class="control-btn" />
                 </VisualElement>
+                <!-- Fleet Health Summary -->
+                <VisualElement name="fleet-health-summary" class="fleet-health-summary">
+                    <Label name="fleet-health-score-header" text="Fleet Health: --%" class="fleet-health-score-label" />
+                    <VisualElement class="fleet-health-summary-metrics">
+                        <Label name="fleet-rul-critical-header" text="RUL Critical: 0" class="fleet-health-metric" />
+                        <Label name="fleet-anomaly-count-header" text="Predicted Anomalies (&lt;5m): 0" class="fleet-health-metric" />
+                    </VisualElement>
+                </VisualElement>
                 <VisualElement name="fleet-grid" class="fleet-grid" />
             </VisualElement>
 

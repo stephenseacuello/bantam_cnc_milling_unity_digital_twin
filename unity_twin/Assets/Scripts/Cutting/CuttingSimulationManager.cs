@@ -198,14 +198,31 @@ namespace MiracleTwin.Cutting
                 TotalMaterialRemoved += removedVoxels * voxelVolumeMM3;
             }
 
-            // 5. Stability lobe check (periodic, not every frame)
+            // 5. Feed current wear into stability predictor for wear-adjusted lobes
+            if (stabilityLobePredictor != null)
+            {
+                float previousLimit = stabilityLobePredictor.LastStabilityLimit;
+                stabilityLobePredictor.UpdateToolWear(toolWearModel.VB);
+
+                // Warn when stability limit crosses below current depth of cut
+                float newLimit = stabilityLobePredictor.CalculateStabilityLimit(rpm);
+                if (previousLimit > ap && newLimit <= ap)
+                {
+                    Debug.LogWarning($"[CuttingSimulationManager] WEAR-STABILITY WARNING: " +
+                                     $"Tool wear (VB={toolWearModel.VB:F3}mm) has shifted stability limit " +
+                                     $"below current depth of cut ({ap:F2}mm). " +
+                                     $"New stability limit: {newLimit:F2}mm. Consider reducing DOC or replacing tool.");
+                }
+            }
+
+            // 6. Stability lobe check (periodic, not every frame)
             if (enableStabilityLobeCheck && Time.time - lastStabilityCheckTime >= stabilityCheckInterval)
             {
                 lastStabilityCheckTime = Time.time;
                 CheckStabilityLobe(rpm, ap);
             }
 
-            // 6. Auto-pause on end-of-life (VBmax reached)
+            // 7. Auto-pause on end-of-life (VBmax reached)
             IsToolEndOfLife = toolWearModel.IsEndOfLife;
             if (IsToolEndOfLife && !toolEndOfLifePauseTriggered)
             {

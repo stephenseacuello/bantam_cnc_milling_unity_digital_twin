@@ -1103,3 +1103,43 @@ class CuttingSimProxy:
             elif ratio < 0.15:
                 risk = max(risk, 0.2)
         return risk
+
+    def get_block_anomaly_indicators(
+        self,
+        result: Dict[str, float],
+        force_threshold: float = 180.0,
+        temp_threshold: float = 25.0,
+    ) -> Dict[str, float]:
+        """Extract anomaly-relevant metrics from a simulation result dict.
+
+        Args:
+            result: A dict with keys matching BlockPrediction fields
+                (peak_force_n, temperature_rise_c, wear_after_block_mm,
+                surface_ra_um) or a BlockPrediction-like object converted to dict.
+            force_threshold: Force threshold in Newtons for ratio calculation.
+            temp_threshold: Temperature threshold in Celsius for ratio calculation.
+
+        Returns:
+            Dict with anomaly indicator metrics:
+                - peak_force_ratio: peak force vs threshold (0-1+)
+                - temp_rise_ratio: temperature rise vs threshold (0-1+)
+                - wear_rate: wear in mm/block (approximated from wear_after_block_mm)
+                - chatter_risk_score: 0-1 score from stability analysis
+                - surface_ra_um: surface roughness if available, else 0.0
+        """
+        peak_force = result.get('peak_force_n', 0.0)
+        temp_rise = result.get('temperature_rise_c', 0.0)
+        wear = result.get('wear_after_block_mm', 0.0)
+        surface_ra = result.get('surface_ra_um', 0.0)
+
+        # Chatter risk from RPM if provided, otherwise 0
+        rpm = result.get('spindle_rpm', 0.0)
+        chatter = self._chatter_risk_score(rpm)
+
+        return {
+            'peak_force_ratio': peak_force / force_threshold if force_threshold > 0 else 0.0,
+            'temp_rise_ratio': temp_rise / temp_threshold if temp_threshold > 0 else 0.0,
+            'wear_rate': wear,  # mm accumulated through this block
+            'chatter_risk_score': chatter,
+            'surface_ra_um': surface_ra,
+        }

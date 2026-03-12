@@ -44,20 +44,71 @@ namespace MiracleTwin.Cutting
         [SerializeField] private float maxRPM = 25000f;
         [SerializeField] private float rpmSearchStep = 50f;
 
+        [Header("Tool Wear Adjustment")]
+        [SerializeField] private float currentWearVB = 0f;           // Current flank wear in mm
+        [SerializeField] private float wearStiffnessReduction = 0.15f; // % stiffness loss per 0.1mm wear
+        [SerializeField] private float wearDampingIncrease = 0.05f;    // % damping increase per 0.1mm wear
+        [SerializeField] private float maxWearVB = 0.3f;              // VBmax clamp (mm)
+
+        // Cached lobe surface for visualization
+        private float[,] lobeSurface; // [rpmIndex, depthIndex]
+        private float[] lobeSurfaceRPMs;
+        private float[] lobeSurfaceDepths;
+        private bool lobeSurfaceDirty = true;
+
         /// <summary>Last evaluated chatter risk.</summary>
         public ChatterRisk LastRisk { get; private set; } = ChatterRisk.LOW;
 
         /// <summary>Last evaluated stability limit (mm).</summary>
         public float LastStabilityLimit { get; private set; }
 
+        /// <summary>Current flank wear value (mm).</summary>
+        public float CurrentWearVB => currentWearVB;
+
+        /// <summary>
+        /// Update tool wear and recompute stability limits.
+        /// Marks the lobe surface cache as dirty so it will be recomputed on next access.
+        /// </summary>
+        public void UpdateToolWear(float wearVB_mm)
+        {
+            currentWearVB = Mathf.Max(0f, wearVB_mm);
+            lobeSurfaceDirty = true;
+        }
+
+        /// <summary>
+        /// Get wear-adjusted modal stiffness: k_eff = k * (1 - wearFactor * VB / 0.1).
+        /// Wear reduces effective stiffness (tool becomes more compliant).
+        /// Clamped so stiffness never drops below 10% of nominal.
+        /// </summary>
+        private float GetEffectiveStiffness(float wearVB)
+        {
+            float clampedVB = Mathf.Clamp(wearVB, 0f, maxWearVB);
+            float factor = 1f - wearStiffnessReduction * (clampedVB / 0.1f);
+            factor = Mathf.Max(factor, 0.1f); // Never below 10% of nominal
+            return stiffnessNpm * factor;
+        }
+
+        /// <summary>
+        /// Get wear-adjusted damping: zeta_eff = zeta * (1 + wearDampingIncrease * VB / 0.1).
+        /// Wear increases effective damping slightly (contact area grows).
+        /// </summary>
+        private float GetEffectiveDamping(float wearVB)
+        {
+            float clampedVB = Mathf.Clamp(wearVB, 0f, maxWearVB);
+            float factor = 1f + wearDampingIncrease * (clampedVB / 0.1f);
+            return dampingRatio * factor;
+        }
+
         /// <summary>
         /// Calculate the stability limit (ap_lim in mm) at a given RPM
-        /// using the Altintas-Budak ZOA method.
+        /// using the Altintas-Budak ZOA method, with wear-adjusted modal parameters.
         /// </summary>
         public float CalculateStabilityLimit(float rpm)
         {
             if (rpm <= 0) return float.MaxValue;
 
+            float k_eff = GetEffectiveStiffness(currentWearVB);
+            float zeta_eff = GetEffectiveDamping(currentWearVB);
             float omega_n = naturalFrequencyHz * 2f * Mathf.PI;
             float bestApLim = float.MaxValue;
 
@@ -67,22 +118,16 @@ namespace MiracleTwin.Cutting
                 float omega_c = omega_n * ratio;
                 float r = omega_c / omega_n;
                 float r2 = r * r;
-                float dr = 2f * dampingRatio * r;
+                float dr = 2f * zeta_eff * r;
 
                 // Real part of FRF: Re[G(jω)]
-                float denom = stiffnessNpm * ((1f - r2) * (1f - r2) + dr * dr);
+                float denom = k_eff * ((1f - r2) * (1f - r2) + dr * dr);
                 if (Mathf.Abs(denom) < 1e-12f) continue;
                 float realG = (1f - r2) / denom;
 
                 if (realG >= 0) continue; // Only unstable when Re[G] < 0
 
-                // ap_lim = -1 / (2 · Ktc · N · Re[G])
-                // Ktc is in N/mm², Re[G] is in m/N, so convert: Ktc * 1e6 to get N/m²
-                // Actually Ktc in N/mm² and ap in mm. We need consistent units.
-                // ap_lim (mm) = -1 / (2 * Ktc(N/mm²) * N * Re[G](m/N))
-                // = -1 / (2 * Ktc * N * Re[G])
-                // But Re[G] has units m/N (compliance). We need to convert to mm/N:
-                // Re[G] (mm/N) = Re[G] (m/N) * 1000
+                // ap_lim (mm) = -1 / (2 * Ktc(N/mm²) * N * Re[G](mm/N))
                 float realG_mmN = realG * 1000f;  // Convert m/N to mm/N
                 float apLim = -1f / (2f * Ktc * fluteCount * realG_mmN);
 
@@ -101,6 +146,89 @@ namespace MiracleTwin.Cutting
             }
 
             return bestApLim < float.MaxValue ? bestApLim : 100f; // 100mm = effectively unlimited
+        }
+
+        /// <summary>
+        /// Compute full lobe surface grid for visualization.
+        /// The surface stores stability limits at each (RPM, depth) grid point.
+        /// </summary>
+        public void ComputeLobeSurface(float minRPMRange, float maxRPMRange, float minDepth, float maxDepth, int resolution = 50)
+        {
+            lobeSurface = new float[resolution, resolution];
+            lobeSurfaceRPMs = new float[resolution];
+            lobeSurfaceDepths = new float[resolution];
+
+            for (int i = 0; i < resolution; i++)
+            {
+                lobeSurfaceRPMs[i] = Mathf.Lerp(minRPMRange, maxRPMRange, (float)i / (resolution - 1));
+                lobeSurfaceDepths[i] = Mathf.Lerp(minDepth, maxDepth, (float)i / (resolution - 1));
+            }
+
+            for (int ri = 0; ri < resolution; ri++)
+            {
+                float apLim = CalculateStabilityLimit(lobeSurfaceRPMs[ri]);
+                for (int di = 0; di < resolution; di++)
+                {
+                    // Store margin: positive = stable, negative = unstable
+                    lobeSurface[ri, di] = apLim - lobeSurfaceDepths[di];
+                }
+            }
+
+            lobeSurfaceDirty = false;
+        }
+
+        /// <summary>
+        /// Get interpolated stability limit at specific RPM from the cached surface.
+        /// Returns the stability limit in mm. Falls back to direct calculation if surface not computed.
+        /// </summary>
+        public float GetStabilityLimitFromSurface(float rpm)
+        {
+            if (lobeSurface == null || lobeSurfaceRPMs == null || lobeSurfaceRPMs.Length < 2)
+                return CalculateStabilityLimit(rpm);
+
+            // Find bounding RPM indices
+            int len = lobeSurfaceRPMs.Length;
+            if (rpm <= lobeSurfaceRPMs[0])
+                return CalculateStabilityLimit(lobeSurfaceRPMs[0]);
+            if (rpm >= lobeSurfaceRPMs[len - 1])
+                return CalculateStabilityLimit(lobeSurfaceRPMs[len - 1]);
+
+            // Binary search for interval
+            int lo = 0, hi = len - 1;
+            while (hi - lo > 1)
+            {
+                int mid = (lo + hi) / 2;
+                if (lobeSurfaceRPMs[mid] <= rpm) lo = mid;
+                else hi = mid;
+            }
+
+            // The stability limit at each RPM column is where margin crosses zero.
+            // margin = apLim - depth, so apLim = margin + depth. At depth index 0, margin = apLim - minDepth.
+            // Simpler: just interpolate the direct calculation values.
+            float apLo = CalculateStabilityLimit(lobeSurfaceRPMs[lo]);
+            float apHi = CalculateStabilityLimit(lobeSurfaceRPMs[hi]);
+            float t = (rpm - lobeSurfaceRPMs[lo]) / (lobeSurfaceRPMs[hi] - lobeSurfaceRPMs[lo]);
+            return Mathf.Lerp(apLo, apHi, t);
+        }
+
+        /// <summary>
+        /// Get the full lobe surface data for visualization.
+        /// Returns the surface grid, RPM axis values, and depth axis values.
+        /// </summary>
+        public (float[,] surface, float[] rpms, float[] depths) GetLobeSurfaceData()
+        {
+            return (lobeSurface, lobeSurfaceRPMs, lobeSurfaceDepths);
+        }
+
+        /// <summary>
+        /// Check if operating point is in a stable pocket.
+        /// A stable pocket is where the depth of cut is below the stability limit
+        /// with at least the medium risk margin of headroom.
+        /// </summary>
+        public bool IsInStablePocket(float rpm, float depth)
+        {
+            float apLim = CalculateStabilityLimit(rpm);
+            return depth < apLim * mediumRiskMargin;
         }
 
         /// <summary>

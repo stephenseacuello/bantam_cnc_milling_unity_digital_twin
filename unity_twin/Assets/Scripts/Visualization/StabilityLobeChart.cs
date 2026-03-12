@@ -1,4 +1,5 @@
 using UnityEngine;
+using MiracleTwin.Cutting;
 
 namespace MiracleTwin.Visualization
 {
@@ -25,6 +26,15 @@ namespace MiracleTwin.Visualization
         [SerializeField] private Color stableColor = new(0.2f, 0.8f, 0.2f, 0.3f);
         [SerializeField] private Color unstableColor = new(0.8f, 0.2f, 0.2f, 0.3f);
         [SerializeField] private Color operatingPointColor = Color.yellow;
+        [SerializeField] private Color nearBoundaryColor = new(1f, 0.9f, 0.2f, 0.5f);
+
+        [Header("Lobe Surface Rendering")]
+        [SerializeField] private StabilityLobePredictor lobePredictor;
+        [SerializeField] private int lobeSurfaceResolution = 50;
+
+        /// <summary>Texture used to render the wear-adjusted lobe surface.</summary>
+        private Texture2D lobeSurfaceTexture;
+        private GameObject lobeSurfaceQuad;
 
         public float CurrentRPM { get; set; }
         public float CurrentDepth { get; set; }
@@ -135,27 +145,160 @@ namespace MiracleTwin.Visualization
         }
 
         /// <summary>
-        /// Draw lookahead operating points as debug visualization.
-        /// Green = stable, Red = unstable.
+        /// Render the lobe surface as a color-coded 2D texture overlay.
+        /// Green = stable pocket (large margin), Yellow = near boundary, Red = unstable.
+        /// </summary>
+        private void RenderLobeSurface()
+        {
+            if (lobePredictor == null) return;
+
+            lobePredictor.ComputeLobeSurface(minRPM, maxRPM, 0f, maxDepth, lobeSurfaceResolution);
+            var (surface, rpms, depths) = lobePredictor.GetLobeSurfaceData();
+            if (surface == null) return;
+
+            int res = lobeSurfaceResolution;
+
+            if (lobeSurfaceTexture == null || lobeSurfaceTexture.width != res)
+            {
+                lobeSurfaceTexture = new Texture2D(res, res, TextureFormat.RGBA32, false);
+                lobeSurfaceTexture.filterMode = FilterMode.Bilinear;
+                lobeSurfaceTexture.wrapMode = TextureWrapMode.Clamp;
+            }
+
+            for (int x = 0; x < res; x++)
+            {
+                for (int y = 0; y < res; y++)
+                {
+                    float margin = surface[x, y]; // positive = stable, negative = unstable
+                    float depth = depths[y];
+                    float normalizedMargin = depth > 0.001f ? margin / depth : 1f;
+
+                    Color c;
+                    if (normalizedMargin > 0.2f)
+                        c = stableColor;            // Green: stable pocket, large margin
+                    else if (normalizedMargin > 0f)
+                        c = nearBoundaryColor;      // Yellow: near boundary
+                    else
+                        c = unstableColor;          // Red: unstable
+
+                    lobeSurfaceTexture.SetPixel(x, y, c);
+                }
+            }
+            lobeSurfaceTexture.Apply();
+
+            // Create or update the quad to display the texture
+            if (lobeSurfaceQuad == null)
+            {
+                lobeSurfaceQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                lobeSurfaceQuad.name = "LobeSurfaceOverlay";
+                lobeSurfaceQuad.transform.SetParent(transform, false);
+                lobeSurfaceQuad.transform.localPosition = Vector3.zero;
+                lobeSurfaceQuad.transform.localScale = Vector3.one;
+                // Remove collider
+                var col = lobeSurfaceQuad.GetComponent<Collider>();
+                if (col != null) Destroy(col);
+            }
+
+            var renderer = lobeSurfaceQuad.GetComponent<Renderer>();
+            if (renderer != null)
+            {
+                var shader = Shader.Find("Universal Render Pipeline/Unlit")
+                          ?? Shader.Find("Sprites/Default")
+                          ?? Shader.Find("Hidden/InternalErrorShader");
+                if (shader != null)
+                {
+                    renderer.material = new Material(shader);
+                    renderer.material.mainTexture = lobeSurfaceTexture;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Called periodically to refresh the lobe surface when wear changes.
+        /// </summary>
+        void Update()
+        {
+            if (lobePredictor != null)
+            {
+                // Re-render lobe surface when predictor data changes
+                var (surface, _, _) = lobePredictor.GetLobeSurfaceData();
+                if (surface == null)
+                {
+                    RenderLobeSurface();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Refresh the lobe surface visualization. Call this after wear updates.
+        /// </summary>
+        public void RefreshLobeSurface()
+        {
+            RenderLobeSurface();
+        }
+
+        /// <summary>
+        /// Get the stability margin color for an operating point.
+        /// </summary>
+        private Color GetStabilityColor(float rpm, float depth)
+        {
+            float limit = CalculateStabilityLimit(rpm);
+            float margin = limit - depth;
+            float normalizedMargin = depth > 0.001f ? margin / depth : 1f;
+
+            if (normalizedMargin > 0.2f) return stableColor;
+            if (normalizedMargin > 0f) return nearBoundaryColor;
+            return unstableColor;
+        }
+
+        /// <summary>
+        /// Draw current operating point and lookahead points as debug visualization.
+        /// Current point as yellow dot; lookahead as trail of colored dots.
+        /// Green = stable pocket (large margin), Yellow = near boundary, Red = unstable.
         /// </summary>
         void OnDrawGizmos()
         {
+            // Draw current operating point
+            if (CurrentRPM > 0 && CurrentDepth > 0)
+            {
+                float xNorm = Mathf.InverseLerp(minRPM, maxRPM, CurrentRPM);
+                float yNorm = CurrentDepth / maxDepth;
+                Vector3 worldPos = transform.TransformPoint(new Vector3(xNorm - 0.5f, yNorm - 0.5f, 0));
+
+                Gizmos.color = operatingPointColor;
+                Gizmos.DrawSphere(worldPos, 0.008f);
+            }
+
+            // Draw lookahead points as a trail with stability coloring
             if (lookaheadPoints.Count == 0) return;
 
-            foreach (var point in lookaheadPoints)
+            for (int i = 0; i < lookaheadPoints.Count; i++)
             {
-                float rpm = point.x;
-                float depth = point.y;
-                float limit = CalculateStabilityLimit(rpm);
-                bool stable = depth < limit;
+                float rpm = lookaheadPoints[i].x;
+                float depth = lookaheadPoints[i].y;
 
                 // Normalize to chart space
                 float xNorm = Mathf.InverseLerp(minRPM, maxRPM, rpm);
                 float yNorm = depth / maxDepth;
                 Vector3 worldPos = transform.TransformPoint(new Vector3(xNorm - 0.5f, yNorm - 0.5f, 0));
 
-                Gizmos.color = stable ? Color.green : Color.red;
-                Gizmos.DrawSphere(worldPos, 0.005f);
+                // Color by stability margin: green (safe), yellow (near boundary), red (unstable)
+                Gizmos.color = GetStabilityColor(rpm, depth);
+
+                // Trail dots get smaller as they get further from current point
+                float size = Mathf.Lerp(0.006f, 0.003f, (float)i / Mathf.Max(1, lookaheadPoints.Count - 1));
+                Gizmos.DrawSphere(worldPos, size);
+
+                // Draw connecting line between trail points
+                if (i > 0)
+                {
+                    float prevRpm = lookaheadPoints[i - 1].x;
+                    float prevDepth = lookaheadPoints[i - 1].y;
+                    float prevX = Mathf.InverseLerp(minRPM, maxRPM, prevRpm);
+                    float prevY = prevDepth / maxDepth;
+                    Vector3 prevPos = transform.TransformPoint(new Vector3(prevX - 0.5f, prevY - 0.5f, 0));
+                    Gizmos.DrawLine(prevPos, worldPos);
+                }
             }
         }
     }

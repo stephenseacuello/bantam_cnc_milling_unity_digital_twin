@@ -17,6 +17,8 @@ try:
 except ImportError:
     PredictionValidatorNode = None  # type: ignore[assignment,misc]
 
+from miracle_twin.block_telemetry import BlockTelemetryTracker
+
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.action.server import ServerGoalHandle
@@ -29,6 +31,18 @@ from miracle_msgs.action import RunPrediction
 from miracle_msgs.srv import RunPrediction as RunPredictionSrv
 from miracle_twin.cutting_sim_proxy import CuttingSimProxy, GCodeBlock, ToolState
 from miracle_twin.tool_library import ToolLibrary
+
+
+@dataclass
+class AnomalyMarker:
+    """A predictive anomaly marker flagging a potentially problematic G-code block."""
+    block_index: int
+    gcode_line: str
+    marker_type: str       # e.g. "FORCE_CRITICAL", "THERMAL_WARNING"
+    severity: float        # 0.0 - 1.0
+    predicted_value: float
+    threshold: float
+    recommendation: str    # e.g. "Reduce feed rate by 20%"
 
 
 @dataclass
@@ -96,6 +110,8 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         self._latest_machine_state: Optional[MachineState] = None
         self._tool_library = ToolLibrary()
         self._validator: Optional[Any] = None
+        self._block_telemetry = BlockTelemetryTracker()
+        self._telemetry_block_counter: int = 0
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure prediction runner."""
@@ -170,6 +186,39 @@ class PredictionRunnerNode(MiracleLifecycleNode):
     def _on_machine_state(self, msg: MachineState) -> None:
         """Cache latest machine state for use in predictions."""
         self._latest_machine_state = msg
+
+    def _record_block_telemetry(
+        self,
+        block_index: int,
+        gcode_line: str,
+        predicted: dict,
+        actual: dict,
+    ) -> None:
+        """Record a single block's predicted-vs-actual comparison.
+
+        Automatically checks for drift every 50 blocks.
+        """
+        self._block_telemetry.record(block_index, gcode_line, predicted, actual)
+        self._telemetry_block_counter += 1
+        if self._telemetry_block_counter % 50 == 0:
+            self._check_drift()
+
+    def _check_drift(self) -> None:
+        """Log a warning if the model is drifting."""
+        report = self._block_telemetry.get_drift_report(window=50)
+        if report.is_drifting:
+            self.get_logger().warning(
+                "Model drift detected: force_trend=%.2f%%/100blk, "
+                "temp_trend=%.2f%%/100blk (blocks_since_cal=%d)",
+                report.force_drift_trend,
+                report.temp_drift_trend,
+                report.blocks_since_calibration,
+            )
+            if report.recalibration_suggested:
+                self.get_logger().warning(
+                    "Recalibration suggested: drift persisting for >50 "
+                    "consecutive checks"
+                )
 
     def set_validator(self, validator: Any) -> None:
         """Attach a PredictionValidatorNode for prediction-vs-actual tracking.
@@ -701,6 +750,14 @@ class PredictionRunnerNode(MiracleLifecycleNode):
                     f'"diameter_mm": {td.diameter_mm}}}'
                 )
 
+            # Identify anomaly risks in simulation results
+            anomaly_markers = self._identify_anomaly_risks(blocks, sim_result)
+            if anomaly_markers:
+                self.get_logger().warning(
+                    f"Identified {len(anomaly_markers)} anomaly markers "
+                    f"in prediction for {request.machine_id}"
+                )
+
             prediction = PHMPrediction()
             prediction.timestamp = self.get_clock().now().to_msg()
             prediction.machine_id = request.machine_id
@@ -737,11 +794,28 @@ class PredictionRunnerNode(MiracleLifecycleNode):
                     },
                 )
 
+            # Build anomaly markers JSON for detailed report
+            markers_json = ''
+            if anomaly_markers:
+                import json
+                markers_list = [
+                    {
+                        'block_index': m.block_index,
+                        'marker_type': m.marker_type,
+                        'severity': round(m.severity, 3),
+                        'predicted_value': round(m.predicted_value, 3),
+                        'threshold': round(m.threshold, 3),
+                        'recommendation': m.recommendation,
+                    }
+                    for m in anomaly_markers
+                ]
+                markers_json = f', "anomaly_markers": {json.dumps(markers_list)}'
+
             goal_handle.succeed()
             result.success = True
             result.prediction = prediction
             result.detailed_report_json = (
-                f'{{"status": "completed"{tool_info}}}'
+                f'{{"status": "completed"{tool_info}{markers_json}}}'
             )
 
         except Exception as exc:
@@ -757,6 +831,209 @@ class PredictionRunnerNode(MiracleLifecycleNode):
 
         return result
 
+
+    @staticmethod
+    def _generate_recommendation(marker_type: str, predicted_value: float, threshold: float) -> str:
+        """Generate actionable recommendation text for an anomaly marker.
+
+        Args:
+            marker_type: The anomaly type identifier.
+            predicted_value: The predicted metric value.
+            threshold: The threshold that was exceeded.
+
+        Returns:
+            Human-readable recommendation string.
+        """
+        recommendations = {
+            'FORCE_WARNING': 'Reduce feed rate by 15% or decrease depth of cut',
+            'FORCE_CRITICAL': 'Reduce feed rate by 30% and decrease depth of cut immediately',
+            'THERMAL_WARNING': 'Increase coolant flow or reduce cutting speed by 10%',
+            'THERMAL_CRITICAL': 'Stop and verify coolant system; reduce speed by 25%',
+            'WEAR_ACCELERATED': 'Schedule tool replacement; reduce cutting speed to extend life',
+            'CHATTER_RISK': 'Adjust spindle speed to avoid stability lobe boundary',
+            'TOOL_END_OF_LIFE': 'Replace tool before next operation',
+            'SURFACE_QUALITY_WARNING': 'Reduce feed per tooth or verify tool nose radius',
+        }
+        base = recommendations.get(marker_type, 'Review cutting parameters')
+        if threshold > 0 and predicted_value > 0:
+            overshoot_pct = ((predicted_value - threshold) / threshold) * 100.0
+            if overshoot_pct > 0:
+                return f'{base} (exceeded by {overshoot_pct:.0f}%)'
+        return base
+
+    @staticmethod
+    def _identify_anomaly_risks(
+        blocks: List['GCodeBlock'],
+        sim_result: 'SimulationResult',
+        force_threshold: float = 180.0,
+        temp_warning: float = 15.0,
+        temp_critical: float = 25.0,
+        wear_rate_threshold: float = 0.005,
+        chatter_threshold: float = 0.8,
+        rul_threshold_min: float = 30.0,
+        surface_ra_threshold: float = 3.2,
+    ) -> List['AnomalyMarker']:
+        """Scan simulation results and flag blocks with anomaly risks.
+
+        Args:
+            blocks: The G-code blocks that were simulated.
+            sim_result: The SimulationResult from CuttingSimProxy.
+            force_threshold: Force threshold in N (default 180N).
+            temp_warning: Temperature rise warning threshold in C.
+            temp_critical: Temperature rise critical threshold in C.
+            wear_rate_threshold: Wear rate threshold in mm/block.
+            chatter_threshold: Chatter risk score threshold (0-1) for HIGH.
+            rul_threshold_min: RUL threshold in minutes for TOOL_END_OF_LIFE.
+            surface_ra_threshold: Surface roughness threshold in um.
+
+        Returns:
+            List of AnomalyMarker instances for flagged blocks.
+        """
+        markers: List[AnomalyMarker] = []
+        prev_wear = 0.0
+        rul_hours = sim_result.remaining_useful_life_hours
+        rul_min = rul_hours * 60.0
+
+        for i, bp in enumerate(sim_result.block_predictions):
+            gcode_line = f'block_{i}'
+            if i < len(blocks):
+                blk = blocks[i]
+                gcode_line = (
+                    f'G1 F{blk.feed_rate_mmpm:.0f} S{blk.spindle_rpm:.0f} '
+                    f'(block {i})'
+                )
+
+            # --- Force checks ---
+            force_ratio = bp.peak_force_n / force_threshold if force_threshold > 0 else 0.0
+            if force_ratio >= 1.0:
+                severity = min(1.0, force_ratio - 0.5)  # 1.0 ratio -> 0.5 severity, 1.5 -> 1.0
+                markers.append(AnomalyMarker(
+                    block_index=i,
+                    gcode_line=gcode_line,
+                    marker_type='FORCE_CRITICAL',
+                    severity=severity,
+                    predicted_value=bp.peak_force_n,
+                    threshold=force_threshold,
+                    recommendation=PredictionRunnerNode._generate_recommendation(
+                        'FORCE_CRITICAL', bp.peak_force_n, force_threshold,
+                    ),
+                ))
+            elif force_ratio >= 0.8:
+                severity = (force_ratio - 0.8) / 0.2  # 0.8 -> 0.0, 1.0 -> 1.0
+                markers.append(AnomalyMarker(
+                    block_index=i,
+                    gcode_line=gcode_line,
+                    marker_type='FORCE_WARNING',
+                    severity=severity,
+                    predicted_value=bp.peak_force_n,
+                    threshold=force_threshold * 0.8,
+                    recommendation=PredictionRunnerNode._generate_recommendation(
+                        'FORCE_WARNING', bp.peak_force_n, force_threshold * 0.8,
+                    ),
+                ))
+
+            # --- Temperature checks ---
+            if bp.temperature_rise_c > temp_critical:
+                severity = min(1.0, bp.temperature_rise_c / (temp_critical * 2.0))
+                markers.append(AnomalyMarker(
+                    block_index=i,
+                    gcode_line=gcode_line,
+                    marker_type='THERMAL_CRITICAL',
+                    severity=severity,
+                    predicted_value=bp.temperature_rise_c,
+                    threshold=temp_critical,
+                    recommendation=PredictionRunnerNode._generate_recommendation(
+                        'THERMAL_CRITICAL', bp.temperature_rise_c, temp_critical,
+                    ),
+                ))
+            elif bp.temperature_rise_c > temp_warning:
+                severity = (bp.temperature_rise_c - temp_warning) / (temp_critical - temp_warning)
+                severity = min(1.0, max(0.0, severity))
+                markers.append(AnomalyMarker(
+                    block_index=i,
+                    gcode_line=gcode_line,
+                    marker_type='THERMAL_WARNING',
+                    severity=severity,
+                    predicted_value=bp.temperature_rise_c,
+                    threshold=temp_warning,
+                    recommendation=PredictionRunnerNode._generate_recommendation(
+                        'THERMAL_WARNING', bp.temperature_rise_c, temp_warning,
+                    ),
+                ))
+
+            # --- Wear rate check ---
+            wear_rate = bp.wear_after_block_mm - prev_wear
+            prev_wear = bp.wear_after_block_mm
+            if wear_rate > wear_rate_threshold:
+                severity = min(1.0, wear_rate / (wear_rate_threshold * 3.0))
+                markers.append(AnomalyMarker(
+                    block_index=i,
+                    gcode_line=gcode_line,
+                    marker_type='WEAR_ACCELERATED',
+                    severity=severity,
+                    predicted_value=wear_rate,
+                    threshold=wear_rate_threshold,
+                    recommendation=PredictionRunnerNode._generate_recommendation(
+                        'WEAR_ACCELERATED', wear_rate, wear_rate_threshold,
+                    ),
+                ))
+
+            # --- Chatter risk check (uses block RPM) ---
+            if i < len(blocks):
+                from miracle_twin.cutting_sim_proxy import CuttingSimProxy
+                chatter_score = CuttingSimProxy()._chatter_risk_score(blocks[i].spindle_rpm)
+                if chatter_score >= chatter_threshold:
+                    markers.append(AnomalyMarker(
+                        block_index=i,
+                        gcode_line=gcode_line,
+                        marker_type='CHATTER_RISK',
+                        severity=chatter_score,
+                        predicted_value=chatter_score,
+                        threshold=chatter_threshold,
+                        recommendation=PredictionRunnerNode._generate_recommendation(
+                            'CHATTER_RISK', chatter_score, chatter_threshold,
+                        ),
+                    ))
+
+            # --- Surface roughness check ---
+            if bp.surface_ra_um > surface_ra_threshold:
+                severity = min(1.0, bp.surface_ra_um / (surface_ra_threshold * 2.0))
+                markers.append(AnomalyMarker(
+                    block_index=i,
+                    gcode_line=gcode_line,
+                    marker_type='SURFACE_QUALITY_WARNING',
+                    severity=severity,
+                    predicted_value=bp.surface_ra_um,
+                    threshold=surface_ra_threshold,
+                    recommendation=PredictionRunnerNode._generate_recommendation(
+                        'SURFACE_QUALITY_WARNING', bp.surface_ra_um, surface_ra_threshold,
+                    ),
+                ))
+
+        # --- Tool end of life (global check, applied to last block) ---
+        if rul_min < rul_threshold_min and len(sim_result.block_predictions) > 0:
+            last_idx = len(sim_result.block_predictions) - 1
+            gcode_line = f'block_{last_idx}'
+            if last_idx < len(blocks):
+                blk = blocks[last_idx]
+                gcode_line = (
+                    f'G1 F{blk.feed_rate_mmpm:.0f} S{blk.spindle_rpm:.0f} '
+                    f'(block {last_idx})'
+                )
+            severity = min(1.0, 1.0 - (rul_min / rul_threshold_min))
+            markers.append(AnomalyMarker(
+                block_index=last_idx,
+                gcode_line=gcode_line,
+                marker_type='TOOL_END_OF_LIFE',
+                severity=severity,
+                predicted_value=rul_min,
+                threshold=rul_threshold_min,
+                recommendation=PredictionRunnerNode._generate_recommendation(
+                    'TOOL_END_OF_LIFE', rul_min, rul_threshold_min,
+                ),
+            ))
+
+        return markers
 
     def _handle_run_prediction(
         self,

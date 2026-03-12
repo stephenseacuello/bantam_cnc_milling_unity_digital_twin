@@ -63,6 +63,15 @@ namespace MiracleTwin.UI
         private bool awaitingPostActionFeedback;
         private const float POST_ACTION_DELAY_SEC = 30f;
 
+        // Ranked action cards UI
+        private VisualElement rankedActionsContainer;
+        private Button compareToggleButton;
+        private VisualElement comparisonTable;
+        private VisualElement doNothingRiskBar;
+        private Label doNothingRiskLabel;
+        private bool compareMode;
+        private int highlightedActionIndex;
+
         private bool isVisible;
         private CorrelatedAlertMsg currentAlert;
 
@@ -324,6 +333,9 @@ namespace MiracleTwin.UI
 
                 panelRoot.Add(feedbackContainer);
             }
+
+            // Create ranked actions UI
+            EnsureRankedActionsUIExists();
 
             // Create Apply/Revert buttons if not in UXML
             if (applyOverrideButton == null)
@@ -850,6 +862,378 @@ namespace MiracleTwin.UI
 
             if (revertButton != null)
                 revertButton.clicked -= OnRevertOverride;
+
+            if (compareToggleButton != null)
+                compareToggleButton.clicked -= OnToggleCompare;
+        }
+
+        // ========================================================================
+        // Ranked Action Cards — Alternative Action Ranking Display
+        // ========================================================================
+
+        /// <summary>
+        /// Data for a single ranked corrective action received from the cognitive layer.
+        /// </summary>
+        [Serializable]
+        public class RankedActionData
+        {
+            public string actionType;
+            public string description;
+            public float feedOverridePct;
+            public float speedOverridePct;
+            public float forceReductionPct;
+            public float rulExtensionMin;
+            public float surfaceImprovementPct;
+            public float cycleTimeImpactPct;
+            public float riskReduction;
+            public float confidence;
+            public string reasoning;
+            public float score;
+        }
+
+        /// <summary>
+        /// Full ranked action result from the cognitive action ranker.
+        /// </summary>
+        [Serializable]
+        public class RankedActionResult
+        {
+            public string situationSummary;
+            public List<RankedActionData> rankedActions;
+            public int recommendedIndex;
+            public float doNothingRisk;
+        }
+
+        /// <summary>
+        /// Build the ranked-actions UI section programmatically.
+        /// Called once from EnsurePreviewUIExists or Start.
+        /// </summary>
+        private void EnsureRankedActionsUIExists()
+        {
+            if (panelRoot == null || rankedActionsContainer != null) return;
+
+            rankedActionsContainer = new VisualElement { name = "ranked-actions-container" };
+            rankedActionsContainer.AddToClassList("ranked-actions-container");
+
+            var header = new Label("Alternative Actions (Top 3)");
+            header.AddToClassList("ranked-actions-header");
+            rankedActionsContainer.Add(header);
+
+            // Compare toggle
+            compareToggleButton = new Button(OnToggleCompare)
+            {
+                text = "Compare",
+                name = "compare-toggle-btn"
+            };
+            compareToggleButton.AddToClassList("compare-toggle-btn");
+            rankedActionsContainer.Add(compareToggleButton);
+
+            // Comparison table (hidden by default)
+            comparisonTable = new VisualElement { name = "comparison-table" };
+            comparisonTable.AddToClassList("comparison-table");
+            comparisonTable.style.display = DisplayStyle.None;
+            rankedActionsContainer.Add(comparisonTable);
+
+            // Do-nothing risk indicator
+            var doNothingContainer = new VisualElement { name = "do-nothing-container" };
+            doNothingContainer.AddToClassList("do-nothing-container");
+
+            doNothingRiskLabel = new Label("Do Nothing Risk: --");
+            doNothingRiskLabel.AddToClassList("do-nothing-label");
+            doNothingContainer.Add(doNothingRiskLabel);
+
+            doNothingRiskBar = new VisualElement { name = "do-nothing-risk-bar" };
+            doNothingRiskBar.AddToClassList("do-nothing-risk-bar");
+            var barFill = new VisualElement { name = "do-nothing-risk-fill" };
+            barFill.AddToClassList("do-nothing-risk-fill");
+            doNothingRiskBar.Add(barFill);
+            doNothingContainer.Add(doNothingRiskBar);
+
+            rankedActionsContainer.Add(doNothingContainer);
+
+            // Insert before the feedback container if it exists, otherwise append
+            if (feedbackContainer != null)
+            {
+                int idx = panelRoot.IndexOf(feedbackContainer);
+                if (idx >= 0)
+                    panelRoot.Insert(idx, rankedActionsContainer);
+                else
+                    panelRoot.Add(rankedActionsContainer);
+            }
+            else
+            {
+                panelRoot.Add(rankedActionsContainer);
+            }
+
+            compareMode = false;
+        }
+
+        /// <summary>
+        /// Populate the ranked action cards with data from the cognitive layer.
+        /// Shows top 3 actions as expandable cards with Apply buttons.
+        /// </summary>
+        public void DisplayRankedActions(RankedActionResult result)
+        {
+            if (rankedActionsContainer == null)
+                EnsureRankedActionsUIExists();
+
+            if (rankedActionsContainer == null) return;
+
+            // Remove old action cards (keep header, toggle, table, do-nothing)
+            var toRemove = new List<VisualElement>();
+            foreach (var child in rankedActionsContainer.Children())
+            {
+                if (child.ClassListContains("ranked-action-card"))
+                    toRemove.Add(child);
+            }
+            foreach (var el in toRemove)
+                rankedActionsContainer.Remove(el);
+
+            highlightedActionIndex = result.recommendedIndex;
+
+            // Show top 3
+            int count = Mathf.Min(result.rankedActions.Count, 3);
+            for (int i = 0; i < count; i++)
+            {
+                var action = result.rankedActions[i];
+                var card = BuildActionCard(action, i, i == result.recommendedIndex);
+
+                // Insert after header (index 1 = after header label)
+                int insertIdx = 1 + i;
+                if (insertIdx < rankedActionsContainer.childCount)
+                    rankedActionsContainer.Insert(insertIdx, card);
+                else
+                    rankedActionsContainer.Add(card);
+            }
+
+            // Update do-nothing risk
+            UpdateDoNothingRisk(result.doNothingRisk);
+
+            // Update comparison table
+            if (compareMode)
+                BuildComparisonTable(result);
+        }
+
+        /// <summary>
+        /// Build a single expandable action card.
+        /// </summary>
+        private VisualElement BuildActionCard(RankedActionData action, int rank, bool isRecommended)
+        {
+            var card = new VisualElement();
+            card.AddToClassList("ranked-action-card");
+            if (isRecommended)
+                card.AddToClassList("ranked-action-recommended");
+
+            // Header row: rank + name + score
+            var headerRow = new VisualElement();
+            headerRow.style.flexDirection = FlexDirection.Row;
+            headerRow.AddToClassList("ranked-action-header-row");
+
+            var rankLabel = new Label($"#{rank + 1}");
+            rankLabel.AddToClassList("ranked-action-rank");
+            headerRow.Add(rankLabel);
+
+            var nameLabel = new Label(action.description);
+            nameLabel.AddToClassList("ranked-action-name");
+            headerRow.Add(nameLabel);
+
+            card.Add(headerRow);
+
+            // Key benefit
+            string benefit = GetKeyBenefit(action);
+            var benefitLabel = new Label($"Benefit: {benefit}");
+            benefitLabel.AddToClassList("ranked-action-benefit");
+            card.Add(benefitLabel);
+
+            // Key cost
+            string cost = GetKeyCost(action);
+            var costLabel = new Label($"Cost: {cost}");
+            costLabel.AddToClassList("ranked-action-cost");
+            card.Add(costLabel);
+
+            // Confidence bar
+            var confRow = new VisualElement();
+            confRow.style.flexDirection = FlexDirection.Row;
+            confRow.AddToClassList("ranked-action-conf-row");
+
+            var confLabel = new Label($"Confidence: {action.confidence:P0}");
+            confLabel.AddToClassList("ranked-action-conf-label");
+            confRow.Add(confLabel);
+
+            var confBar = new VisualElement();
+            confBar.AddToClassList("ranked-action-conf-bar");
+            var confFill = new VisualElement();
+            confFill.AddToClassList("ranked-action-conf-fill");
+            confFill.style.width = new StyleLength(new Length(action.confidence * 100f, LengthUnit.Percent));
+            confBar.Add(confFill);
+            confRow.Add(confBar);
+
+            card.Add(confRow);
+
+            // Expandable reasoning (collapsed by default)
+            var reasoningLabel = new Label(action.reasoning);
+            reasoningLabel.AddToClassList("ranked-action-reasoning");
+            reasoningLabel.style.display = DisplayStyle.None;
+            card.Add(reasoningLabel);
+
+            // Expand/collapse toggle on card click
+            card.RegisterCallback<ClickEvent>(evt =>
+            {
+                var style = reasoningLabel.style.display;
+                reasoningLabel.style.display =
+                    style == DisplayStyle.None ? DisplayStyle.Flex : DisplayStyle.None;
+            });
+
+            // Apply button
+            float feedPct = action.feedOverridePct;
+            float speedPct = action.speedOverridePct;
+            string actionType = action.actionType;
+            var applyBtn = new Button(() => OnApplyRankedAction(feedPct, speedPct, actionType))
+            {
+                text = "Apply"
+            };
+            applyBtn.AddToClassList("ranked-action-apply-btn");
+            card.Add(applyBtn);
+
+            return card;
+        }
+
+        /// <summary>Derive the key benefit string for an action card.</summary>
+        private static string GetKeyBenefit(RankedActionData action)
+        {
+            if (action.riskReduction > 0.5f)
+                return $"Risk -{action.riskReduction:P0}";
+            if (action.forceReductionPct > 10f)
+                return $"Force -{action.forceReductionPct:F0}%";
+            if (action.rulExtensionMin > 10f)
+                return $"Tool life +{action.rulExtensionMin:F0} min";
+            if (action.surfaceImprovementPct > 15f)
+                return $"Surface +{action.surfaceImprovementPct:F0}%";
+            return $"Risk -{action.riskReduction:P0}";
+        }
+
+        /// <summary>Derive the key cost string for an action card.</summary>
+        private static string GetKeyCost(RankedActionData action)
+        {
+            if (action.cycleTimeImpactPct > 0f)
+                return $"Cycle time +{action.cycleTimeImpactPct:F0}%";
+            return "No cycle time impact";
+        }
+
+        /// <summary>Apply a ranked action by publishing feed/speed overrides.</summary>
+        private void OnApplyRankedAction(float feedPct, float speedPct, string actionType)
+        {
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+
+            if (miracleBridge != null)
+            {
+                string reason = $"Operator selected ranked action: {actionType} (feed={feedPct:F0}%, spindle={speedPct:F0}%)";
+                miracleBridge.PublishFeedOverride(feedPct, speedPct, reason);
+                Debug.Log($"[DecisionSupportPanel] Applied ranked action {actionType}: feed={feedPct}%, spindle={speedPct}%");
+
+                // Update sliders to reflect
+                if (whatIfSlider != null) whatIfSlider.value = feedPct;
+                if (spindleSlider != null) spindleSlider.value = speedPct;
+
+                overrideAppliedTime = Time.time;
+                awaitingPostActionFeedback = true;
+            }
+        }
+
+        /// <summary>Toggle between card view and side-by-side comparison table.</summary>
+        private void OnToggleCompare()
+        {
+            compareMode = !compareMode;
+            if (comparisonTable != null)
+            {
+                comparisonTable.style.display = compareMode ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+            if (compareToggleButton != null)
+            {
+                compareToggleButton.text = compareMode ? "Cards" : "Compare";
+            }
+        }
+
+        /// <summary>Build a side-by-side comparison table for the ranked actions.</summary>
+        private void BuildComparisonTable(RankedActionResult result)
+        {
+            if (comparisonTable == null) return;
+            comparisonTable.Clear();
+
+            // Header row
+            var headerRow = new VisualElement();
+            headerRow.style.flexDirection = FlexDirection.Row;
+            headerRow.AddToClassList("comparison-header-row");
+
+            headerRow.Add(MakeTableCell("Metric", isHeader: true));
+            int count = Mathf.Min(result.rankedActions.Count, 3);
+            for (int i = 0; i < count; i++)
+            {
+                headerRow.Add(MakeTableCell($"#{i + 1} {result.rankedActions[i].actionType}", isHeader: true));
+            }
+            comparisonTable.Add(headerRow);
+
+            // Metric rows
+            string[] metrics = { "Force Reduction", "RUL Extension", "Surface Improvement", "Cycle Time Impact", "Risk Reduction", "Confidence" };
+            for (int m = 0; m < metrics.Length; m++)
+            {
+                var row = new VisualElement();
+                row.style.flexDirection = FlexDirection.Row;
+                row.AddToClassList("comparison-data-row");
+                row.Add(MakeTableCell(metrics[m], isHeader: false));
+
+                for (int i = 0; i < count; i++)
+                {
+                    var a = result.rankedActions[i];
+                    string val = m switch
+                    {
+                        0 => $"{a.forceReductionPct:F1}%",
+                        1 => $"{a.rulExtensionMin:F1} min",
+                        2 => $"{a.surfaceImprovementPct:F1}%",
+                        3 => $"+{a.cycleTimeImpactPct:F1}%",
+                        4 => $"{a.riskReduction:P0}",
+                        5 => $"{a.confidence:P0}",
+                        _ => "--"
+                    };
+                    row.Add(MakeTableCell(val, isHeader: false));
+                }
+                comparisonTable.Add(row);
+            }
+        }
+
+        /// <summary>Helper to create a table cell label.</summary>
+        private static Label MakeTableCell(string text, bool isHeader)
+        {
+            var label = new Label(text);
+            label.AddToClassList(isHeader ? "comparison-cell-header" : "comparison-cell");
+            label.style.width = new StyleLength(new Length(25f, LengthUnit.Percent));
+            return label;
+        }
+
+        /// <summary>Update the do-nothing risk indicator bar and label.</summary>
+        private void UpdateDoNothingRisk(float risk)
+        {
+            if (doNothingRiskLabel != null)
+            {
+                string severity = risk > 0.7f ? "HIGH" : risk > 0.4f ? "MEDIUM" : "LOW";
+                doNothingRiskLabel.text = $"Do Nothing Risk: {risk:P0} ({severity})";
+            }
+
+            if (doNothingRiskBar != null)
+            {
+                var fill = doNothingRiskBar.Q<VisualElement>("do-nothing-risk-fill");
+                if (fill != null)
+                {
+                    fill.style.width = new StyleLength(new Length(risk * 100f, LengthUnit.Percent));
+                    // Color coding: green < 0.4, yellow 0.4-0.7, red > 0.7
+                    if (risk > 0.7f)
+                        fill.style.backgroundColor = new Color(0.9f, 0.2f, 0.2f);
+                    else if (risk > 0.4f)
+                        fill.style.backgroundColor = new Color(0.9f, 0.7f, 0.1f);
+                    else
+                        fill.style.backgroundColor = new Color(0.2f, 0.8f, 0.3f);
+                }
+            }
         }
     }
 }

@@ -9,7 +9,8 @@ confidence when supporting causal evidence exists.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+import json
 import threading
 import time
 import os
@@ -20,6 +21,29 @@ from rclpy.lifecycle import TransitionCallbackReturn
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import AnomalyAlert, SecurityAlert, CorrelatedAlert
+
+
+@dataclass
+class GCodeContext:
+    """G-code execution context for a machine at a point in time."""
+    program_name: str
+    block_index: int
+    gcode_line: str
+    operation_type: str  # "LINEAR_CUT", "ARC_CUT", "DRILL", "RAPID", "TOOL_CHANGE"
+    feed_rate: float
+    spindle_rpm: float
+    depth_of_cut: float
+    tool_id: str
+    elapsed_program_pct: float  # 0-100
+
+    def to_json(self) -> str:
+        """Serialize to JSON string."""
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'GCodeContext':
+        """Deserialize from JSON string."""
+        return cls(**json.loads(json_str))
 
 
 @dataclass
@@ -96,6 +120,13 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
 
         # Optional causal inference integration
         self._causal_links: Dict[str, List[Tuple[str, float]]] = {}  # effect -> [(cause, strength)]
+
+        # G-code context tracking per machine
+        self._machine_gcode_context: Dict[str, GCodeContext] = {}
+
+        # Block anomaly history: machine_id -> block_index -> count
+        self._block_anomaly_history: Dict[str, Dict[int, int]] = {}
+        self._block_anomaly_history_cap: int = 1000
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure alert correlator."""
@@ -529,6 +560,11 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
             rule.root_cause, alert_types, confidence,
         )
 
+        # Enrich with G-code context
+        confidence, gcode_context_json, blocks_until = self._enrich_alert_with_gcode(
+            None, machine_id, confidence,
+        )
+
         # Publish correlated alert
         self._correlation_counter += 1
         msg = CorrelatedAlert()
@@ -542,12 +578,92 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
         msg.recommended_actions = rule.recommended_actions
         msg.machine_id = machine_id
 
+        # Attach G-code context fields
+        if gcode_context_json is not None:
+            msg.gcode_context_json = gcode_context_json
+        if blocks_until is not None:
+            msg.blocks_until_predicted_issue = blocks_until
+
         self._correlated_pub.publish(msg)
         boost_info = f", causal_boost={causal_boost:.3f}" if causal_boost > 0 else ""
+        gcode_info = f", gcode_block={self._machine_gcode_context[machine_id].block_index}" if machine_id in self._machine_gcode_context else ""
         self.get_logger().info(
             f"Correlated alert: [{msg.correlation_id}] {rule.name} "
-            f"on {machine_id} (confidence={confidence:.2f}{boost_info})"
+            f"on {machine_id} (confidence={confidence:.2f}{boost_info}{gcode_info})"
         )
+
+    def update_gcode_context(self, machine_id: str, context: GCodeContext) -> None:
+        """Update the current G-code execution context for a machine.
+
+        Args:
+            machine_id: The machine whose context is being updated.
+            context: The current G-code execution context.
+        """
+        self._machine_gcode_context[machine_id] = context
+
+    def get_gcode_context(self, machine_id: str) -> Optional[GCodeContext]:
+        """Return the current G-code context for a machine, or None."""
+        return self._machine_gcode_context.get(machine_id)
+
+    def _record_block_anomaly(self, machine_id: str, block_index: int) -> None:
+        """Record that an anomaly occurred at a specific G-code block."""
+        if machine_id not in self._block_anomaly_history:
+            self._block_anomaly_history[machine_id] = {}
+        block_map = self._block_anomaly_history[machine_id]
+        block_map[block_index] = block_map.get(block_index, 0) + 1
+        # Cap the number of tracked blocks per machine
+        if len(block_map) > self._block_anomaly_history_cap:
+            # Remove the entry with the lowest count
+            min_block = min(block_map, key=block_map.get)  # type: ignore[arg-type]
+            del block_map[min_block]
+
+    def _correlate_with_gcode_patterns(
+        self, machine_id: str, block_index: int, base_confidence: float,
+    ) -> Tuple[float, bool]:
+        """Check if a G-code block has recurring anomalies and boost confidence.
+
+        Args:
+            machine_id: The machine to check.
+            block_index: The G-code block index.
+            base_confidence: The current confidence value.
+
+        Returns:
+            (adjusted_confidence, is_recurring) tuple.
+        """
+        block_map = self._block_anomaly_history.get(machine_id, {})
+        count = block_map.get(block_index, 0)
+        if count > 2:
+            return min(1.0, base_confidence + 0.15), True
+        return base_confidence, False
+
+    def _enrich_alert_with_gcode(
+        self, msg: Any, machine_id: str, confidence: float,
+    ) -> Tuple[float, Optional[str], Optional[int]]:
+        """Attach G-code context to a correlated alert message.
+
+        Returns:
+            (adjusted_confidence, gcode_context_json, blocks_until_predicted_issue)
+        """
+        ctx = self._machine_gcode_context.get(machine_id)
+        gcode_context_json: Optional[str] = None
+        blocks_until_predicted_issue: Optional[int] = None
+
+        if ctx is not None:
+            gcode_context_json = ctx.to_json()
+            self._record_block_anomaly(machine_id, ctx.block_index)
+            confidence, is_recurring = self._correlate_with_gcode_patterns(
+                machine_id, ctx.block_index, confidence,
+            )
+            # Estimate blocks until predicted issue (placeholder heuristic)
+            block_map = self._block_anomaly_history.get(machine_id, {})
+            # Look ahead for blocks with known issues
+            lookahead_blocks = 10
+            for future_block in range(ctx.block_index + 1, ctx.block_index + lookahead_blocks + 1):
+                if block_map.get(future_block, 0) > 2:
+                    blocks_until_predicted_issue = future_block - ctx.block_index
+                    break
+
+        return confidence, gcode_context_json, blocks_until_predicted_issue
 
     @property
     def suppressed_count(self) -> int:

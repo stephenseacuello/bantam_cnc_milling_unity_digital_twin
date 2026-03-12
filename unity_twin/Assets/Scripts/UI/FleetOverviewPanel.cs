@@ -7,9 +7,26 @@ using MiracleTwin.Core;
 namespace MiracleTwin.UI
 {
     /// <summary>
+    /// Predictive health data for a single machine, populated from
+    /// the anomaly-prediction and tool-wear-estimation pipelines.
+    /// </summary>
+    [System.Serializable]
+    public class PredictiveHealthData
+    {
+        public float toolRUL_minutes;        // Remaining useful life
+        public float nextAnomalyETA_seconds; // Time until predicted anomaly
+        public string nextAnomalyType;       // "FORCE_WARNING", "CHATTER_RISK", etc.
+        public int nextAnomalyBlockIndex;    // Which G-code block
+        public float overallHealthScore;     // 0.0 (critical) to 1.0 (perfect)
+        public float oeeScore;              // Current OEE 0-100
+        public string trendDirection;       // "improving", "stable", "degrading"
+    }
+
+    /// <summary>
     /// Fleet overview panel showing a grid of machine cards.
     /// Each card displays: status indicator, multi-metric sparklines (load, temp, power, wear),
-    /// wear bar, program progress, and alert badge count.
+    /// wear bar, program progress, alert badge count, and predictive health indicators
+    /// (RUL countdown, health ring, anomaly ETA badge, OEE trend arrow).
     /// Click a card to switch the dashboard to that machine's detailed view.
     /// </summary>
     public class FleetOverviewPanel : MonoBehaviour
@@ -38,6 +55,7 @@ namespace MiracleTwin.UI
         private bool isVisible;
         private readonly Dictionary<string, MachineCardData> cardData = new();
         private readonly Dictionary<string, VisualElement> cardElements = new();
+        private readonly Dictionary<string, PredictiveHealthData> _machineHealth = new();
 
         /// <summary>Which metric(s) to display on the sparkline.</summary>
         public enum SparklineMode
@@ -224,6 +242,27 @@ namespace MiracleTwin.UI
             metricsRow.Add(worstPerf);
 
             grid.Add(metricsRow);
+
+            // Fleet health summary row
+            var healthRow = new VisualElement();
+            healthRow.AddToClassList("fleet-health-summary-row");
+
+            var healthScore = new Label("Fleet Health: --%");
+            healthScore.name = "fleet-health-score";
+            healthScore.AddToClassList("fleet-metric-label");
+            healthRow.Add(healthScore);
+
+            var rulCritical = new Label("RUL Critical: 0");
+            rulCritical.name = "fleet-rul-critical-count";
+            rulCritical.AddToClassList("fleet-metric-label");
+            healthRow.Add(rulCritical);
+
+            var anomalyCount = new Label("Anomalies <5m: 0");
+            anomalyCount.name = "fleet-anomaly-count";
+            anomalyCount.AddToClassList("fleet-metric-label");
+            healthRow.Add(anomalyCount);
+
+            grid.Add(healthRow);
         }
 
         private VisualElement CreateMachineCard(string machineId)
@@ -315,6 +354,30 @@ namespace MiracleTwin.UI
             progBar.AddToClassList("fleet-progress-bar");
             progRow.Add(progBar);
             card.Add(progRow);
+
+            // --- Predictive Health Indicators ---
+
+            // Health ring (circular progress indicator)
+            var healthRing = CreateHealthRing(1.0f);
+            healthRing.name = $"fleet-health-ring-{machineId}";
+            card.Add(healthRing);
+
+            // RUL countdown bar
+            var rulBar = CreateRULBar(float.PositiveInfinity);
+            rulBar.name = $"fleet-rul-bar-{machineId}";
+            card.Add(rulBar);
+
+            // Anomaly countdown badge
+            var anomalyBadge = CreateAnomalyCountdown("", float.PositiveInfinity);
+            anomalyBadge.name = $"fleet-anomaly-badge-{machineId}";
+            anomalyBadge.style.display = DisplayStyle.None;
+            card.Add(anomalyBadge);
+
+            // OEE trend arrow
+            var trendLabel = new Label("");
+            trendLabel.name = $"fleet-trend-{machineId}";
+            trendLabel.AddToClassList("fleet-trend-arrow");
+            card.Add(trendLabel);
 
             // Click handler
             card.RegisterCallback<ClickEvent>(evt =>
@@ -603,6 +666,267 @@ namespace MiracleTwin.UI
             // Trigger sparkline repaint
             var sparkline = card.Q<VisualElement>($"fleet-sparkline-{machineId}");
             sparkline?.MarkDirtyRepaint();
+
+            // Update predictive health indicators if data exists
+            if (_machineHealth.TryGetValue(machineId, out var healthData))
+                ApplyPredictiveHealthUI(card, machineId, healthData);
+        }
+
+        // ─── Predictive Health Indicator Methods ───────────────────────
+
+        /// <summary>Update predictive health data for a machine and refresh UI.</summary>
+        public void UpdatePredictiveHealth(string machineId, PredictiveHealthData data)
+        {
+            _machineHealth[machineId] = data;
+
+            if (cardElements.TryGetValue(machineId, out var card))
+                ApplyPredictiveHealthUI(card, machineId, data);
+
+            UpdateFleetHealthSummary();
+        }
+
+        /// <summary>Apply predictive health data to a card's UI elements.</summary>
+        private void ApplyPredictiveHealthUI(VisualElement card, string machineId, PredictiveHealthData data)
+        {
+            // Health ring
+            var healthRing = card.Q<VisualElement>($"fleet-health-ring-{machineId}");
+            if (healthRing != null)
+            {
+                var fill = healthRing.Q<VisualElement>("health-ring-fill");
+                var label = healthRing.Q<Label>("health-ring-label");
+                Color hc = GetHealthColor(data.overallHealthScore);
+
+                if (fill != null)
+                {
+                    float pct = Mathf.Clamp01(data.overallHealthScore) * 100f;
+                    fill.style.width = new Length(pct, LengthUnit.Percent);
+                    fill.style.backgroundColor = hc;
+                }
+                if (label != null)
+                    label.text = $"{Mathf.RoundToInt(data.overallHealthScore * 100)}%";
+            }
+
+            // RUL bar
+            var rulBar = card.Q<VisualElement>($"fleet-rul-bar-{machineId}");
+            if (rulBar != null)
+            {
+                var fill = rulBar.Q<VisualElement>("rul-bar-fill");
+                var label = rulBar.Q<Label>("rul-bar-label");
+
+                Color rulColor;
+                if (data.toolRUL_minutes > 60f)
+                    rulColor = StatusGreen;
+                else if (data.toolRUL_minutes > 30f)
+                    rulColor = StatusYellow;
+                else
+                    rulColor = StatusRed;
+
+                if (fill != null)
+                {
+                    float pct = Mathf.Clamp01(data.toolRUL_minutes / 120f) * 100f;
+                    fill.style.width = new Length(pct, LengthUnit.Percent);
+                    fill.style.backgroundColor = rulColor;
+                }
+                if (label != null)
+                    label.text = float.IsInfinity(data.toolRUL_minutes)
+                        ? "RUL: --"
+                        : $"RUL: {data.toolRUL_minutes:F0}m";
+            }
+
+            // Anomaly countdown badge
+            var anomalyBadge = card.Q<VisualElement>($"fleet-anomaly-badge-{machineId}");
+            if (anomalyBadge != null)
+            {
+                bool hasAnomaly = !float.IsInfinity(data.nextAnomalyETA_seconds)
+                               && !string.IsNullOrEmpty(data.nextAnomalyType)
+                               && data.nextAnomalyETA_seconds >= 0;
+                anomalyBadge.style.display = hasAnomaly ? DisplayStyle.Flex : DisplayStyle.None;
+
+                if (hasAnomaly)
+                {
+                    var label = anomalyBadge.Q<Label>("anomaly-badge-label");
+                    if (label != null)
+                    {
+                        int totalSec = Mathf.RoundToInt(data.nextAnomalyETA_seconds);
+                        int min = totalSec / 60;
+                        int sec = totalSec % 60;
+                        label.text = $"{data.nextAnomalyType} in {min}:{sec:D2}";
+                    }
+
+                    // Pulse class for critical (< 60s)
+                    if (data.nextAnomalyETA_seconds < 60f)
+                        anomalyBadge.AddToClassList("anomaly-badge-critical");
+                    else
+                        anomalyBadge.RemoveFromClassList("anomaly-badge-critical");
+                }
+            }
+
+            // OEE trend arrow
+            var trendLabel = card.Q<Label>($"fleet-trend-{machineId}");
+            if (trendLabel != null)
+            {
+                switch (data.trendDirection)
+                {
+                    case "improving":
+                        trendLabel.text = $"OEE {data.oeeScore:F0}% \u2191";
+                        trendLabel.RemoveFromClassList("trend-stable");
+                        trendLabel.RemoveFromClassList("trend-degrading");
+                        trendLabel.AddToClassList("trend-improving");
+                        break;
+                    case "degrading":
+                        trendLabel.text = $"OEE {data.oeeScore:F0}% \u2193";
+                        trendLabel.RemoveFromClassList("trend-stable");
+                        trendLabel.RemoveFromClassList("trend-improving");
+                        trendLabel.AddToClassList("trend-degrading");
+                        break;
+                    default: // "stable"
+                        trendLabel.text = $"OEE {data.oeeScore:F0}% \u2192";
+                        trendLabel.RemoveFromClassList("trend-improving");
+                        trendLabel.RemoveFromClassList("trend-degrading");
+                        trendLabel.AddToClassList("trend-stable");
+                        break;
+                }
+            }
+        }
+
+        /// <summary>Create a health ring indicator element.</summary>
+        private VisualElement CreateHealthRing(float score)
+        {
+            var container = new VisualElement();
+            container.AddToClassList("fleet-health-ring");
+
+            var track = new VisualElement();
+            track.AddToClassList("health-ring-track");
+
+            var fill = new VisualElement();
+            fill.name = "health-ring-fill";
+            fill.AddToClassList("health-ring-fill");
+            float pct = Mathf.Clamp01(score) * 100f;
+            fill.style.width = new Length(pct, LengthUnit.Percent);
+            fill.style.backgroundColor = GetHealthColor(score);
+            track.Add(fill);
+
+            container.Add(track);
+
+            var label = new Label($"{Mathf.RoundToInt(score * 100)}%");
+            label.name = "health-ring-label";
+            label.AddToClassList("health-ring-label");
+            container.Add(label);
+
+            return container;
+        }
+
+        /// <summary>Create a RUL countdown bar element.</summary>
+        private VisualElement CreateRULBar(float rul_minutes)
+        {
+            var container = new VisualElement();
+            container.AddToClassList("fleet-rul-container");
+
+            var track = new VisualElement();
+            track.AddToClassList("rul-bar-track");
+
+            var fill = new VisualElement();
+            fill.name = "rul-bar-fill";
+            fill.AddToClassList("rul-bar-fill");
+
+            Color rulColor;
+            if (float.IsInfinity(rul_minutes) || rul_minutes > 60f)
+                rulColor = StatusGreen;
+            else if (rul_minutes > 30f)
+                rulColor = StatusYellow;
+            else
+                rulColor = StatusRed;
+
+            float pct = float.IsInfinity(rul_minutes) ? 100f : Mathf.Clamp01(rul_minutes / 120f) * 100f;
+            fill.style.width = new Length(pct, LengthUnit.Percent);
+            fill.style.backgroundColor = rulColor;
+            track.Add(fill);
+
+            container.Add(track);
+
+            var label = new Label(float.IsInfinity(rul_minutes) ? "RUL: --" : $"RUL: {rul_minutes:F0}m");
+            label.name = "rul-bar-label";
+            label.AddToClassList("rul-bar-label");
+            container.Add(label);
+
+            return container;
+        }
+
+        /// <summary>Create an anomaly countdown badge element.</summary>
+        private VisualElement CreateAnomalyCountdown(string type, float eta_seconds)
+        {
+            var badge = new VisualElement();
+            badge.AddToClassList("fleet-anomaly-badge");
+
+            var label = new Label("");
+            label.name = "anomaly-badge-label";
+            label.AddToClassList("anomaly-badge-label");
+
+            if (!string.IsNullOrEmpty(type) && !float.IsInfinity(eta_seconds))
+            {
+                int totalSec = Mathf.RoundToInt(eta_seconds);
+                int min = totalSec / 60;
+                int sec = totalSec % 60;
+                label.text = $"{type} in {min}:{sec:D2}";
+            }
+
+            badge.Add(label);
+            return badge;
+        }
+
+        /// <summary>Map a 0-1 health score to a color (red-yellow-green gradient).</summary>
+        private Color GetHealthColor(float score)
+        {
+            score = Mathf.Clamp01(score);
+            if (score >= 0.7f)
+                return Color.Lerp(StatusYellow, StatusGreen, (score - 0.7f) / 0.3f);
+            if (score >= 0.3f)
+                return Color.Lerp(StatusRed, StatusYellow, (score - 0.3f) / 0.4f);
+            return StatusRed;
+        }
+
+        /// <summary>Update the fleet-level health summary labels.</summary>
+        private void UpdateFleetHealthSummary()
+        {
+            if (fleetPanel == null) return;
+
+            float totalHealth = 0f;
+            int healthCount = 0;
+            int rulCriticalCount = 0;
+            int upcomingAnomalies = 0;
+
+            foreach (var kvp in _machineHealth)
+            {
+                var h = kvp.Value;
+                totalHealth += h.overallHealthScore;
+                healthCount++;
+
+                if (h.toolRUL_minutes < 30f)
+                    rulCriticalCount++;
+
+                if (!float.IsInfinity(h.nextAnomalyETA_seconds) && h.nextAnomalyETA_seconds <= 300f)
+                    upcomingAnomalies++;
+            }
+
+            float avgHealth = healthCount > 0 ? totalHealth / healthCount : 1f;
+
+            var healthLabel = fleetPanel.Q<Label>("fleet-health-score");
+            if (healthLabel != null)
+                healthLabel.text = $"Fleet Health: {Mathf.RoundToInt(avgHealth * 100)}%";
+
+            var rulLabel = fleetPanel.Q<Label>("fleet-rul-critical-count");
+            if (rulLabel != null)
+            {
+                rulLabel.text = $"RUL Critical: {rulCriticalCount}";
+                rulLabel.style.color = rulCriticalCount > 0 ? StatusRed : StatusGreen;
+            }
+
+            var anomalyLabel = fleetPanel.Q<Label>("fleet-anomaly-count");
+            if (anomalyLabel != null)
+            {
+                anomalyLabel.text = $"Anomalies <5m: {upcomingAnomalies}";
+                anomalyLabel.style.color = upcomingAnomalies > 0 ? StatusYellow : StatusGreen;
+            }
         }
 
         void Update()

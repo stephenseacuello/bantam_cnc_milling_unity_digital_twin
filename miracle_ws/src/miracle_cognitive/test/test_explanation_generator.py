@@ -134,6 +134,10 @@ class TestCausalChainBuilding:
         node._history_size = 500
         node._detail_level = 'medium'
         node._explanation_pub = None
+        node._feedback_confidence = {}
+        node._feedback_ratings = {}
+        node._feedback_detail_overrides = {}
+        node._gcode_contexts = {}
         node._causal_links = {
             'ToolWear': ('HighFeedRate', 0.7),
             'SurfaceRoughnessIncrease': ('ToolWear', 0.8),

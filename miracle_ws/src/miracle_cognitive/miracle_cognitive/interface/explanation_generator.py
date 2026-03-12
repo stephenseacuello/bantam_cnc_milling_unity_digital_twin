@@ -12,6 +12,7 @@ Levels:
 
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+import json
 import math
 import time
 import threading
@@ -151,6 +152,9 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         self._feedback_ratings: Dict[str, List[float]] = {}
         self._feedback_detail_overrides: Dict[str, str] = {}
 
+        # G-code context per machine for enriching explanations
+        self._gcode_contexts: Dict[str, Dict[str, Any]] = {}
+
         # Causal links mirroring causal_inference._init_causal_model().
         # Stored as effect -> (cause, strength) for backward tracing.
         self._causal_links: Dict[str, Tuple[str, float]] = {
@@ -270,6 +274,18 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         )
         if temporal_context:
             counterfactual += f' {temporal_context}'
+
+        # Enrich counterfactual with G-code context
+        gcode_ctx = self._gcode_contexts.get(machine_id)
+        if gcode_ctx:
+            block_idx = gcode_ctx.get('block_index', 0)
+            feed = gcode_ctx.get('feed_rate', 0)
+            # Estimate force reduction from feed rate reduction
+            force_reduction_estimate = min(40, max(5, int(reduction * 0.8)))
+            counterfactual += (
+                f' Reducing feed rate for blocks {block_idx}-{block_idx + 5} '
+                f'would have reduced force by ~{force_reduction_estimate}%.'
+            )
 
         features = self._build_feature_contributions(
             anomaly_type, severity, contributing_factors, template,
@@ -476,6 +492,23 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
             if link_details:
                 lines.append(f'  Link strengths: {", ".join(link_details)}')
 
+        # G-code execution context
+        gcode_ctx = self._gcode_contexts.get(machine_id)
+        if gcode_ctx:
+            lines.append(f'\nG-code execution context:')
+            lines.append(
+                f'  During execution of: {gcode_ctx.get("gcode_line", "N/A")} '
+                f'(block {gcode_ctx.get("block_index", "?")})'
+            )
+            lines.append(
+                f'  Operation: {gcode_ctx.get("operation_type", "UNKNOWN")} '
+                f'at {gcode_ctx.get("feed_rate", 0):.0f} mm/min, '
+                f'{gcode_ctx.get("spindle_rpm", 0):.0f} RPM'
+            )
+            lines.append(
+                f'  Program progress: {gcode_ctx.get("elapsed_program_pct", 0):.1f}%'
+            )
+
         context = self._get_historical_context(machine_id, anomaly_type)
         if context:
             lines.append(f'\nHistorical context: {context}')
@@ -535,6 +568,21 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
             f'Based on the last {len(past)} occurrences, reducing by '
             f'{reduction}% resolved the issue {resolution_pct}% of the time.'
         )
+
+    def set_gcode_context(self, machine_id: str, context: Dict[str, Any]) -> None:
+        """Set the current G-code execution context for a machine.
+
+        Args:
+            machine_id: Machine identifier.
+            context: Dict with keys: program_name, block_index, gcode_line,
+                     operation_type, feed_rate, spindle_rpm, depth_of_cut,
+                     tool_id, elapsed_program_pct.
+        """
+        self._gcode_contexts[machine_id] = context
+
+    def get_gcode_context(self, machine_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current G-code context for a machine, or None."""
+        return self._gcode_contexts.get(machine_id)
 
     def explain_anomaly(self, anomaly_type: str, factors: list) -> str:
         record = self.generate_explanation(

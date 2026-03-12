@@ -6,6 +6,7 @@ dynamically adjust feed rate and spindle speed overrides. Publishes
 FeedOverride messages for closed-loop control.
 """
 
+import math
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -72,6 +73,7 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
         self._thermal_threshold: float = 0.85
         self._min_feed_override: float = 20.0
         self._dismissed_until: float = 0.0
+        self._max_force_capacity: float = 1000.0  # Newtons, configurable
 
     def _do_configure(self) -> TransitionCallbackReturn:
         params = self.declare_and_validate_parameters({
@@ -81,6 +83,7 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
             'thermal_threshold': {'default': 0.85, 'type': float, 'range': (0.1, 1.0)},
             'min_feed_override': {'default': 20.0, 'type': float, 'range': (5.0, 100.0)},
             'update_interval_sec': {'default': 1.0, 'type': float, 'range': (0.1, 10.0)},
+            'max_force_capacity': {'default': 1000.0, 'type': float, 'range': (100.0, 50000.0)},
         })
 
         self._machine_id = params['machine_id']
@@ -88,6 +91,7 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
         self._wear_threshold = params['wear_threshold']
         self._thermal_threshold = params['thermal_threshold']
         self._min_feed_override = params['min_feed_override']
+        self._max_force_capacity = params['max_force_capacity']
 
         self._override_pub = self.create_publisher(
             FeedOverride,
@@ -126,16 +130,40 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _on_machine_state(self, msg: MachineState) -> None:
-        self._state.force_ratio = msg.spindle_load / 100.0
-        if hasattr(msg, 'spindle_temp'):
-            self._state.thermal_ratio = msg.spindle_temp / 120.0
+        # Compute resultant cutting force from Fx, Fy, Fz components
+        fx = msg.cutting_force_x
+        fy = msg.cutting_force_y
+        fz = msg.cutting_force_z
+        resultant_force = math.sqrt(fx * fx + fy * fy + fz * fz)
+
+        if resultant_force > 0.0:
+            # Use actual cutting forces when available
+            self._state.force_ratio = resultant_force / self._max_force_capacity
+        else:
+            # Fallback to spindle_load as proxy when force sensors read zero
+            self._state.force_ratio = msg.spindle_load / 100.0
+
+        self._state.thermal_ratio = msg.spindle_temp / 120.0
 
     def _on_anomaly(self, msg: AnomalyAlert) -> None:
         atype = msg.anomaly_type.lower()
         if 'chatter' in atype or 'vibration' in atype:
-            if msg.severity > 0.7:
+            effective_severity = msg.severity
+
+            # Boost severity if frequency-related contributing factors are present
+            if hasattr(msg, 'contributing_factors') and msg.contributing_factors:
+                frequency_keywords = ('frequency', 'freq', 'resonan', 'harmonic', 'fft')
+                has_frequency_factor = any(
+                    any(kw in factor.lower() for kw in frequency_keywords)
+                    for factor in msg.contributing_factors
+                )
+                if has_frequency_factor:
+                    # Frequency-related factors increase chatter confidence
+                    effective_severity = min(1.0, effective_severity * 1.2)
+
+            if effective_severity > 0.7:
                 self._state.chatter_risk = 'HIGH'
-            elif msg.severity > 0.4:
+            elif effective_severity > 0.4:
                 self._state.chatter_risk = 'MEDIUM'
             else:
                 self._state.chatter_risk = 'LOW'

@@ -17,6 +17,11 @@ namespace MiracleTwin.UI
         [SerializeField] private UIDocument uiDocument;
         [SerializeField] private MachineStateEventSO machineStateEvent;
 
+        [Header("Event Channels")]
+        [SerializeField] private AnomalyAlertEventSO onAnomalyAlert;
+        [SerializeField] private ToolWearEventSO onToolWear;
+        [SerializeField] private JobStatusEventSO onJobStatus;
+
         [Header("Fleet Settings")]
         [SerializeField] private string[] machineIds = { "cnc1", "cnc2", "cnc3" };
         [SerializeField] private int sparklineSamples = 60;
@@ -58,15 +63,30 @@ namespace MiracleTwin.UI
             }
 
             BuildCards();
-
-            if (machineStateEvent != null)
-                machineStateEvent.Register(OnMachineStateUpdate);
         }
 
-        void OnDestroy()
+        void OnEnable()
+        {
+            if (machineStateEvent != null)
+                machineStateEvent.Register(OnMachineStateUpdate);
+            if (onAnomalyAlert != null)
+                onAnomalyAlert.Register(OnAnomalyAlert);
+            if (onToolWear != null)
+                onToolWear.Register(OnToolWearUpdate);
+            if (onJobStatus != null)
+                onJobStatus.Register(OnJobStatusUpdate);
+        }
+
+        void OnDisable()
         {
             if (machineStateEvent != null)
                 machineStateEvent.Unregister(OnMachineStateUpdate);
+            if (onAnomalyAlert != null)
+                onAnomalyAlert.Unregister(OnAnomalyAlert);
+            if (onToolWear != null)
+                onToolWear.Unregister(OnToolWearUpdate);
+            if (onJobStatus != null)
+                onJobStatus.Unregister(OnJobStatusUpdate);
         }
 
         /// <summary>Toggle fleet panel visibility.</summary>
@@ -251,6 +271,39 @@ namespace MiracleTwin.UI
                 _ => new Color(0.5f, 0.5f, 0.6f),
             };
 
+            UpdateCardUI(id, data);
+        }
+
+        private void OnAnomalyAlert(RosMessageTypes.Miracle.AnomalyAlertMsg msg)
+        {
+            string id = msg.machine_id;
+            if (!cardData.ContainsKey(id)) return;
+
+            var data = cardData[id];
+            data.alertCount++;
+            UpdateCardUI(id, data);
+
+            Debug.Log($"[FleetOverview] Anomaly alert for {id}: {msg.anomaly_type} " +
+                     $"(severity={msg.severity:F2}). Total alerts: {data.alertCount}");
+        }
+
+        private void OnToolWearUpdate(RosMessageTypes.Miracle.ToolWearEstimateMsg msg)
+        {
+            string id = msg.machine_id;
+            if (!cardData.ContainsKey(id)) return;
+
+            var data = cardData[id];
+            data.wearPercent = (float)msg.wear_percentage;
+            UpdateCardUI(id, data);
+        }
+
+        private void OnJobStatusUpdate(RosMessageTypes.Miracle.JobStatusMsg msg)
+        {
+            string id = msg.machine_id;
+            if (!cardData.ContainsKey(id)) return;
+
+            var data = cardData[id];
+            data.programProgress = (float)msg.progress;
             UpdateCardUI(id, data);
         }
 

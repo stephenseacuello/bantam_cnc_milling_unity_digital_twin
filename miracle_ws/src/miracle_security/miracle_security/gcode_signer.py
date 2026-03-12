@@ -42,11 +42,13 @@ class SignatureResult(Enum):
 class SignatureInfo:
     """Information extracted from a signature block."""
     signature_b64: str
+    content_hash_hex: str = ""
     signer_id: str = ""
     timestamp: str = ""
 
 
 SIGNATURE_PREFIX = "; MIRACLE_SIG:"
+HASH_PREFIX = "; MIRACLE_HASH:"
 SIGNER_PREFIX = "; MIRACLE_SIGNER:"
 TIMESTAMP_PREFIX = "; MIRACLE_SIGNED_AT:"
 SIG_BLOCK_START = "; --- MIRACLE SIGNATURE BLOCK ---"
@@ -119,6 +121,7 @@ class GCodeSigner:
 
         # Compute SHA256 of clean content
         content_hash = hashlib.sha256(clean_text.encode('utf-8')).digest()
+        content_hash_hex = content_hash.hex()
 
         # Sign with Ed25519
         private_key = serialization.load_pem_private_key(private_key_pem, password=None)
@@ -127,10 +130,11 @@ class GCodeSigner:
 
         timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
-        # Append signature block
+        # Append signature block (includes SHA256 hash for clients without Ed25519)
         sig_block = (
             f"\n{SIG_BLOCK_START}\n"
             f"{SIGNATURE_PREFIX}{sig_b64}\n"
+            f"{HASH_PREFIX}{content_hash_hex}\n"
             f"{SIGNER_PREFIX}{signer_id}\n"
             f"{TIMESTAMP_PREFIX}{timestamp}\n"
             f"{SIG_BLOCK_END}\n"
@@ -225,6 +229,8 @@ class GCodeSigner:
             line = line.strip()
             if line.startswith(SIGNATURE_PREFIX):
                 info.signature_b64 = line[len(SIGNATURE_PREFIX):]
+            elif line.startswith(HASH_PREFIX):
+                info.content_hash_hex = line[len(HASH_PREFIX):]
             elif line.startswith(SIGNER_PREFIX):
                 info.signer_id = line[len(SIGNER_PREFIX):]
             elif line.startswith(TIMESTAMP_PREFIX):

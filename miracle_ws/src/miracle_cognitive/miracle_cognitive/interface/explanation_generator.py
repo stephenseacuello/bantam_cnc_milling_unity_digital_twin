@@ -12,6 +12,7 @@ Levels:
 
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+import math
 import time
 import threading
 
@@ -30,6 +31,7 @@ class FeatureContribution:
     contribution_pct: float
     threshold: Optional[float] = None
     direction: str = 'above'
+    confidence_interval: float = 0.0  # 0-1, lower means more confident
 
 
 @dataclass
@@ -175,6 +177,11 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         exp_msg.contributing_features = [f.feature_name for f in explanation.features]
         exp_msg.feature_contributions = [f.contribution_pct for f in explanation.features]
         exp_msg.model_confidence = msg.severity
+        # Use the average confidence interval from feature contributions
+        if explanation.features:
+            exp_msg.confidence_interval = sum(
+                f.confidence_interval for f in explanation.features
+            ) / len(explanation.features)
         self._explanation_pub.publish(exp_msg)
 
     def generate_explanation(
@@ -184,7 +191,13 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
     ) -> ExplanationRecord:
         template = self._ANOMALY_TEMPLATES.get(anomaly_type, self._DEFAULT_TEMPLATE)
         severity_pct = int(severity * 100)
-        reduction = max(10, int(severity * 30))
+
+        # Compute reduction based on how far severity exceeds normal threshold
+        if severity > 0.5:
+            reduction = min(50, max(5, int((severity - 0.5) / 0.5 * 40)))
+        else:
+            reduction = max(5, int(severity * 20))
+
         life_extension = int((1.0 - severity) * 45)
 
         fmt_kwargs = {
@@ -199,8 +212,16 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         summary = template['summary'].format(**fmt_kwargs)
         counterfactual = template['counterfactual'].format(**fmt_kwargs)
 
+        # Add temporal context from historical resolution data
+        temporal_context = self._get_temporal_resolution_context(
+            machine_id, anomaly_type, reduction
+        )
+        if temporal_context:
+            counterfactual += f' {temporal_context}'
+
         features = self._build_feature_contributions(
-            anomaly_type, severity, contributing_factors, template
+            anomaly_type, severity, contributing_factors, template,
+            recommended_action=recommended_action,
         )
 
         detail = self._build_detail(
@@ -226,32 +247,72 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
 
         return record
 
+    # Mapping from recommended_action keywords to top contributing feature
+    _ACTION_TO_TOP_FEATURE = {
+        'reduce feed': 'feed_rate',
+        'lower feed': 'feed_rate',
+        'replace tool': 'tool_wear_vb',
+        'change tool': 'tool_wear_vb',
+        'reduce speed': 'cutting_speed',
+        'lower speed': 'cutting_speed',
+    }
+
     def _build_feature_contributions(
         self, anomaly_type: str, severity: float,
         contributing_factors: Optional[List[str]], template: dict,
+        recommended_action: str = '',
     ) -> List[FeatureContribution]:
         features = []
-        factor_names = contributing_factors or template.get('typical_features', [])
+        factor_names = list(contributing_factors or template.get('typical_features', []))
         if not factor_names:
             return features
 
+        # Derive top contributor from recommended_action if available
+        if recommended_action:
+            action_lower = recommended_action.lower()
+            for action_key, feature_name in self._ACTION_TO_TOP_FEATURE.items():
+                if action_key in action_lower:
+                    # Move the matching feature to front, or insert it
+                    if feature_name in factor_names:
+                        factor_names.remove(feature_name)
+                    factor_names.insert(0, feature_name)
+                    break
+
+        # Compute variance-based confidence from history
+        severity_variance = self._compute_severity_variance(anomaly_type)
+
         total = len(factor_names)
+        raw_pcts = []
         for i, name in enumerate(factor_names):
             if i == 0:
-                pct = 40.0 + severity * 10
+                # Primary factor: severity-weighted contribution
+                pct = severity * 50.0
             elif i == 1:
-                pct = 25.0
+                # Secondary factor: inverse-severity blend
+                pct = (1.0 - severity) * 30.0 + severity * 25.0
             else:
-                pct = max(5.0, (35.0 - 25.0) / max(1, total - 2))
+                # Remaining: diminishing geometric series (each gets 60% of previous)
+                if not raw_pcts:
+                    pct = 10.0
+                else:
+                    prev = raw_pcts[-1] if len(raw_pcts) >= 2 else raw_pcts[-1]
+                    pct = max(2.0, prev * 0.6)
+            raw_pcts.append(pct)
 
+        # Confidence interval: higher variance in history = lower confidence
+        ci = min(1.0, severity_variance * 2.0) if severity_variance > 0 else 0.1
+
+        for i, name in enumerate(factor_names):
             features.append(FeatureContribution(
                 feature_name=name,
                 value=severity * (1.0 - i * 0.15),
-                contribution_pct=round(pct, 1),
+                contribution_pct=round(raw_pcts[i], 1),
                 threshold=severity * 0.7 if i == 0 else None,
                 direction='above',
+                confidence_interval=round(ci, 3),
             ))
 
+        # Normalize to 100%
         total_pct = sum(f.contribution_pct for f in features)
         if total_pct > 0:
             for f in features:
@@ -259,6 +320,19 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
 
         features.sort(key=lambda f: f.contribution_pct, reverse=True)
         return features
+
+    def _compute_severity_variance(self, anomaly_type: str) -> float:
+        """Compute variance of severity for historical records of the same anomaly type."""
+        with self._history_lock:
+            severities = [
+                r.severity for r in self._history
+                if r.anomaly_type == anomaly_type
+            ]
+        if len(severities) < 2:
+            return 0.0
+        mean = sum(severities) / len(severities)
+        variance = sum((s - mean) ** 2 for s in severities) / len(severities)
+        return variance
 
     def _build_detail(
         self, prefix: str, features: List[FeatureContribution],
@@ -271,9 +345,10 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
             lines.append('\nContributing factors (ranked by importance):')
             for i, f in enumerate(features, 1):
                 threshold_str = f' (threshold: {f.threshold:.3f})' if f.threshold else ''
+                ci_str = f', CI=+/-{f.confidence_interval:.1%}' if f.confidence_interval > 0 else ''
                 lines.append(
                     f'  {i}. {f.feature_name}: {f.contribution_pct:.1f}% contribution '
-                    f'(value={f.value:.3f}{threshold_str})'
+                    f'(value={f.value:.3f}{threshold_str}{ci_str})'
                 )
 
         context = self._get_historical_context(machine_id, anomaly_type)
@@ -307,6 +382,33 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
             f'Seen {count} times on this machine. '
             f'Average severity: {avg_severity:.0%}. '
             f'Last occurrence: {elapsed:.0f}s ago.'
+        )
+
+    def _get_temporal_resolution_context(
+        self, machine_id: str, anomaly_type: str, reduction: int,
+    ) -> str:
+        """Build temporal context about past resolutions for counterfactuals."""
+        with self._history_lock:
+            past = [
+                r for r in self._history
+                if r.machine_id == machine_id and r.anomaly_type == anomaly_type
+            ]
+
+        if len(past) < 2:
+            return ''
+
+        # Estimate resolution rate: count how often severity decreased after occurrence
+        resolved_count = 0
+        for i in range(1, len(past)):
+            if past[i].severity < past[i - 1].severity:
+                resolved_count += 1
+
+        total_transitions = len(past) - 1
+        resolution_pct = int(resolved_count / total_transitions * 100)
+
+        return (
+            f'Based on the last {len(past)} occurrences, reducing by '
+            f'{reduction}% resolved the issue {resolution_pct}% of the time.'
         )
 
     def explain_anomaly(self, anomaly_type: str, factors: list) -> str:

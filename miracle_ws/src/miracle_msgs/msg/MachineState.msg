@@ -6,6 +6,10 @@ float64 feed_rate
 float64[] axis_positions
 float64[] axis_velocities
 float64 spindle_load
+float64 spindle_temp
+float64 cutting_force_x
+float64 cutting_force_y
+float64 cutting_force_z
 float64 coolant_level
 string current_program
 uint32 current_line

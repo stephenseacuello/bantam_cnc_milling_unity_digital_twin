@@ -4,6 +4,7 @@ using UnityEngine;
 using UnityEngine.UIElements;
 using Unity.Profiling;
 using MiracleTwin.Core;
+using MiracleTwin.Cutting;
 
 namespace MiracleTwin.UI
 {
@@ -16,6 +17,7 @@ namespace MiracleTwin.UI
     public class ForceChart : MonoBehaviour
     {
         [SerializeField] private CuttingStateEventSO cuttingStateEvent;
+        [SerializeField] private GCodeExecutor gcodeExecutor;
         [SerializeField] private UIDocument uiDocument;
         [SerializeField] private int maxSamples = 200;
         [SerializeField] private float maxForce = 200f;
@@ -48,12 +50,16 @@ namespace MiracleTwin.UI
         {
             if (cuttingStateEvent != null)
                 cuttingStateEvent.Register(OnCuttingState);
+            if (gcodeExecutor != null)
+                gcodeExecutor.OnLookaheadUpdated += OnLookaheadResults;
         }
 
         void OnDisable()
         {
             if (cuttingStateEvent != null)
                 cuttingStateEvent.Unregister(OnCuttingState);
+            if (gcodeExecutor != null)
+                gcodeExecutor.OnLookaheadUpdated -= OnLookaheadResults;
         }
 
         void Start()
@@ -89,6 +95,19 @@ namespace MiracleTwin.UI
             forceSamples.Enqueue(new Vector3(state.forceFx, state.forceFy, state.forceFz));
             while (forceSamples.Count > maxSamples)
                 forceSamples.Dequeue();
+        }
+
+        private void OnLookaheadResults(IReadOnlyList<LookaheadResult> results)
+        {
+            if (results == null || results.Count == 0)
+            {
+                ClearPredictions();
+                return;
+            }
+            var forces = new float[results.Count];
+            for (int i = 0; i < results.Count; i++)
+                forces[i] = results[i].peakForceN;
+            SetPredictedForces(forces);
         }
 
         void Update()

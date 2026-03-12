@@ -227,6 +227,8 @@ namespace MiracleTwin.Core
                 $"/miracle/{targetMachineId}/job_status", OnJobStatus);
             ros.Subscribe<FeedOverrideMsg>(
                 $"/miracle/{targetMachineId}/feed_override", OnFeedOverride);
+            ros.Subscribe<CuttingStateMsg>(
+                $"/miracle/{targetMachineId}/cutting_state", OnCuttingState);
         }
 
         private void RegisterPublishers()
@@ -304,6 +306,42 @@ namespace MiracleTwin.Core
                 (float)msg.feed_override_pct,
                 (float)msg.spindle_override_pct,
                 msg.reason ?? "");
+        }
+
+        private void OnCuttingState(CuttingStateMsg msg)
+        {
+            TryRecord($"/miracle/{machineId}/cutting_state", msg);
+            var pos = msg.tool_position ?? new double[3];
+            var dir = msg.tool_direction ?? new double[3];
+            onCuttingState?.Raise(new CuttingStateData
+            {
+                spindleRPM = (float)msg.spindle_rpm,
+                feedRate = (float)msg.feed_rate,
+                toolPosition = new UnityEngine.Vector3((float)pos[0], (float)pos[1], (float)pos[2]),
+                toolDirection = new UnityEngine.Vector3((float)dir[0], (float)dir[1], (float)dir[2]),
+                axialDepth = (float)msg.axial_depth,
+                radialDepth = (float)msg.radial_depth,
+                toolDiameter = (float)msg.tool_diameter,
+                isCutting = msg.is_cutting,
+                currentGCodeLine = (int)msg.current_gcode_line,
+                forceFx = (float)msg.force_fx,
+                forceFy = (float)msg.force_fy,
+                forceFz = (float)msg.force_fz,
+                powerWatts = (float)msg.power_watts,
+                torqueNm = (float)msg.torque_nm,
+                mrr = (float)msg.mrr,
+                toolTemperature = (float)msg.tool_temperature,
+                interfaceTemperature = (float)msg.interface_temperature,
+                flankWearVB = (float)msg.flank_wear_vb,
+                wearPercentage = (float)msg.wear_percentage,
+                chipThicknessRatio = (float)msg.chip_thickness_ratio,
+                shearAngleDeg = (float)msg.shear_angle_deg,
+                chipCurlRadius = (float)msg.chip_curl_radius,
+                chipVelocity = (float)msg.chip_velocity,
+                surfaceRoughnessRa = (float)msg.surface_roughness_ra,
+                surfaceRoughnessRz = (float)msg.surface_roughness_rz,
+                surfaceGrade = msg.surface_grade ?? ""
+            });
         }
 
         // --- Publishers ---

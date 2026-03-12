@@ -39,6 +39,7 @@ set(msg_files
   "msg/RobotJointState.msg"
   "msg/CorrelatedAlert.msg"
   "msg/FeedOverride.msg"
+  "msg/CuttingState.msg"
   "msg/Explanation.msg"
   "msg/MaterialBatch.msg"
   "msg/PartRecord.msg"

@@ -46,6 +46,7 @@ set(msg_files
   "msg/StabilityRecommendation.msg"
   "msg/InferredAction.msg"
   "msg/AlarmEscalation.msg"
+  "msg/OperatorFeedback.msg"
 )
 
 set(srv_files

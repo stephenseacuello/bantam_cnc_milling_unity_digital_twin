@@ -146,6 +146,11 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         self._detail_level: str = 'medium'
         self._explanation_pub = None
 
+        # Operator feedback integration
+        self._feedback_confidence: Dict[str, float] = {}
+        self._feedback_ratings: Dict[str, List[float]] = {}
+        self._feedback_detail_overrides: Dict[str, str] = {}
+
         # Causal links mirroring causal_inference._init_causal_model().
         # Stored as effect -> (cause, strength) for backward tracing.
         self._causal_links: Dict[str, Tuple[str, float]] = {
@@ -269,6 +274,22 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         features = self._build_feature_contributions(
             anomaly_type, severity, contributing_factors, template,
             recommended_action=recommended_action,
+        )
+
+        # Adjust feature confidence intervals based on operator feedback
+        feedback_conf = self._feedback_confidence.get(anomaly_type)
+        if feedback_conf is not None:
+            for f in features:
+                # High feedback confidence (operators rate highly) reduces CI
+                # Low feedback confidence (poor ratings) increases CI
+                adjustment = (1.0 - feedback_conf) * 0.2
+                f.confidence_interval = round(
+                    min(1.0, f.confidence_interval + adjustment), 3
+                )
+
+        # Apply detail level override from feedback
+        effective_detail_level = self._feedback_detail_overrides.get(
+            anomaly_type, self._detail_level
         )
 
         detail = self._build_detail(
@@ -524,6 +545,30 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
 
     def explain_optimization(self, action: str, reasoning: str) -> str:
         return f"Optimization '{action}': {reasoning}"
+
+    def update_from_feedback(self, anomaly_type: str, rating: float) -> None:
+        """Update explanation quality tracking from operator feedback.
+
+        Args:
+            anomaly_type: The anomaly type the feedback relates to.
+            rating: Operator rating on a 1-5 scale.
+        """
+        ratings = self._feedback_ratings.setdefault(anomaly_type, [])
+        ratings.append(rating)
+        # Keep last 100 ratings per anomaly type
+        if len(ratings) > 100:
+            self._feedback_ratings[anomaly_type] = ratings[-100:]
+
+        avg = sum(self._feedback_ratings[anomaly_type]) / len(self._feedback_ratings[anomaly_type])
+        self._feedback_confidence[anomaly_type] = avg / 5.0  # normalize to 0-1
+
+        # Adjust detail level override based on feedback quality
+        if avg < 2.0:
+            self._feedback_detail_overrides[anomaly_type] = 'brief'
+        elif avg > 4.0:
+            self._feedback_detail_overrides[anomaly_type] = 'detailed'
+        else:
+            self._feedback_detail_overrides.pop(anomaly_type, None)
 
     @property
     def history(self) -> List[ExplanationRecord]:

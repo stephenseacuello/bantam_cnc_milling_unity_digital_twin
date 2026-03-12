@@ -3,9 +3,12 @@ Alert Correlation Engine.
 
 Groups related alerts by machine_id within a sliding time window and
 publishes CorrelatedAlert messages when YAML-configurable correlation rules match.
+
+Optionally integrates with the causal inference engine to boost correlation
+confidence when supporting causal evidence exists.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 import threading
 import time
@@ -90,6 +93,9 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
         self._fleet_buffer: Dict[str, List[AlertEntry]] = {}  # keyed by anomaly_type
         self._fleet_suppressed_ids: set = set()
         self._fleet_alert_count: int = 0
+
+        # Optional causal inference integration
+        self._causal_links: Dict[str, List[Tuple[str, float]]] = {}  # effect -> [(cause, strength)]
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure alert correlator."""
@@ -445,6 +451,48 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
             f"{len(anomaly_types)} types on {machine_ids} (confidence={confidence:.2f})"
         )
 
+    def set_causal_links(self, causal_links: Dict[str, List[Tuple[str, float]]]) -> None:
+        """Provide causal link data for enrichment.
+
+        Args:
+            causal_links: Mapping of effect -> [(cause, effective_strength), ...].
+        """
+        self._causal_links = causal_links
+
+    def _enrich_with_causal_context(
+        self,
+        root_cause: str,
+        alert_types: List[str],
+        base_confidence: float,
+    ) -> Tuple[float, float]:
+        """Enrich a correlation with causal graph evidence.
+
+        Looks up each alert type in the causal links graph.  If a causal link
+        exists whose cause matches the root_cause (or a substring thereof), the
+        link strength is used to compute a confidence boost.
+
+        Returns:
+            (adjusted_confidence, causal_confidence_boost)
+        """
+        if not self._causal_links:
+            return base_confidence, 0.0
+
+        max_causal_strength = 0.0
+        for atype in alert_types:
+            for effect_key, cause_list in self._causal_links.items():
+                if effect_key != atype:
+                    continue
+                for cause, strength in cause_list:
+                    if cause in root_cause or root_cause in cause:
+                        max_causal_strength = max(max_causal_strength, strength)
+
+        if max_causal_strength <= 0.0:
+            return base_confidence, 0.0
+
+        causal_confidence_boost = max_causal_strength * 0.2
+        adjusted = min(1.0, base_confidence * (1.0 + causal_confidence_boost))
+        return adjusted, causal_confidence_boost
+
     def _try_correlate(
         self, machine_id: str, alerts: List[AlertEntry],
         rule: CorrelationRule, now: float
@@ -475,6 +523,12 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
         if confidence < rule.min_confidence:
             return
 
+        # Enrich with causal context if available
+        alert_types = [a.alert_type for a in matching]
+        confidence, causal_boost = self._enrich_with_causal_context(
+            rule.root_cause, alert_types, confidence,
+        )
+
         # Publish correlated alert
         self._correlation_counter += 1
         msg = CorrelatedAlert()
@@ -489,9 +543,10 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
         msg.machine_id = machine_id
 
         self._correlated_pub.publish(msg)
+        boost_info = f", causal_boost={causal_boost:.3f}" if causal_boost > 0 else ""
         self.get_logger().info(
             f"Correlated alert: [{msg.correlation_id}] {rule.name} "
-            f"on {machine_id} (confidence={confidence:.2f})"
+            f"on {machine_id} (confidence={confidence:.2f}{boost_info})"
         )
 
     @property

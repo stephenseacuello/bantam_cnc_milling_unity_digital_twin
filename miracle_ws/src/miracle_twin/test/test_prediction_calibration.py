@@ -112,7 +112,6 @@ _miracle_core_param_mod.create_parameter_callback = lambda *a, **k: lambda *a: N
 _miracle_core_exc_mod = type(sys)('miracle_core.exceptions')
 _miracle_core_exc_mod.ConfigurationError = type('ConfigurationError', (Exception,), {})
 
-sys.modules.setdefault('miracle_core', _miracle_core_mod)
 sys.modules.setdefault('miracle_core.lifecycle_node_base', _miracle_core_lifecycle_mod)
 sys.modules.setdefault('miracle_core.qos_profiles', _miracle_core_qos_mod)
 sys.modules.setdefault('miracle_core.heartbeat_mixin', _miracle_core_heartbeat_mod)

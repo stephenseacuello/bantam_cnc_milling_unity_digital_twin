@@ -412,6 +412,14 @@ class AlarmManagerNode(MiracleLifecycleNode):
                     self.get_logger().info(
                         f"Alarm acknowledged: [{alarm_id}] by {user}"
                     )
+                # Publish CLEARED escalation so downstream consumers
+                # (e.g. job scheduler) can unblock the machine.
+                self._publish_escalation(
+                    alarm,
+                    action='CLEARED',
+                    reason=f"Alarm acknowledged by {user}",
+                    time_unacked=0.0,
+                )
                 return True
         return False
 
@@ -427,6 +435,14 @@ class AlarmManagerNode(MiracleLifecycleNode):
         with self._alarms_lock:
             if alarm_id in self._active_alarms:
                 alarm = self._active_alarms.pop(alarm_id)
+                # Publish CLEARED escalation before changing state so the
+                # message still carries the alarm's machine_id / severity.
+                self._publish_escalation(
+                    alarm,
+                    action='CLEARED',
+                    reason=f"Alarm cleared",
+                    time_unacked=0.0,
+                )
                 alarm.state = AlarmState.NORMAL
                 self._alarm_history.append(alarm)
                 if len(self._alarm_history) > self._history_size:

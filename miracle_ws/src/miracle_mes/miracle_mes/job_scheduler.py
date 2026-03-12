@@ -4,9 +4,12 @@ Job Scheduler Node.
 Manages manufacturing job queue with priority scheduling.
 Assigns jobs to machines based on capability, availability, and optimization.
 Supports priority levels: LOW, NORMAL, HIGH, RUSH.
+
+Alarm escalation integration: subscribes to alarm escalation events and
+automatically pauses or reassigns jobs on affected machines.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from enum import IntEnum
 import threading
@@ -24,6 +27,11 @@ from miracle_msgs.msg import JobStatus, MachineState, TaskAnnouncement
 from miracle_msgs.action import ExecuteJob
 from miracle_msgs.srv import SubmitTask
 from miracle_mes.digital_thread import DigitalThreadNode
+
+try:
+    from miracle_msgs.msg import AlarmEscalation
+except ImportError:  # pragma: no cover
+    AlarmEscalation = None  # type: ignore[assignment,misc]
 
 
 class Priority(IntEnum):
@@ -92,6 +100,9 @@ class JobSchedulerNode(MiracleLifecycleNode):
         self._max_queue: int = 1000
         self._enable_auction: bool = False
         self._digital_thread: Optional[DigitalThreadNode] = None
+        self._blocked_machines: Set[str] = set()
+        self._alarm_escalation_sub = None
+        self._job_history: List[Dict[str, Any]] = []
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure job scheduler."""
@@ -157,6 +168,15 @@ class JobSchedulerNode(MiracleLifecycleNode):
             QoSProfiles.state_data(),
             machine_ids,
         )
+
+        # Subscribe to alarm escalation events for automatic job pausing
+        if AlarmEscalation is not None:
+            self._alarm_escalation_sub = self.create_subscription(
+                AlarmEscalation,
+                '/miracle/scada/alarm_escalations',
+                self._on_alarm_escalation,
+                QoSProfiles.alert(),
+            )
 
         self.get_logger().info("Job scheduler configured")
         return TransitionCallbackReturn.SUCCESS
@@ -239,11 +259,24 @@ class JobSchedulerNode(MiracleLifecycleNode):
             if not self._job_queue:
                 return
 
-            # Find idle machines
+            # Find idle machines, excluding blocked ones
             idle_machines = [
                 mid for mid, state in self._machine_states.items()
                 if state.status in ('IDLE', 'READY')
+                and mid not in self._blocked_machines
             ]
+
+            # Log skipped blocked machines
+            blocked_idle = [
+                mid for mid, state in self._machine_states.items()
+                if state.status in ('IDLE', 'READY')
+                and mid in self._blocked_machines
+            ]
+            for mid in blocked_idle:
+                self.get_logger().warn(
+                    f"Machine {mid} skipped for scheduling: "
+                    f"blocked by alarm escalation"
+                )
 
             if not idle_machines:
                 return
@@ -528,6 +561,182 @@ class JobSchedulerNode(MiracleLifecycleNode):
                 metadata=meta,
             )
         return True
+
+    # ------------------------------------------------------------------
+    # Alarm escalation handling
+    # ------------------------------------------------------------------
+
+    def _on_alarm_escalation(self, msg) -> None:
+        """Handle alarm escalation events from the alarm manager.
+
+        Depending on escalation level/action, pause or reassign jobs on
+        the affected machine.
+        """
+        action = msg.escalation_action
+        machine_id = msg.machine_id
+        reason = msg.reason
+
+        if action == 'CLEARED':
+            self._unblock_machine(machine_id)
+            return
+
+        if action == 'PRIORITY_BOOST':
+            # Level 1: log warning only, no job action
+            self.get_logger().warn(
+                f"Alarm escalation PRIORITY_BOOST on {machine_id}: {reason}"
+            )
+            return
+
+        if action == 'FORCED_ACK_REQUIRED':
+            # Level 2: pause active job on the machine
+            self.get_logger().warn(
+                f"Alarm escalation FORCED_ACK_REQUIRED on {machine_id}: "
+                f"{reason}"
+            )
+            job = self._find_active_job_on_machine(machine_id)
+            if job and job.status != 'PAUSED':
+                self._pause_job_for_alarm(
+                    job, f"Paused due to alarm escalation: {reason}"
+                )
+            return
+
+        if action == 'SUPERVISOR_NOTIFY':
+            # Level 3: pause job + block machine
+            self.get_logger().error(
+                f"Alarm escalation SUPERVISOR_NOTIFY on {machine_id}: "
+                f"{reason}"
+            )
+            job = self._find_active_job_on_machine(machine_id)
+            if job and job.status != 'PAUSED':
+                self._pause_job_for_alarm(
+                    job, f"Paused due to alarm escalation: {reason}"
+                )
+            self._blocked_machines.add(machine_id)
+            return
+
+        if action == 'EMERGENCY_STOP':
+            # Emergency: pause + block + attempt reassignment
+            job = self._find_active_job_on_machine(machine_id)
+            affected_job_id = job.job_id if job else 'N/A'
+            self.get_logger().critical(
+                f"Emergency stop on {machine_id}, "
+                f"job {affected_job_id} paused"
+            )
+            if job and job.status != 'PAUSED':
+                self._pause_job_for_alarm(
+                    job, f"Paused due to alarm escalation: {reason}"
+                )
+            self._blocked_machines.add(machine_id)
+
+            # Attempt to reassign the job to another machine
+            if job:
+                self.reassign_job(job.job_id, machine_id)
+            return
+
+    def _find_active_job_on_machine(self, machine_id: str) -> Optional[Job]:
+        """Find the active (non-completed) job assigned to a machine."""
+        for job in self._active_jobs.values():
+            if job.machine_id == machine_id and job.status in (
+                'ASSIGNED', 'RUNNING', 'PAUSED',
+            ):
+                return job
+        return None
+
+    def _pause_job_for_alarm(self, job: Job, reason: str) -> None:
+        """Pause a job due to alarm escalation and record history."""
+        job.status = 'PAUSED'
+        self._publish_job_status(job)
+        self._job_history.append({
+            'job_id': job.job_id,
+            'machine_id': job.machine_id,
+            'action': 'PAUSED',
+            'reason': reason,
+        })
+        if self._digital_thread:
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_JOB_PAUSED,
+                machine_id=job.machine_id,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata={
+                    'job_id': job.job_id,
+                    'reason': reason,
+                },
+            )
+
+    def _unblock_machine(self, machine_id: str) -> None:
+        """Unblock a machine after its alarm is cleared or acknowledged.
+
+        Removes the machine from the blocked set so it becomes available
+        for scheduling again.
+        """
+        if machine_id in self._blocked_machines:
+            self._blocked_machines.discard(machine_id)
+            self.get_logger().info(
+                f"Machine {machine_id} unblocked after alarm cleared"
+            )
+
+    def reassign_job(
+        self, job_id: str, from_machine: str, to_machine: Optional[str] = None,
+    ) -> bool:
+        """Reassign a job from one machine to another.
+
+        Args:
+            job_id: The job to reassign.
+            from_machine: The machine the job is currently on.
+            to_machine: Target machine. If None, the best available
+                (not blocked, idle/ready) machine is chosen automatically.
+
+        Returns:
+            True if the job was successfully reassigned.
+        """
+        job = self._active_jobs.get(job_id)
+        if not job:
+            return False
+
+        if to_machine is None:
+            # Find best available machine (not blocked, lowest queue)
+            candidates = [
+                mid for mid, state in self._machine_states.items()
+                if mid != from_machine
+                and mid not in self._blocked_machines
+                and state.status in ('IDLE', 'READY')
+            ]
+            if not candidates:
+                self.get_logger().warn(
+                    f"No available machines to reassign job {job_id}"
+                )
+                return False
+            to_machine = candidates[0]
+
+        job.machine_id = to_machine
+        job.status = 'ASSIGNED'
+        self._publish_job_status(job)
+
+        if self._digital_thread:
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_JOB_PAUSED,
+                machine_id=to_machine,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata={
+                    'job_id': job.job_id,
+                    'reassigned_from': from_machine,
+                    'reassigned_to': to_machine,
+                },
+            )
+
+        self.get_logger().info(
+            f"Job {job_id} reassigned from {from_machine} to {to_machine}"
+        )
+        return True
+
+    @property
+    def blocked_machines(self) -> Set[str]:
+        """Return the set of machines currently blocked by alarm escalations."""
+        return set(self._blocked_machines)
 
     def _publish_job_status(self, job: Job) -> None:
         """Publish current job status."""

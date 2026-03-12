@@ -5,10 +5,14 @@ hierarchy rooted at MiracleError, enabling both fine-grained and broad
 exception handling patterns.
 """
 
+import importlib
+
 import pytest
 
+import miracle_core.exceptions
+# Reload to undo any attribute overwriting by other test files' mock setup.
+importlib.reload(miracle_core.exceptions)
 
-# Exceptions module has no ROS2 dependencies, so import directly
 from miracle_core.exceptions import (
     MiracleError,
     ConfigurationError,

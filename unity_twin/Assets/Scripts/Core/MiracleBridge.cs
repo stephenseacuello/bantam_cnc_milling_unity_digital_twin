@@ -242,6 +242,8 @@ namespace MiracleTwin.Core
                 $"/miracle/{machineId}/feed_override_cmd");
             ros.RegisterPublisher<StabilityRecommendationMsg>(
                 $"/miracle/{machineId}/stability_recommendation");
+            ros.RegisterPublisher<OperatorFeedbackMsg>(
+                "/miracle/cognitive/operator_feedback");
         }
 
         private void RegisterServices()
@@ -398,6 +400,40 @@ namespace MiracleTwin.Core
             ros.Publish(topic, msg);
             TryRecord(topic, msg);
             onStabilityRecommendation?.Raise(msg);
+        }
+
+        /// <summary>
+        /// Publish operator feedback to the cognitive system for closed-loop learning.
+        /// </summary>
+        /// <param name="feedbackType">One of: RECOMMENDATION_ACCEPTED, RECOMMENDATION_REJECTED, EXPLANATION_RATED, ACTION_CONFIRMED, ACTION_FAILED.</param>
+        /// <param name="anomalyType">The anomaly type this feedback relates to.</param>
+        /// <param name="rating">1-5 for ratings, 1.0/0.0 for accept/reject.</param>
+        /// <param name="action">What action the operator took.</param>
+        /// <param name="referenceId">ID of the recommendation/explanation being rated.</param>
+        public void PublishOperatorFeedback(string feedbackType, string anomalyType, float rating, string action, string referenceId)
+        {
+            if (ros == null)
+            {
+                Debug.LogWarning("[MiracleBridge] Cannot publish operator feedback: no ROS connection.");
+                return;
+            }
+
+            var msg = new OperatorFeedbackMsg
+            {
+                timestamp = new RosMessageTypes.BuiltinInterfaces.TimeMsg(),
+                machine_id = machineId,
+                feedback_type = feedbackType ?? "",
+                reference_id = referenceId ?? "",
+                anomaly_type = anomalyType ?? "",
+                rating = rating,
+                operator_comment = "",
+                action_taken = action ?? ""
+            };
+
+            string topic = "/miracle/cognitive/operator_feedback";
+            ros.Publish(topic, msg);
+            TryRecord(topic, msg);
+            Debug.Log($"[MiracleBridge] Published operator feedback: type={feedbackType}, anomaly={anomalyType}, rating={rating}");
         }
 
         // --- Service Calls ---

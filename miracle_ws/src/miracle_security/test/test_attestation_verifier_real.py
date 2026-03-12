@@ -7,6 +7,12 @@ import pytest
 
 # Ensure miracle_msgs.srv mock exists for attestation_verifier import
 sys.modules.setdefault('miracle_msgs.srv', MagicMock())
+_srv_mod = sys.modules['miracle_msgs.srv']
+if not hasattr(_srv_mod, 'RequestAttestation') or not callable(getattr(_srv_mod, 'RequestAttestation', None)):
+    _srv_mod.RequestAttestation = MagicMock()
+
+# Force reimport attestation_verifier to use our mock
+sys.modules.pop('miracle_security.attestation_verifier', None)
 
 from miracle_security.tpm_interface import (
     AttestationQuote,

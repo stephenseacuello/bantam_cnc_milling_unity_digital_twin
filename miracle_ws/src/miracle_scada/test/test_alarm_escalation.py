@@ -77,7 +77,6 @@ class _QoSProfiles:
 
 _miracle_core_qos.QoSProfiles = _QoSProfiles
 
-sys.modules.setdefault('miracle_core', _miracle_core)
 sys.modules.setdefault('miracle_core.lifecycle_node_base', _miracle_core_lifecycle)
 sys.modules.setdefault('miracle_core.qos_profiles', _miracle_core_qos)
 

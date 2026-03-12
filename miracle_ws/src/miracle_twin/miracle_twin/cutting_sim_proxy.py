@@ -122,6 +122,9 @@ class BlockPrediction:
     mrr_mm3pm: float = 0.0
     wear_after_block_mm: float = 0.0
     temperature_rise_c: float = 0.0
+    deflection_mm: float = 0.0
+    dimensional_error_mm: float = 0.0
+    surface_ra_um: float = 0.0
 
 
 @dataclass
@@ -135,6 +138,10 @@ class SimulationResult:
     health_index: float = 0.0
     trend_data: List[float] = field(default_factory=list)
     recommended_action: str = ''
+    max_deflection_mm: float = 0.0
+    max_dimensional_error_mm: float = 0.0
+    avg_surface_ra_um: float = 0.0
+    max_surface_ra_um: float = 0.0
 
 
 @dataclass
@@ -143,6 +150,91 @@ class WhatIfComparison:
     baseline: Dict[str, float] = field(default_factory=dict)
     override: Dict[str, float] = field(default_factory=dict)
     delta: Dict[str, float] = field(default_factory=dict)
+
+
+class ToolDeflectionModel:
+    """Cantilever beam deflection model for end mills.
+
+    Treats the tool as a cantilever beam fixed at the collet.
+    delta = F * L^3 / (3 * E * I)  where I = pi * d^4 / 64 for circular cross-section.
+    """
+
+    @staticmethod
+    def compute_deflection(
+        radial_force_n: float,
+        tool_diameter_mm: float,
+        overhang_mm: float,
+        elastic_modulus_gpa: float,
+    ) -> float:
+        """Compute tool tip deflection in mm."""
+        d = tool_diameter_mm * 1e-3  # to meters
+        L = overhang_mm * 1e-3
+        E = elastic_modulus_gpa * 1e9  # Pa
+        I = math.pi * d ** 4 / 64  # second moment of area
+        F = abs(radial_force_n)
+        if E * I == 0:
+            return 0.0
+        delta_m = F * L ** 3 / (3 * E * I)
+        return delta_m * 1e3  # back to mm
+
+    @staticmethod
+    def compute_dimensional_error(
+        radial_force_n: float,
+        tool_diameter_mm: float,
+        overhang_mm: float,
+        elastic_modulus_gpa: float,
+    ) -> float:
+        """Compute dimensional error on workpiece surface (mm).
+
+        The tool deflects away from the cut, leaving extra material.
+        Error = deflection (positive means oversized).
+        """
+        return ToolDeflectionModel.compute_deflection(
+            radial_force_n, tool_diameter_mm, overhang_mm, elastic_modulus_gpa
+        )
+
+
+class SurfaceRoughnessModel:
+    """Theoretical and empirical surface roughness prediction.
+
+    Theoretical Ra for end milling (ideal):
+        Ra_ideal = f^2 / (32 * R)  where f=feed/tooth, R=nose radius
+
+    With vibration contribution:
+        Ra_actual = Ra_ideal + K_vib * amplitude
+
+    With wear contribution:
+        Ra_actual += K_wear * VB  (flank wear increases roughness)
+    """
+
+    @staticmethod
+    def compute_ra(
+        feed_per_tooth_mm: float,
+        nose_radius_mm: float,
+        vibration_amplitude_mm: float = 0.0,
+        flank_wear_vb_mm: float = 0.0,
+        depth_of_cut_mm: float = 1.0,
+    ) -> float:
+        """Compute surface roughness Ra in micrometers."""
+        if nose_radius_mm <= 0:
+            nose_radius_mm = 0.4
+
+        # Theoretical (kinematic) roughness
+        f = feed_per_tooth_mm
+        R = nose_radius_mm
+        Ra_ideal = (f ** 2) / (32.0 * R) * 1000.0  # convert mm to um
+
+        # Vibration contribution (K_vib ~ 5.0 um per mm amplitude)
+        Ra_vibration = 5.0 * vibration_amplitude_mm
+
+        # Wear contribution (K_wear ~ 15.0 um per mm VB)
+        Ra_wear = 15.0 * flank_wear_vb_mm
+
+        # Depth effect: deeper cuts slightly worsen finish
+        depth_factor = 1.0 + 0.05 * max(0, depth_of_cut_mm - 1.0)
+
+        Ra_total = (Ra_ideal + Ra_vibration + Ra_wear) * depth_factor
+        return round(max(0.1, Ra_total), 3)  # minimum 0.1 um (polished)
 
 
 class CuttingSimProxy:
@@ -647,6 +739,15 @@ class CuttingSimProxy:
         cutting_time = tool.cutting_time_min
         helix_rad = math.radians(tool.helix_angle_deg)
 
+        # Deflection / surface properties from active tool definition
+        elastic_modulus = 200.0  # default HSS
+        overhang = 30.0
+        nose_radius = 0.4
+        if self._active_tool_def is not None:
+            elastic_modulus = self._active_tool_def.elastic_modulus_gpa
+            overhang = self._active_tool_def.tool_overhang_mm
+            nose_radius = self._active_tool_def.nose_radius_mm
+
         block_predictions = []
         health_trend = []
         total_time = 0.0
@@ -720,6 +821,24 @@ class CuttingSimProxy:
                 + forces['fz_avg'] ** 2
             ) * chip_penalty
 
+            # Tool deflection from radial force component
+            radial_force = abs(forces['fy_peak']) * chip_penalty
+            block_deflection = ToolDeflectionModel.compute_deflection(
+                radial_force, tool.diameter_mm, overhang, elastic_modulus,
+            )
+            block_dim_error = ToolDeflectionModel.compute_dimensional_error(
+                radial_force, tool.diameter_mm, overhang, elastic_modulus,
+            )
+
+            # Surface roughness prediction
+            block_ra = SurfaceRoughnessModel.compute_ra(
+                feed_per_tooth_mm=fz,
+                nose_radius_mm=nose_radius,
+                vibration_amplitude_mm=0.0,
+                flank_wear_vb_mm=vb,
+                depth_of_cut_mm=ap,
+            )
+
             pred = BlockPrediction(
                 peak_force_n=peak_force,
                 avg_force_n=avg_force,
@@ -728,6 +847,9 @@ class CuttingSimProxy:
                 mrr_mm3pm=forces['mrr'],
                 wear_after_block_mm=vb,
                 temperature_rise_c=temp_rise,
+                deflection_mm=block_deflection,
+                dimensional_error_mm=block_dim_error,
+                surface_ra_um=block_ra,
             )
             block_predictions.append(pred)
             health_trend.append(max(0.0, 1.0 - vb / self.VBMAX))
@@ -769,6 +891,15 @@ class CuttingSimProxy:
         else:
             action = 'Continue normal operation'
 
+        # Deflection and surface roughness summaries
+        deflections = [bp.deflection_mm for bp in block_predictions]
+        dim_errors = [bp.dimensional_error_mm for bp in block_predictions]
+        surface_ras = [bp.surface_ra_um for bp in block_predictions if bp.surface_ra_um > 0]
+        max_defl = max(deflections) if deflections else 0.0
+        max_dim_err = max(dim_errors) if dim_errors else 0.0
+        avg_ra = (sum(surface_ras) / len(surface_ras)) if surface_ras else 0.0
+        max_ra = max(surface_ras) if surface_ras else 0.0
+
         # Restore previous coolant setting
         self._coolant = prev_coolant
 
@@ -781,6 +912,10 @@ class CuttingSimProxy:
             health_index=health_index,
             trend_data=health_trend[-10:] if health_trend else [health_index],
             recommended_action=action,
+            max_deflection_mm=max_defl,
+            max_dimensional_error_mm=max_dim_err,
+            avg_surface_ra_um=round(avg_ra, 3),
+            max_surface_ra_um=max_ra,
         )
 
     def what_if_compare(
@@ -832,10 +967,18 @@ class CuttingSimProxy:
         baseline_rul_min = baseline_result.remaining_useful_life_hours * 60.0
         override_rul_min = override_result.remaining_useful_life_hours * 60.0
 
-        # Estimate surface roughness Ra from feed per tooth
-        # Ra ~ f_z^2 / (8 * R) for ideal finish; use ratio approach
-        baseline_ra = self._estimate_surface_ra(blocks, baseline_params)
-        override_ra = self._estimate_surface_ra(blocks, override_params)
+        # Use simulation-computed surface Ra (from SurfaceRoughnessModel)
+        baseline_ra = baseline_result.max_surface_ra_um
+        override_ra = override_result.max_surface_ra_um
+        # Fall back to legacy estimate if simulation yielded zero
+        if baseline_ra == 0.0:
+            baseline_ra = self._estimate_surface_ra(blocks, baseline_params)
+        if override_ra == 0.0:
+            override_ra = self._estimate_surface_ra(blocks, override_params)
+
+        # Deflection from simulation results
+        baseline_defl = baseline_result.max_deflection_mm
+        override_defl = override_result.max_deflection_mm
 
         # Chatter risk based on spindle RPM relative to stability lobes
         baseline_rpm = self._effective_rpm(blocks, baseline_params)
@@ -848,12 +991,14 @@ class CuttingSimProxy:
             'rul_minutes': baseline_rul_min,
             'max_ra': baseline_ra,
             'chatter_risk': baseline_chatter,
+            'max_deflection_mm': baseline_defl,
         }
         override_dict = {
             'peak_force': override_peak,
             'rul_minutes': override_rul_min,
             'max_ra': override_ra,
             'chatter_risk': override_chatter,
+            'max_deflection_mm': override_defl,
         }
 
         # Delta calculations
@@ -871,12 +1016,22 @@ class CuttingSimProxy:
             else 0.0
         )
         risk_change = override_chatter - baseline_chatter
+        deflection_change_pct = (
+            (override_defl - baseline_defl) / baseline_defl * 100.0
+            if baseline_defl > 0 else 0.0
+        )
+        surface_ra_change_pct = (
+            (override_ra - baseline_ra) / baseline_ra * 100.0
+            if baseline_ra > 0 else 0.0
+        )
 
         delta_dict = {
             'force_pct': force_pct,
             'life_pct': life_pct,
             'quality_change': quality_change,
             'risk_change': risk_change,
+            'deflection_change_pct': deflection_change_pct,
+            'surface_ra_change_pct': surface_ra_change_pct,
         }
 
         return WhatIfComparison(

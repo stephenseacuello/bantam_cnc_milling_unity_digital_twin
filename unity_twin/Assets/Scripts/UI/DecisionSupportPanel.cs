@@ -46,6 +46,23 @@ namespace MiracleTwin.UI
         private Button revertButton;
         private Button closeButton;
 
+        // Operator feedback UI
+        private VisualElement feedbackContainer;
+        private VisualElement starRatingContainer;
+        private Button acceptButton;
+        private Button rejectButton;
+        private Label feedbackStatusLabel;
+        private VisualElement postActionContainer;
+        private Button actionConfirmedButton;
+        private Button actionFailedButton;
+
+        // Feedback state
+        private string currentReferenceId;
+        private string currentAnomalyType;
+        private float overrideAppliedTime;
+        private bool awaitingPostActionFeedback;
+        private const float POST_ACTION_DELAY_SEC = 30f;
+
         private bool isVisible;
         private CorrelatedAlertMsg currentAlert;
 
@@ -232,6 +249,82 @@ namespace MiracleTwin.UI
                 panelRoot.Add(impactPreviewContainer);
             }
 
+            // Create operator feedback section
+            if (feedbackContainer == null)
+            {
+                feedbackContainer = new VisualElement { name = "feedback-container" };
+                feedbackContainer.AddToClassList("feedback-container");
+
+                var feedbackHeader = new Label("Operator Feedback");
+                feedbackHeader.AddToClassList("feedback-header");
+                feedbackContainer.Add(feedbackHeader);
+
+                // Accept / Reject buttons for recommendations
+                var recommendationRow = new VisualElement();
+                recommendationRow.style.flexDirection = FlexDirection.Row;
+                recommendationRow.AddToClassList("feedback-button-row");
+
+                acceptButton = new Button(OnAcceptRecommendation) { text = "Accept", name = "feedback-accept-btn" };
+                acceptButton.AddToClassList("feedback-accept-btn");
+                recommendationRow.Add(acceptButton);
+
+                rejectButton = new Button(OnRejectRecommendation) { text = "Reject", name = "feedback-reject-btn" };
+                rejectButton.AddToClassList("feedback-reject-btn");
+                recommendationRow.Add(rejectButton);
+
+                feedbackContainer.Add(recommendationRow);
+
+                // Star rating (1-5) for explanation quality
+                starRatingContainer = new VisualElement { name = "star-rating-container" };
+                starRatingContainer.style.flexDirection = FlexDirection.Row;
+                starRatingContainer.AddToClassList("star-rating-container");
+                var ratingLabel = new Label("Rate explanation:");
+                ratingLabel.AddToClassList("star-rating-label");
+                starRatingContainer.Add(ratingLabel);
+                for (int star = 1; star <= 5; star++)
+                {
+                    int starValue = star;
+                    var starBtn = new Button(() => OnRateExplanation(starValue))
+                    {
+                        text = "\u2605",
+                        name = $"star-{star}"
+                    };
+                    starBtn.AddToClassList("star-btn");
+                    starRatingContainer.Add(starBtn);
+                }
+                feedbackContainer.Add(starRatingContainer);
+
+                // Post-action feedback (shown after override applied + delay)
+                postActionContainer = new VisualElement { name = "post-action-feedback" };
+                postActionContainer.AddToClassList("post-action-feedback");
+                postActionContainer.style.display = DisplayStyle.None;
+
+                var postLabel = new Label("Did this action help?");
+                postLabel.AddToClassList("post-action-label");
+                postActionContainer.Add(postLabel);
+
+                var postRow = new VisualElement();
+                postRow.style.flexDirection = FlexDirection.Row;
+
+                actionConfirmedButton = new Button(OnActionConfirmed) { text = "Yes", name = "feedback-confirmed-btn" };
+                actionConfirmedButton.AddToClassList("feedback-confirmed-btn");
+                postRow.Add(actionConfirmedButton);
+
+                actionFailedButton = new Button(OnActionFailed) { text = "No", name = "feedback-failed-btn" };
+                actionFailedButton.AddToClassList("feedback-failed-btn");
+                postRow.Add(actionFailedButton);
+
+                postActionContainer.Add(postRow);
+                feedbackContainer.Add(postActionContainer);
+
+                feedbackStatusLabel = new Label("");
+                feedbackStatusLabel.name = "feedback-status";
+                feedbackStatusLabel.AddToClassList("feedback-status");
+                feedbackContainer.Add(feedbackStatusLabel);
+
+                panelRoot.Add(feedbackContainer);
+            }
+
             // Create Apply/Revert buttons if not in UXML
             if (applyOverrideButton == null)
             {
@@ -258,6 +351,13 @@ namespace MiracleTwin.UI
             {
                 predictionPending = false;
                 RequestWhatIfPrediction(pendingFeedPct, pendingSpindlePct);
+            }
+
+            // Show post-action feedback prompt after delay
+            if (awaitingPostActionFeedback && Time.time - overrideAppliedTime >= POST_ACTION_DELAY_SEC)
+            {
+                if (postActionContainer != null)
+                    postActionContainer.style.display = DisplayStyle.Flex;
             }
         }
 
@@ -295,6 +395,17 @@ namespace MiracleTwin.UI
 
         private void PopulatePanel(CorrelatedAlertMsg msg)
         {
+            // Track alert context for feedback
+            currentAnomalyType = (msg.correlated_anomaly_types != null && msg.correlated_anomaly_types.Length > 0)
+                ? msg.correlated_anomaly_types[0]
+                : "unknown";
+            currentReferenceId = $"{msg.machine_id}_{currentAnomalyType}_{Time.time:F0}";
+            awaitingPostActionFeedback = false;
+            if (postActionContainer != null)
+                postActionContainer.style.display = DisplayStyle.None;
+            if (feedbackStatusLabel != null)
+                feedbackStatusLabel.text = "";
+
             // Current Situation
             if (situationLabel != null)
             {
@@ -628,6 +739,10 @@ namespace MiracleTwin.UI
                 string reason = $"Operator what-if override: feed={feedPct:F0}%, spindle={spindlePct:F0}%";
                 miracleBridge.PublishFeedOverride(feedPct, spindlePct, reason);
                 Debug.Log($"[DecisionSupportPanel] Applied override: feed={feedPct}%, spindle={spindlePct}%");
+
+                // Start post-action feedback timer
+                overrideAppliedTime = Time.time;
+                awaitingPostActionFeedback = true;
             }
             else
             {
@@ -653,6 +768,70 @@ namespace MiracleTwin.UI
             }
 
             ClearImpactPreview();
+        }
+
+        // --- Operator Feedback Handlers ---
+
+        private void OnAcceptRecommendation()
+        {
+            PublishFeedback("RECOMMENDATION_ACCEPTED", 1.0f, "accepted");
+            if (feedbackStatusLabel != null)
+                feedbackStatusLabel.text = "Recommendation accepted.";
+        }
+
+        private void OnRejectRecommendation()
+        {
+            PublishFeedback("RECOMMENDATION_REJECTED", 0.0f, "rejected");
+            if (feedbackStatusLabel != null)
+                feedbackStatusLabel.text = "Recommendation rejected.";
+        }
+
+        private void OnRateExplanation(int stars)
+        {
+            PublishFeedback("EXPLANATION_RATED", (float)stars, "rated");
+            if (feedbackStatusLabel != null)
+                feedbackStatusLabel.text = $"Rated {stars}/5 stars.";
+        }
+
+        private void OnActionConfirmed()
+        {
+            PublishFeedback("ACTION_CONFIRMED", 1.0f, "confirmed effective");
+            awaitingPostActionFeedback = false;
+            if (postActionContainer != null)
+                postActionContainer.style.display = DisplayStyle.None;
+            if (feedbackStatusLabel != null)
+                feedbackStatusLabel.text = "Action confirmed effective.";
+        }
+
+        private void OnActionFailed()
+        {
+            PublishFeedback("ACTION_FAILED", 0.0f, "confirmed ineffective");
+            awaitingPostActionFeedback = false;
+            if (postActionContainer != null)
+                postActionContainer.style.display = DisplayStyle.None;
+            if (feedbackStatusLabel != null)
+                feedbackStatusLabel.text = "Action marked as ineffective.";
+        }
+
+        private void PublishFeedback(string feedbackType, float rating, string actionTaken)
+        {
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+
+            if (miracleBridge != null)
+            {
+                miracleBridge.PublishOperatorFeedback(
+                    feedbackType,
+                    currentAnomalyType ?? "",
+                    rating,
+                    actionTaken,
+                    currentReferenceId ?? ""
+                );
+            }
+            else
+            {
+                Debug.LogWarning("[DecisionSupportPanel] Cannot publish feedback: MiracleBridge not available.");
+            }
         }
 
         void OnDestroy()

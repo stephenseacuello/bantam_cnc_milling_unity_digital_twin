@@ -154,21 +154,31 @@ class TestWhatIfCompareDeltaCalculations:
         assert result.delta['risk_change'] == 0.0
 
     def test_quality_improves_with_lower_feed(self):
-        """Lower feed should improve surface quality (lower Ra)."""
+        """Lower feed should improve surface quality (lower Ra) for short programs.
+
+        Note: With a wear-aware surface roughness model, halving feed doubles
+        cutting time, which accumulates more wear and can worsen finish over
+        long programs.  Use a single short block to isolate the feed effect.
+        """
         proxy = CuttingSimProxy()
-        blocks = _default_blocks()
+        blocks = [
+            GCodeBlock(
+                feed_rate_mmpm=500.0, spindle_rpm=8000.0,
+                axial_depth_mm=1.5, radial_depth_mm=3.175, length_mm=10.0,
+            ),
+        ]
 
         result = proxy.what_if_compare(
             blocks,
-            baseline_params=None,
+            baseline_params={'feed_rate': 500.0},
             override_params={'feed_rate': 250.0},  # 50% feed
         )
 
         # quality_change: 1.0 = improved, -1.0 = degraded, 0.0 = unchanged
-        assert result.delta['quality_change'] >= 0.0, (
-            "Lower feed should maintain or improve surface quality"
+        # With a short block, reduced feed per tooth dominates over wear growth
+        assert result.override['max_ra'] <= result.baseline['max_ra'], (
+            "Lower feed should yield lower Ra for a short block"
         )
-        assert result.override['max_ra'] <= result.baseline['max_ra']
 
     def test_quality_degrades_with_higher_feed(self):
         """Higher feed should degrade surface quality (higher Ra)."""

@@ -56,6 +56,10 @@ class ToolDefinition:
     max_depth_of_cut_mm: float = 10.0
     max_width_of_cut_mm: float = 6.35
 
+    # Deflection properties
+    elastic_modulus_gpa: float = 200.0  # Young's modulus (HSS=200, Carbide=620)
+    tool_overhang_mm: float = 30.0     # distance from collet to tip
+
     # Stability (modal parameters for chatter prediction)
     natural_freq_hz: float = 1800.0
     damping_ratio: float = 0.03
@@ -96,6 +100,7 @@ class ToolLibrary:
             ktc=796.0, krc=168.0, kac=80.0,
             kte=14.5, kre=10.2, kae=4.8,
             taylor_C=300.0, taylor_n=0.125,
+            elastic_modulus_gpa=200.0, tool_overhang_mm=30.0,
             min_rpm=1000, max_rpm=15000,
             natural_freq_hz=1800.0, damping_ratio=0.03, stiffness_n_per_m=8e6,
             recommended_coolant='flood',
@@ -111,6 +116,7 @@ class ToolLibrary:
             kte=20.0, kre=15.0, kae=7.0,
             taylor_C=450.0, taylor_n=0.25,
             vb_max_mm=0.30,
+            elastic_modulus_gpa=620.0, tool_overhang_mm=35.0,
             min_rpm=2000, max_rpm=25000,
             max_feed_per_tooth_mm=0.12,
             natural_freq_hz=2200.0, damping_ratio=0.025, stiffness_n_per_m=12e6,
@@ -127,6 +133,7 @@ class ToolLibrary:
             kte=12.0, kre=8.0, kae=4.0,
             taylor_C=350.0, taylor_n=0.2,
             vb_max_mm=0.15,
+            elastic_modulus_gpa=620.0, tool_overhang_mm=25.0,
             min_rpm=5000, max_rpm=30000,
             max_depth_of_cut_mm=3.0,
             natural_freq_hz=3000.0, damping_ratio=0.02, stiffness_n_per_m=5e6,
@@ -143,6 +150,7 @@ class ToolLibrary:
             kte=16.0, kre=11.0, kae=5.0,
             taylor_C=280.0, taylor_n=0.1,
             vb_max_mm=0.35,
+            elastic_modulus_gpa=200.0, tool_overhang_mm=40.0,
             min_rpm=500, max_rpm=10000,
             max_depth_of_cut_mm=15.0,
             natural_freq_hz=1500.0, damping_ratio=0.035, stiffness_n_per_m=15e6,
@@ -159,6 +167,7 @@ class ToolLibrary:
             kte=25.0, kre=18.0, kae=9.0,
             taylor_C=500.0, taylor_n=0.3,
             vb_max_mm=0.25,
+            elastic_modulus_gpa=620.0, tool_overhang_mm=45.0,
             min_rpm=1500, max_rpm=20000,
             max_feed_per_tooth_mm=0.08,
             natural_freq_hz=1200.0, damping_ratio=0.04, stiffness_n_per_m=20e6,

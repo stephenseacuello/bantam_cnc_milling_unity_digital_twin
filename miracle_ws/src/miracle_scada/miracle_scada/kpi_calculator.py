@@ -14,6 +14,7 @@ Quality      = Good Count / Total Count
 
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
+import math
 import threading
 import time
 
@@ -22,6 +23,39 @@ from rclpy.lifecycle import TransitionCallbackReturn
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import MachineState, JobStatus, AnomalyAlert, SystemKPIs
+
+
+# ---------------------------------------------------------------------------
+# OEE Trending Dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OEESnapshot:
+    """A point-in-time OEE measurement."""
+    timestamp: float
+    oee: float
+    availability: float
+    performance: float
+    quality: float
+    machine_id: str = 'fleet'  # 'fleet' for aggregate
+
+
+@dataclass
+class OEETrendAnalysis:
+    """Trend analysis result for OEE metrics."""
+    metric: str           # 'oee', 'availability', 'performance', 'quality'
+    trend_direction: str  # 'improving', 'stable', 'degrading'
+    slope_per_hour: float  # change rate per hour
+    current_value: float
+    avg_1h: float         # average over last hour
+    avg_8h: float         # average over last 8 hours (shift)
+    min_value: float
+    max_value: float
+    samples: int
+
+
+# Maximum number of snapshots to retain (24 hours at 30s interval)
+_MAX_OEE_HISTORY = 2880
 
 
 # Machine states derived from MachineState.status strings
@@ -116,9 +150,21 @@ class KPICalculatorNode(MiracleLifecycleNode):
         self._anomaly_subs: Optional[List] = None
         self._kpi_pub = None
         self._publish_timer = None
+        self._trend_timer = None
         self._publish_interval: float = 10.0
         self._ideal_cycle_time: float = 60.0
         self._planned_hours: float = 24.0
+
+        # OEE history and trending
+        self._oee_history: List[OEESnapshot] = []
+        self._machine_oee_history: Dict[str, List[OEESnapshot]] = {}
+        self._trend_interval_sec: float = 300.0  # 5 minutes
+        self._degradation_threshold: float = -0.02  # slope per hour
+        self._improving_threshold: float = 0.01    # slope per hour
+
+        # MTBF/MTTR real tracking
+        self._failure_timestamps: List[float] = []
+        self._repair_durations: List[float] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -146,12 +192,24 @@ class KPICalculatorNode(MiracleLifecycleNode):
                 'default': 'cnc1,cnc2,cnc3',
                 'type': str,
             },
+            'trend_interval_sec': {
+                'default': 300.0,
+                'type': float,
+                'range': (10.0, 3600.0),
+            },
+            'degradation_threshold': {
+                'default': -0.02,
+                'type': float,
+                'range': (-1.0, 0.0),
+            },
         })
 
         machine_ids = self.get_machine_ids(params)
         self._publish_interval = params['publish_interval_sec']
         self._ideal_cycle_time = params['ideal_cycle_time_sec']
         self._planned_hours = params['planned_hours_per_day']
+        self._trend_interval_sec = params.get('trend_interval_sec', 300.0)
+        self._degradation_threshold = params.get('degradation_threshold', -0.02)
 
         # Initialise per-machine metrics
         with self._lock:
@@ -207,6 +265,11 @@ class KPICalculatorNode(MiracleLifecycleNode):
             self._publish_kpis,
             callback_group=self.service_callback_group,
         )
+        self._trend_timer = self.create_timer(
+            self._trend_interval_sec,
+            self._on_trend_timer,
+            callback_group=self.service_callback_group,
+        )
         self.get_logger().info("KPI calculator activated")
         return TransitionCallbackReturn.SUCCESS
 
@@ -215,6 +278,9 @@ class KPICalculatorNode(MiracleLifecycleNode):
         if self._publish_timer is not None:
             self._publish_timer.cancel()
             self._publish_timer = None
+        if self._trend_timer is not None:
+            self._trend_timer.cancel()
+            self._trend_timer = None
         return TransitionCallbackReturn.SUCCESS
 
     # ------------------------------------------------------------------
@@ -303,6 +369,18 @@ class KPICalculatorNode(MiracleLifecycleNode):
         if self._kpi_pub is not None:
             self._kpi_pub.publish(msg)
 
+        # Record fleet OEE snapshot
+        now = self._now_sec()
+        snapshot = OEESnapshot(
+            timestamp=now,
+            oee=msg.oee,
+            availability=msg.availability,
+            performance=msg.performance,
+            quality=msg.quality,
+            machine_id='fleet',
+        )
+        self._append_snapshot(snapshot)
+
     def _compute_fleet_kpis(self) -> SystemKPIs:
         """Aggregate KPIs across all machines."""
         msg = SystemKPIs()
@@ -381,6 +459,60 @@ class KPICalculatorNode(MiracleLifecycleNode):
         return msg
 
     # ------------------------------------------------------------------
+    # OEE History & Trending
+    # ------------------------------------------------------------------
+
+    def _append_snapshot(self, snapshot: OEESnapshot) -> None:
+        """Append a snapshot to the appropriate history list, capping size."""
+        with self._lock:
+            if snapshot.machine_id == 'fleet':
+                self._oee_history.append(snapshot)
+                if len(self._oee_history) > _MAX_OEE_HISTORY:
+                    self._oee_history = self._oee_history[-_MAX_OEE_HISTORY:]
+            else:
+                hist = self._machine_oee_history.setdefault(
+                    snapshot.machine_id, [],
+                )
+                hist.append(snapshot)
+                if len(hist) > _MAX_OEE_HISTORY:
+                    self._machine_oee_history[snapshot.machine_id] = \
+                        hist[-_MAX_OEE_HISTORY:]
+
+    def _on_trend_timer(self) -> None:
+        """Periodic callback to run trend analysis and log degradation."""
+        trends = self.get_trend_analysis()
+        for metric, analysis in trends.items():
+            if analysis.trend_direction == 'degrading':
+                self.get_logger().warning(
+                    f"OEE DEGRADATION: {metric} trending down at "
+                    f"{analysis.slope_per_hour:+.4f}/hr "
+                    f"(current={analysis.current_value:.3f}, "
+                    f"1h_avg={analysis.avg_1h:.3f})"
+                )
+
+    @property
+    def oee_history(self) -> List[OEESnapshot]:
+        """Return fleet OEE history (up to 24 hours)."""
+        with self._lock:
+            return list(self._oee_history)
+
+    def get_oee_history(self, hours: float = 24.0) -> List[OEESnapshot]:
+        """Return fleet OEE snapshots for the last *hours* hours."""
+        cutoff = self._now_sec() - hours * 3600.0
+        with self._lock:
+            return [s for s in self._oee_history if s.timestamp >= cutoff]
+
+    def get_trend_analysis(self) -> Dict[str, OEETrendAnalysis]:
+        """Compute trend analysis for each OEE metric from fleet history."""
+        with self._lock:
+            snapshots = list(self._oee_history)
+        return _analyze_trends(
+            snapshots,
+            degradation_threshold=self._degradation_threshold,
+            improving_threshold=self._improving_threshold,
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -450,6 +582,172 @@ def compute_mttr(total_repair_time: float, failure_count: int) -> float:
     if failure_count <= 0:
         return 0.0
     return total_repair_time / failure_count
+
+
+# ------------------------------------------------------------------
+# Trending pure functions (testable without ROS2)
+# ------------------------------------------------------------------
+
+def compute_moving_average(
+    snapshots: List[OEESnapshot],
+    metric: str,
+    window_seconds: float,
+    reference_time: Optional[float] = None,
+) -> float:
+    """Compute the moving average of *metric* over the last *window_seconds*.
+
+    Args:
+        snapshots: Sorted list of OEESnapshot.
+        metric: One of 'oee', 'availability', 'performance', 'quality'.
+        window_seconds: Time window in seconds.
+        reference_time: End of the window; defaults to the last snapshot ts.
+
+    Returns:
+        Average value, or 0.0 if no samples in the window.
+    """
+    if not snapshots:
+        return 0.0
+    if reference_time is None:
+        reference_time = snapshots[-1].timestamp
+    cutoff = reference_time - window_seconds
+    values = [
+        getattr(s, metric)
+        for s in snapshots
+        if s.timestamp >= cutoff
+    ]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def compute_linear_regression_slope(
+    snapshots: List[OEESnapshot],
+    metric: str,
+    window_seconds: float,
+    reference_time: Optional[float] = None,
+) -> float:
+    """Compute a least-squares linear regression slope for *metric*.
+
+    The slope is expressed in *change per hour*.
+
+    Args:
+        snapshots: Sorted list of OEESnapshot.
+        metric: One of 'oee', 'availability', 'performance', 'quality'.
+        window_seconds: How far back to look (seconds).
+        reference_time: End of window; defaults to last snapshot ts.
+
+    Returns:
+        Slope (change per hour), or 0.0 if fewer than 2 data points.
+    """
+    if not snapshots:
+        return 0.0
+    if reference_time is None:
+        reference_time = snapshots[-1].timestamp
+    cutoff = reference_time - window_seconds
+
+    points = [
+        (s.timestamp, getattr(s, metric))
+        for s in snapshots
+        if s.timestamp >= cutoff
+    ]
+    n = len(points)
+    if n < 2:
+        return 0.0
+
+    # Convert timestamps to hours relative to first point
+    t0 = points[0][0]
+    xs = [(t - t0) / 3600.0 for t, _ in points]
+    ys = [v for _, v in points]
+
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+
+    if denominator == 0.0:
+        return 0.0
+    return numerator / denominator
+
+
+def _classify_trend(
+    slope: float,
+    degradation_threshold: float = -0.02,
+    improving_threshold: float = 0.01,
+) -> str:
+    """Classify a slope as 'improving', 'degrading', or 'stable'."""
+    if slope <= degradation_threshold:
+        return 'degrading'
+    if slope >= improving_threshold:
+        return 'improving'
+    return 'stable'
+
+
+def _analyze_trends(
+    snapshots: List[OEESnapshot],
+    degradation_threshold: float = -0.02,
+    improving_threshold: float = 0.01,
+) -> Dict[str, OEETrendAnalysis]:
+    """Analyse trend for each OEE metric.
+
+    Returns a dict keyed by metric name ('oee', 'availability', etc.).
+    """
+    metrics = ('oee', 'availability', 'performance', 'quality')
+    results: Dict[str, OEETrendAnalysis] = {}
+
+    for metric in metrics:
+        if not snapshots:
+            results[metric] = OEETrendAnalysis(
+                metric=metric,
+                trend_direction='stable',
+                slope_per_hour=0.0,
+                current_value=0.0,
+                avg_1h=0.0,
+                avg_8h=0.0,
+                min_value=0.0,
+                max_value=0.0,
+                samples=0,
+            )
+            continue
+
+        values = [getattr(s, metric) for s in snapshots]
+        slope = compute_linear_regression_slope(
+            snapshots, metric, window_seconds=3600.0,
+        )
+        direction = _classify_trend(
+            slope, degradation_threshold, improving_threshold,
+        )
+
+        results[metric] = OEETrendAnalysis(
+            metric=metric,
+            trend_direction=direction,
+            slope_per_hour=slope,
+            current_value=values[-1],
+            avg_1h=compute_moving_average(snapshots, metric, 3600.0),
+            avg_8h=compute_moving_average(snapshots, metric, 28800.0),
+            min_value=min(values),
+            max_value=max(values),
+            samples=len(values),
+        )
+
+    return results
+
+
+def compute_real_mtbf(
+    failure_timestamps: List[float],
+    total_uptime: float,
+) -> float:
+    """Compute actual MTBF = total_uptime / failure_count."""
+    if not failure_timestamps:
+        return 0.0
+    return total_uptime / len(failure_timestamps)
+
+
+def compute_real_mttr(repair_durations: List[float]) -> float:
+    """Compute actual MTTR = total_repair_time / failure_count."""
+    if not repair_durations:
+        return 0.0
+    return sum(repair_durations) / len(repair_durations)
 
 
 # ------------------------------------------------------------------

@@ -3,20 +3,24 @@ Prediction Validation System.
 
 Compares digital twin predictions against actual sensor data and tracks
 accuracy over time, computing RMSE, bias, R-squared, and drift rate
-to detect model degradation.
+to detect model degradation.  Includes a calibration feedback loop that
+adjusts CuttingSimProxy coefficients based on prediction-vs-actual drift.
 """
 
 import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from rclpy.lifecycle import TransitionCallbackReturn
 
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import MachineState
+
+if TYPE_CHECKING:
+    from miracle_twin.cutting_sim_proxy import CuttingSimProxy
 
 
 @dataclass
@@ -42,6 +46,17 @@ class AccuracyMetrics:
     r_squared: float = 0.0
     drift_rate: float = 0.0
     last_updated: float = 0.0
+
+
+@dataclass
+class CalibrationAdjustment:
+    """A proposed coefficient adjustment based on validation data."""
+    metric: str            # 'force', 'temperature', 'power'
+    current_bias: float    # signed prediction error (positive = overpredicting)
+    correction_factor: float  # multiplier to apply (e.g., 0.95 = reduce by 5%)
+    confidence: float      # 0-1, how confident in this adjustment
+    sample_count: int
+    timestamp: float
 
 
 class PredictionValidatorNode(MiracleLifecycleNode):
@@ -80,6 +95,18 @@ class PredictionValidatorNode(MiracleLifecycleNode):
         self._history_size: int = 5000
         self._comparison_window_sec: float = 10.0
         self._accuracy_interval_sec: float = 30.0
+
+        # Calibration feedback loop parameters
+        self._calibration_enabled: bool = False
+        self._calibration_interval_sec: float = 300.0
+        self._min_samples_for_calibration: int = 50
+        self._max_correction_pct: float = 0.10  # 10%
+        self._calibration_damping: float = 0.3   # learning rate
+
+        # Calibration state
+        self._proxy: Optional['CuttingSimProxy'] = None
+        self._calibration_history: List[CalibrationAdjustment] = []
+        self._last_calibration_time: float = 0.0
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure the prediction validator."""
@@ -357,3 +384,163 @@ class PredictionValidatorNode(MiracleLifecycleNode):
     def set_validator(self, validator: Any) -> None:
         """No-op for API compatibility; this node IS the validator."""
         pass
+
+    # ------------------------------------------------------------------
+    # Calibration feedback loop
+    # ------------------------------------------------------------------
+
+    def set_proxy(self, proxy: 'CuttingSimProxy') -> None:
+        """Connect the validator to a CuttingSimProxy for calibration.
+
+        Args:
+            proxy: The CuttingSimProxy whose coefficients will be adjusted.
+        """
+        self._proxy = proxy
+
+    @property
+    def calibration_history(self) -> List[CalibrationAdjustment]:
+        """Return the full audit trail of calibration adjustments."""
+        with self._lock:
+            return list(self._calibration_history)
+
+    def _compute_calibration(self) -> List[CalibrationAdjustment]:
+        """Compute calibration adjustments based on accumulated prediction error.
+
+        Only runs when calibration is enabled, a proxy is connected, and
+        enough samples have accumulated since the last calibration.
+
+        For each metric (force, temperature, power):
+        - Computes signed bias (predicted - actual) and mean predicted value.
+        - If relative bias exceeds 5% and sample count >= min_samples:
+            - correction_factor = 1.0 - (bias / predicted_mean) * damping
+            - Clamped to [1 - max_correction_pct, 1 + max_correction_pct]
+            - confidence = min(1.0, sample_count / 200) * max(0, r_squared)
+
+        Returns:
+            List of CalibrationAdjustment proposals (may be empty).
+        """
+        if not self._calibration_enabled:
+            return []
+
+        now = time.time()
+        if now - self._last_calibration_time < self._calibration_interval_sec:
+            return []
+
+        adjustments: List[CalibrationAdjustment] = []
+
+        with self._lock:
+            for metric in ('force', 'temperature', 'power'):
+                metric_samples = [s for s in self._samples if s.metric == metric]
+                n = len(metric_samples)
+                if n < self._min_samples_for_calibration:
+                    continue
+
+                # Signed bias: predicted - actual
+                signed_errors = [s.predicted - s.actual for s in metric_samples]
+                bias = sum(signed_errors) / n
+
+                # Mean predicted value (used to compute relative bias)
+                predicted_mean = sum(s.predicted for s in metric_samples) / n
+                if predicted_mean == 0.0:
+                    continue
+
+                relative_bias = abs(bias / predicted_mean)
+                if relative_bias < 0.05:
+                    # Bias under 5% — not worth correcting
+                    continue
+
+                # Correction factor with damping
+                raw_correction = 1.0 - (bias / predicted_mean) * self._calibration_damping
+                lo = 1.0 - self._max_correction_pct
+                hi = 1.0 + self._max_correction_pct
+                correction_factor = max(lo, min(hi, raw_correction))
+
+                # R-squared for confidence weighting
+                accuracy = self._accuracy.get(metric)
+                r_sq = max(0.0, accuracy.r_squared) if accuracy else 0.0
+                confidence = min(1.0, n / 200.0) * r_sq
+
+                adj = CalibrationAdjustment(
+                    metric=metric,
+                    current_bias=bias,
+                    correction_factor=correction_factor,
+                    confidence=confidence,
+                    sample_count=n,
+                    timestamp=now,
+                )
+                adjustments.append(adj)
+
+                self.get_logger().info(
+                    f"Calibration proposal for '{metric}': bias={bias:.3f}, "
+                    f"correction={correction_factor:.4f}, confidence={confidence:.3f}, "
+                    f"samples={n}"
+                )
+
+        self._last_calibration_time = now
+        return adjustments
+
+    def _apply_calibration(
+        self,
+        proxy: 'CuttingSimProxy',
+        adjustments: List[CalibrationAdjustment],
+    ) -> None:
+        """Apply calibration adjustments to a CuttingSimProxy.
+
+        Only adjustments with confidence > 0.7 are applied.
+
+        For force:    scale Ktc, Krc, Kac by correction_factor
+        For power:    scale Kte, Kre, Kae by correction_factor
+        For temperature: scale the coolant thermal_factor
+
+        All changes are logged with before/after values and recorded in the
+        proxy's calibration log.
+
+        Args:
+            proxy: The CuttingSimProxy to adjust.
+            adjustments: List of CalibrationAdjustment proposals.
+        """
+        for adj in adjustments:
+            if adj.confidence < 0.7:
+                self.get_logger().info(
+                    f"Skipping calibration for '{adj.metric}': "
+                    f"confidence {adj.confidence:.3f} < 0.7"
+                )
+                continue
+
+            before = proxy.get_coefficients()
+            factor = adj.correction_factor
+
+            if adj.metric == 'force':
+                proxy.scale_force_coefficients(factor)
+            elif adj.metric == 'power':
+                proxy.scale_edge_coefficients(factor)
+            elif adj.metric == 'temperature':
+                proxy.scale_thermal_factor(factor)
+
+            after = proxy.get_coefficients()
+
+            self.get_logger().info(
+                f"Applied calibration for '{adj.metric}': "
+                f"factor={factor:.4f}, before={before}, after={after}"
+            )
+
+            with self._lock:
+                self._calibration_history.append(adj)
+
+    def run_calibration_cycle(self) -> List[CalibrationAdjustment]:
+        """Run a full calibration cycle: compute adjustments and apply them.
+
+        Recomputes accuracy first so that R-squared values are current,
+        then computes calibration proposals and applies them to the
+        connected proxy (if any).
+
+        Returns:
+            The list of computed CalibrationAdjustment proposals.
+        """
+        # Refresh accuracy metrics before calibrating
+        self._compute_all_accuracy()
+
+        adjustments = self._compute_calibration()
+        if adjustments and self._proxy is not None:
+            self._apply_calibration(self._proxy, adjustments)
+        return adjustments

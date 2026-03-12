@@ -45,6 +45,7 @@ set(msg_files
   "msg/PartRecord.msg"
   "msg/StabilityRecommendation.msg"
   "msg/InferredAction.msg"
+  "msg/AlarmEscalation.msg"
 )
 
 set(srv_files

@@ -61,6 +61,9 @@ class ToolDefinition:
     damping_ratio: float = 0.03
     stiffness_n_per_m: float = 8e6
 
+    # Recommended coolant type for this tool
+    recommended_coolant: str = 'flood'  # 'dry', 'mist', 'flood', 'high_pressure', 'cryogenic'
+
     @property
     def helix_angle_rad(self) -> float:
         return math.radians(self.helix_angle_deg)
@@ -95,6 +98,7 @@ class ToolLibrary:
             taylor_C=300.0, taylor_n=0.125,
             min_rpm=1000, max_rpm=15000,
             natural_freq_hz=1800.0, damping_ratio=0.03, stiffness_n_per_m=8e6,
+            recommended_coolant='flood',
         ))
 
         self.register(ToolDefinition(
@@ -110,6 +114,7 @@ class ToolLibrary:
             min_rpm=2000, max_rpm=25000,
             max_feed_per_tooth_mm=0.12,
             natural_freq_hz=2200.0, damping_ratio=0.025, stiffness_n_per_m=12e6,
+            recommended_coolant='flood',
         ))
 
         self.register(ToolDefinition(
@@ -125,6 +130,7 @@ class ToolLibrary:
             min_rpm=5000, max_rpm=30000,
             max_depth_of_cut_mm=3.0,
             natural_freq_hz=3000.0, damping_ratio=0.02, stiffness_n_per_m=5e6,
+            recommended_coolant='mist',  # DLC coating is self-lubricating
         ))
 
         self.register(ToolDefinition(
@@ -140,6 +146,7 @@ class ToolLibrary:
             min_rpm=500, max_rpm=10000,
             max_depth_of_cut_mm=15.0,
             natural_freq_hz=1500.0, damping_ratio=0.035, stiffness_n_per_m=15e6,
+            recommended_coolant='flood',
         ))
 
         self.register(ToolDefinition(
@@ -155,6 +162,7 @@ class ToolLibrary:
             min_rpm=1500, max_rpm=20000,
             max_feed_per_tooth_mm=0.08,
             natural_freq_hz=1200.0, damping_ratio=0.04, stiffness_n_per_m=20e6,
+            recommended_coolant='flood',
         ))
 
     def register(self, tool: ToolDefinition) -> None:

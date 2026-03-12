@@ -679,3 +679,110 @@
     background-color: rgba(239, 68, 68, 0.2);
     color: rgb(248, 113, 113);
 }
+
+/* ── Notification Toast System ──────────────────────────────────── */
+
+.toast-container {
+    position: absolute;
+    top: 60px;
+    right: 10px;
+    width: 320px;
+    flex-direction: column;
+    picking-mode: ignore;
+}
+
+.toast {
+    flex-direction: row;
+    margin-bottom: 8px;
+    border-radius: 6px;
+    background-color: rgba(30, 32, 38, 0.95);
+    border-width: 1px;
+    border-color: rgba(255, 255, 255, 0.1);
+    overflow: hidden;
+    transition-property: opacity, translate;
+    transition-duration: 300ms;
+    picking-mode: position;
+}
+
+.toast-exit {
+    opacity: 0;
+    translate: 320px 0;
+}
+
+.toast-info {
+    border-color: rgba(59, 130, 246, 0.3);
+}
+
+.toast-warning {
+    border-color: rgba(234, 179, 8, 0.3);
+}
+
+.toast-critical {
+    border-color: rgba(239, 68, 68, 0.5);
+    background-color: rgba(40, 25, 28, 0.95);
+}
+
+.toast-security {
+    border-color: rgba(168, 85, 247, 0.5);
+    background-color: rgba(35, 25, 45, 0.95);
+}
+
+.toast-severity-bar {
+    width: 4px;
+    min-height: 100%;
+}
+
+.toast-content {
+    flex-grow: 1;
+    padding: 8px 10px;
+}
+
+.toast-title-row {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.toast-title {
+    font-size: 12px;
+    color: rgb(220, 225, 235);
+    -unity-font-style: bold;
+    text-transform: uppercase;
+}
+
+.toast-dismiss {
+    font-size: 14px;
+    color: rgba(200, 210, 225, 0.5);
+    background-color: transparent;
+    border-width: 0;
+    padding: 0 4px;
+    min-width: 20px;
+    -unity-text-align: middle-center;
+}
+
+.toast-dismiss:hover {
+    color: rgb(255, 255, 255);
+}
+
+.toast-message {
+    font-size: 11px;
+    color: rgba(200, 210, 225, 0.7);
+    padding-top: 2px;
+    white-space: normal;
+}
+
+.toast-action-btn {
+    font-size: 10px;
+    margin-top: 4px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    background-color: rgba(59, 130, 246, 0.3);
+    color: rgb(147, 197, 253);
+    border-width: 0;
+    align-self: flex-start;
+}
+
+.toast-action-btn:hover {
+    background-color: rgba(59, 130, 246, 0.5);
+    color: rgb(200, 220, 255);
+}

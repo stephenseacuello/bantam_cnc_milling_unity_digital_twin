@@ -48,6 +48,7 @@ class Job:
     required_capabilities: List[str] = field(compare=False, default_factory=list)
     material_batch: str = field(compare=False, default='')
     part_serial: str = field(compare=False, default='')
+    tool_id: str = field(compare=False, default='')
 
 
 class JobSchedulerNode(MiracleLifecycleNode):
@@ -268,6 +269,23 @@ class JobSchedulerNode(MiracleLifecycleNode):
                     serial_number=job.part_serial or '',
                     metadata={'job_id': job.job_id, 'program': job.program_name},
                 )
+                # Record tool installation for the job
+                if job.tool_id:
+                    self._digital_thread.record_genealogy_event(
+                        DigitalThreadNode.ENTRY_TOOL_INSTALLED,
+                        machine_id=job.machine_id,
+                        tool_id=job.tool_id,
+                        serial_number=job.part_serial or '',
+                        batch_id=job.material_batch or '',
+                        metadata={'job_id': job.job_id},
+                    )
+                # Set active job context for anomaly linking
+                self._digital_thread.set_active_job(
+                    machine_id=job.machine_id,
+                    job_id=job.job_id,
+                    serial_number=job.part_serial or '',
+                    batch_id=job.material_batch or '',
+                )
 
             if self._enable_auction:
                 self._announce_task(job)
@@ -298,6 +316,8 @@ class JobSchedulerNode(MiracleLifecycleNode):
             f"Executing job '{request.job_id}' on {request.machine_id}"
         )
 
+        job = self._active_jobs.get(request.job_id)
+
         # Simulate job execution phases
         phases = [
             ('SETUP', 0.1),
@@ -315,7 +335,23 @@ class JobSchedulerNode(MiracleLifecycleNode):
                 goal_handle.canceled()
                 result.success = False
                 result.message = 'Job cancelled'
+                # Record cancellation in genealogy
+                if self._digital_thread:
+                    self._digital_thread.record_genealogy_event(
+                        DigitalThreadNode.ENTRY_JOB_CANCELLED,
+                        machine_id=request.machine_id,
+                        serial_number=job.part_serial if job else '',
+                        batch_id=job.material_batch if job else '',
+                        tool_id=job.tool_id if job else '',
+                        metadata={
+                            'job_id': request.job_id,
+                            'cancelled_at_phase': phase_name,
+                        },
+                    )
+                    self._digital_thread.clear_active_job(request.machine_id)
                 return result
+
+            phase_start = self.get_clock().now().nanoseconds / 1e9
 
             feedback = ExecuteJob.Feedback()
             feedback.progress = progress
@@ -334,6 +370,21 @@ class JobSchedulerNode(MiracleLifecycleNode):
             goal_handle.publish_feedback(feedback)
             await asyncio.sleep(0.5)
 
+            phase_end = self.get_clock().now().nanoseconds / 1e9
+
+            # Record OPERATION_COMPLETE for cutting phases
+            if self._digital_thread and phase_name in ('MACHINING',):
+                self._digital_thread.record_operation_complete(
+                    machine_id=request.machine_id,
+                    tool_id=job.tool_id if job else '',
+                    operation_type=job.task_type if job else 'MILLING',
+                    start_time=phase_start,
+                    end_time=phase_end,
+                    serial_number=job.part_serial if job else '',
+                    batch_id=job.material_batch if job else '',
+                    metadata={'job_id': request.job_id, 'phase': phase_name},
+                )
+
         elapsed_total = (self.get_clock().now() - start).nanoseconds / 1e9
         goal_handle.succeed()
         result.success = True
@@ -343,7 +394,17 @@ class JobSchedulerNode(MiracleLifecycleNode):
         result.quality_metrics = [0.98, 0.95, 0.99]
 
         if self._digital_thread:
-            job = self._active_jobs.get(request.job_id)
+            # Record tool removal on job completion
+            if job and job.tool_id:
+                self._digital_thread.record_genealogy_event(
+                    DigitalThreadNode.ENTRY_TOOL_REMOVED,
+                    machine_id=request.machine_id,
+                    tool_id=job.tool_id,
+                    serial_number=job.part_serial if job else '',
+                    batch_id=job.material_batch if job else '',
+                    metadata={'job_id': request.job_id},
+                )
+
             self._digital_thread.record_genealogy_event(
                 DigitalThreadNode.ENTRY_PART_COMPLETE,
                 machine_id=request.machine_id,
@@ -356,7 +417,117 @@ class JobSchedulerNode(MiracleLifecycleNode):
                 },
             )
 
+            self._digital_thread.clear_active_job(request.machine_id)
+
         return result
+
+    def pause_job(self, job_id: str) -> bool:
+        """Pause an active job and record in genealogy."""
+        job = self._active_jobs.get(job_id)
+        if not job:
+            return False
+        job.status = 'PAUSED'
+        self._publish_job_status(job)
+        if self._digital_thread:
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_JOB_PAUSED,
+                machine_id=job.machine_id,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata={'job_id': job.job_id},
+            )
+        return True
+
+    def resume_job(self, job_id: str) -> bool:
+        """Resume a paused job and record in genealogy."""
+        job = self._active_jobs.get(job_id)
+        if not job or job.status != 'PAUSED':
+            return False
+        job.status = 'RUNNING'
+        self._publish_job_status(job)
+        if self._digital_thread:
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_JOB_RESUMED,
+                machine_id=job.machine_id,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata={'job_id': job.job_id},
+            )
+        return True
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel an active job and record in genealogy."""
+        job = self._active_jobs.get(job_id)
+        if not job:
+            return False
+        job.status = 'CANCELLED'
+        self._publish_job_status(job)
+        if self._digital_thread:
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_JOB_CANCELLED,
+                machine_id=job.machine_id,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata={'job_id': job.job_id},
+            )
+            self._digital_thread.clear_active_job(job.machine_id)
+        self._active_jobs.pop(job_id, None)
+        return True
+
+    def record_job_failure(
+        self, job_id: str, error: str, machine_context: Optional[Dict] = None,
+    ) -> bool:
+        """Record a job failure with error details in genealogy."""
+        job = self._active_jobs.get(job_id)
+        if not job:
+            return False
+        job.status = 'FAILED'
+        self._publish_job_status(job)
+        if self._digital_thread:
+            meta: Dict[str, Any] = {
+                'job_id': job.job_id,
+                'error': error,
+            }
+            if machine_context:
+                meta['machine_context'] = machine_context
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_JOB_FAILED,
+                machine_id=job.machine_id,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata=meta,
+            )
+            self._digital_thread.clear_active_job(job.machine_id)
+        return True
+
+    def record_machine_error(
+        self, job_id: str, error: str,
+        machine_state_context: Optional[Dict] = None,
+    ) -> bool:
+        """Record a machine error event with state context in genealogy."""
+        job = self._active_jobs.get(job_id)
+        if not job:
+            return False
+        if self._digital_thread:
+            meta: Dict[str, Any] = {
+                'job_id': job.job_id,
+                'error': error,
+            }
+            if machine_state_context:
+                meta['machine_state'] = machine_state_context
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_MACHINE_ERROR,
+                machine_id=job.machine_id,
+                serial_number=job.part_serial or '',
+                batch_id=job.material_batch or '',
+                tool_id=job.tool_id or '',
+                metadata=meta,
+            )
+        return True
 
     def _publish_job_status(self, job: Job) -> None:
         """Publish current job status."""

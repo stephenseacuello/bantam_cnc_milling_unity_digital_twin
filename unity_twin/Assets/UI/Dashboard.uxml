@@ -262,6 +262,9 @@
             </VisualElement>
         </VisualElement>
 
+        <!-- Toast Notification Container (top-right overlay) -->
+        <VisualElement name="toast-container" class="toast-container" />
+
         <!-- Bottom Control Bar -->
         <VisualElement name="control-bar" class="control-bar">
             <Button name="play-btn" text="Play" class="control-btn play" />

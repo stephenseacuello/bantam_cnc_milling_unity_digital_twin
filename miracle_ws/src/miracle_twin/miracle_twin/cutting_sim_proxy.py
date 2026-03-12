@@ -6,10 +6,64 @@ PredictionRunner to replace hardcoded values with real simulation results.
 """
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from miracle_twin.tool_library import ToolDefinition, ToolLibrary
+
+
+@dataclass
+class CoolantConfig:
+    """Coolant/lubrication configuration affecting wear and thermal models."""
+    coolant_type: str = 'flood'  # 'dry', 'mist', 'flood', 'high_pressure', 'cryogenic'
+    flow_rate_lpm: float = 10.0  # liters per minute
+    concentration_pct: float = 8.0  # coolant concentration (for emulsions)
+
+    @property
+    def wear_factor(self) -> float:
+        """Multiplicative factor on Taylor wear rate. Lower = less wear."""
+        factors = {
+            'dry': 1.0,
+            'mist': 0.85,       # MQL - minimal quantity lubrication
+            'flood': 0.65,      # conventional flood coolant
+            'high_pressure': 0.50,  # high-pressure through-tool
+            'cryogenic': 0.40,  # CO2/LN2 cryogenic
+        }
+        base = factors.get(self.coolant_type, 1.0)
+        # Flow rate effectiveness: diminishing returns above 15 lpm
+        if self.coolant_type in ('flood', 'high_pressure'):
+            flow_eff = min(1.0, self.flow_rate_lpm / 15.0)
+            base *= (1.0 - 0.2 * flow_eff)  # up to 20% additional reduction
+        return max(0.3, base)
+
+    @property
+    def thermal_factor(self) -> float:
+        """Multiplicative factor on temperature rise. Lower = better cooling."""
+        factors = {
+            'dry': 1.0,
+            'mist': 0.75,
+            'flood': 0.45,
+            'high_pressure': 0.30,
+            'cryogenic': 0.15,
+        }
+        base = factors.get(self.coolant_type, 1.0)
+        if self.coolant_type in ('flood', 'high_pressure'):
+            flow_eff = min(1.0, self.flow_rate_lpm / 15.0)
+            base *= (1.0 - 0.3 * flow_eff)
+        return max(0.1, base)
+
+    @property
+    def chip_evacuation_factor(self) -> float:
+        """Factor for chip recutting probability. Lower = better evacuation."""
+        factors = {
+            'dry': 1.0,
+            'mist': 0.9,
+            'flood': 0.5,
+            'high_pressure': 0.3,
+            'cryogenic': 0.7,  # CO2 doesn't wash chips well
+        }
+        return factors.get(self.coolant_type, 1.0)
 
 
 @dataclass
@@ -122,9 +176,113 @@ class CuttingSimProxy:
             cls._tool_library = ToolLibrary()
         return cls._tool_library
 
-    def __init__(self, coefficients: Optional[CuttingCoefficients] = None):
+    def __init__(self, coefficients: Optional[CuttingCoefficients] = None,
+                 coolant: Optional['CoolantConfig'] = None):
         self.coeffs = coefficients or CuttingCoefficients()
         self._active_tool_def: Optional[ToolDefinition] = None
+        self._coolant: CoolantConfig = coolant or CoolantConfig()
+        self._calibration_log: List[Dict] = []
+
+    @property
+    def coolant(self) -> 'CoolantConfig':
+        """Return the current coolant configuration."""
+        return self._coolant
+
+    def set_coolant(self, config: 'CoolantConfig') -> None:
+        """Set coolant/lubrication configuration."""
+        self._coolant = config
+
+    # ------------------------------------------------------------------
+    # Calibration support
+    # ------------------------------------------------------------------
+
+    def get_coefficients(self) -> Dict[str, float]:
+        """Return current cutting coefficients as a flat dictionary.
+
+        Returns:
+            Dict with keys Ktc, Krc, Kac, Kte, Kre, Kae and their values.
+        """
+        return {
+            'Ktc': self.coeffs.Ktc,
+            'Krc': self.coeffs.Krc,
+            'Kac': self.coeffs.Kac,
+            'Kte': self.coeffs.Kte,
+            'Kre': self.coeffs.Kre,
+            'Kae': self.coeffs.Kae,
+        }
+
+    def scale_force_coefficients(self, factor: float) -> None:
+        """Multiply the shearing (force) coefficients Ktc, Krc, Kac by *factor*.
+
+        Records the change in the calibration log.
+        """
+        before = {'Ktc': self.coeffs.Ktc, 'Krc': self.coeffs.Krc, 'Kac': self.coeffs.Kac}
+        self.coeffs.Ktc *= factor
+        self.coeffs.Krc *= factor
+        self.coeffs.Kac *= factor
+        after = {'Ktc': self.coeffs.Ktc, 'Krc': self.coeffs.Krc, 'Kac': self.coeffs.Kac}
+        self._calibration_log.append({
+            'timestamp': time.time(),
+            'action': 'scale_force_coefficients',
+            'factor': factor,
+            'before': before,
+            'after': after,
+        })
+
+    def scale_edge_coefficients(self, factor: float) -> None:
+        """Multiply the edge (power) coefficients Kte, Kre, Kae by *factor*.
+
+        Records the change in the calibration log.
+        """
+        before = {'Kte': self.coeffs.Kte, 'Kre': self.coeffs.Kre, 'Kae': self.coeffs.Kae}
+        self.coeffs.Kte *= factor
+        self.coeffs.Kre *= factor
+        self.coeffs.Kae *= factor
+        after = {'Kte': self.coeffs.Kte, 'Kre': self.coeffs.Kre, 'Kae': self.coeffs.Kae}
+        self._calibration_log.append({
+            'timestamp': time.time(),
+            'action': 'scale_edge_coefficients',
+            'factor': factor,
+            'before': before,
+            'after': after,
+        })
+
+    def scale_thermal_factor(self, factor: float) -> None:
+        """Scale the coolant thermal_factor by *factor* (clamped to >= 0.1).
+
+        This is implemented by replacing the CoolantConfig with an adjusted
+        copy whose ``thermal_factor`` property is overridden.
+
+        Records the change in the calibration log.
+        """
+        old_tf = self._coolant.thermal_factor
+        # Create a lightweight wrapper that overrides thermal_factor
+        new_tf = max(0.1, old_tf * factor)
+        original_coolant = self._coolant
+
+        class _AdjustedCoolant(CoolantConfig):
+            """CoolantConfig with an externally adjusted thermal_factor."""
+            _override_thermal: float = new_tf
+
+            @property
+            def thermal_factor(self) -> float:
+                return self._override_thermal
+
+        adjusted = _AdjustedCoolant(
+            coolant_type=original_coolant.coolant_type,
+            flow_rate_lpm=original_coolant.flow_rate_lpm,
+            concentration_pct=original_coolant.concentration_pct,
+        )
+        adjusted._override_thermal = new_tf
+        self._coolant = adjusted
+
+        self._calibration_log.append({
+            'timestamp': time.time(),
+            'action': 'scale_thermal_factor',
+            'factor': factor,
+            'before': {'thermal_factor': old_tf},
+            'after': {'thermal_factor': new_tf},
+        })
 
     def set_tool(self, tool_id: str) -> bool:
         """Load a tool from the library by ID and apply its parameters.
@@ -284,20 +442,24 @@ class CuttingSimProxy:
             3.0, max(1.0, 1.0 + 0.035 * max(0.0, tool_temperature_c - 20.0))
         )
 
+        coolant_wear = self._coolant.wear_factor
+
         if cutting_time_min < self.T1:
             # Stage 1: Break-in
             vb = self.VB0 + (self.VB1 - self.VB0) * math.sqrt(
                 cutting_time_min / self.T1
-            )
+            ) * coolant_wear
         elif vb_current < 0.25:
             # Stage 2: Steady-state
             rate = self.C2 * speed_factor * thermal_factor
             rate *= (max(fz_mm, 0.01) / 0.05) ** 0.3
             rate *= (max(ap_mm, 0.1) / 1.0) ** 0.1
+            rate *= coolant_wear
             vb = vb_current + rate * dt_min
         else:
             # Stage 3: Accelerated
             c3 = 0.1 * speed_factor * thermal_factor
+            c3 *= coolant_wear
             vb = vb_current + vb_current * c3 * dt_min
 
         return min(vb, 0.50), cutting_time_min
@@ -429,7 +591,7 @@ class CuttingSimProxy:
             total_power += forces['power_w']
             total_torque += forces['torque_nm']
             total_mrr += forces['mrr']
-            total_temp += forces['power_w'] * 0.05
+            total_temp += forces['power_w'] * 0.05 * self._coolant.thermal_factor
 
         pred = BlockPrediction(
             peak_force_n=total_peak,
@@ -448,6 +610,7 @@ class CuttingSimProxy:
         tool_state: Optional[ToolState] = None,
         parameter_overrides: Optional[Dict[str, float]] = None,
         tool_id: Optional[str] = None,
+        coolant: Optional['CoolantConfig'] = None,
     ) -> SimulationResult:
         """Simulate an entire G-code program and predict forces, wear, and RUL.
 
@@ -458,10 +621,17 @@ class CuttingSimProxy:
             tool_id: Optional tool library ID. If provided, the tool's cutting
                 coefficients, Taylor parameters, and geometry are applied before
                 simulation begins.
+            coolant: Optional CoolantConfig to use for this simulation. If
+                provided, temporarily overrides the instance coolant setting.
 
         Returns:
             SimulationResult with per-block predictions and overall RUL.
         """
+        # Temporarily apply coolant override if provided
+        prev_coolant = self._coolant
+        if coolant is not None:
+            self._coolant = coolant
+
         if tool_id is not None:
             self.set_tool(tool_id)
 
@@ -528,19 +698,27 @@ class CuttingSimProxy:
                 vb, cutting_time, v_mpm, fz, ap, block_time_min
             )
 
-            # Simple thermal estimate
-            temp_rise = forces['power_w'] * 0.05  # Simplified
+            # Thermal estimate modulated by coolant
+            temp_rise = forces['power_w'] * 0.05 * self._coolant.thermal_factor
+
+            # Chip recutting force penalty for poor chip evacuation
+            chip_penalty = 1.0
+            if self._coolant.chip_evacuation_factor > 0.7:
+                # Up to 10% force increase when evacuation is poor
+                chip_penalty = 1.0 + 0.1 * (
+                    (self._coolant.chip_evacuation_factor - 0.7) / 0.3
+                )
 
             peak_force = math.sqrt(
                 forces['fx_peak'] ** 2
                 + forces['fy_peak'] ** 2
                 + forces['fz_peak'] ** 2
-            )
+            ) * chip_penalty
             avg_force = math.sqrt(
                 forces['fx_avg'] ** 2
                 + forces['fy_avg'] ** 2
                 + forces['fz_avg'] ** 2
-            )
+            ) * chip_penalty
 
             pred = BlockPrediction(
                 peak_force_n=peak_force,
@@ -591,6 +769,9 @@ class CuttingSimProxy:
         else:
             action = 'Continue normal operation'
 
+        # Restore previous coolant setting
+        self._coolant = prev_coolant
+
         return SimulationResult(
             block_predictions=block_predictions,
             total_cutting_time_min=total_time,
@@ -608,6 +789,8 @@ class CuttingSimProxy:
         tool_state: Optional[ToolState] = None,
         baseline_params: Optional[Dict[str, float]] = None,
         override_params: Optional[Dict[str, float]] = None,
+        baseline_coolant: Optional['CoolantConfig'] = None,
+        override_coolant: Optional['CoolantConfig'] = None,
     ) -> WhatIfComparison:
         """Run simulation with baseline and override parameters, return comparison.
 
@@ -619,16 +802,20 @@ class CuttingSimProxy:
             tool_state: Current tool state (wear, cutting time).
             baseline_params: Parameter overrides for baseline (None = programmed).
             override_params: Parameter overrides for the what-if scenario.
+            baseline_coolant: CoolantConfig for baseline scenario.
+            override_coolant: CoolantConfig for what-if scenario.
 
         Returns:
             WhatIfComparison with baseline, override, and delta dicts containing:
                 peak_force, rul_minutes, max_ra, chatter_risk
         """
         baseline_result = self.simulate_program(
-            blocks, tool_state=tool_state, parameter_overrides=baseline_params
+            blocks, tool_state=tool_state, parameter_overrides=baseline_params,
+            coolant=baseline_coolant,
         )
         override_result = self.simulate_program(
-            blocks, tool_state=tool_state, parameter_overrides=override_params
+            blocks, tool_state=tool_state, parameter_overrides=override_params,
+            coolant=override_coolant,
         )
 
         # Extract peak force across all blocks

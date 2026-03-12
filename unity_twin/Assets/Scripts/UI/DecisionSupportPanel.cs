@@ -10,24 +10,65 @@ namespace MiracleTwin.UI
     /// <summary>
     /// Operator Decision Support Panel.
     /// Slide-out panel that displays correlated alert details, root cause hypothesis,
-    /// ranked recommended actions, and a what-if feed override slider.
-    /// Subscribes to CorrelatedAlertEventSO and shows/hides on demand.
+    /// ranked recommended actions, and what-if override sliders (feed + spindle RPM).
+    /// Uses CuttingSimProxy predictions via MiracleBridge when available, with an
+    /// improved analytical fallback model (non-linear force, Taylor tool life, chatter risk).
     /// </summary>
     public class DecisionSupportPanel : MonoBehaviour
     {
         [SerializeField] private UIDocument uiDocument;
         [SerializeField] private CorrelatedAlertEventSO onCorrelatedAlert;
+        [SerializeField] private MiracleBridge miracleBridge;
 
         private VisualElement panelRoot;
         private Label situationLabel;
         private Label rootCauseLabel;
         private VisualElement actionsListContainer;
+
+        // Feed override slider
         private Slider whatIfSlider;
-        private Label whatIfResultLabel;
+        private Label whatIfFeedValueLabel;
+
+        // Spindle RPM override slider
+        private Slider spindleSlider;
+        private Label spindleValueLabel;
+
+        // Impact preview section
+        private VisualElement impactPreviewContainer;
+        private Label impactForceLabel;
+        private Label impactToolLifeLabel;
+        private Label impactSurfaceLabel;
+        private Label impactChatterLabel;
+        private Label computingIndicator;
+
+        // Action buttons
+        private Button applyOverrideButton;
+        private Button revertButton;
         private Button closeButton;
 
         private bool isVisible;
         private CorrelatedAlertMsg currentAlert;
+
+        // Debounce state for slider changes
+        private float lastSliderChangeTime;
+        private const float SLIDER_DEBOUNCE_SEC = 0.3f;
+        private bool predictionPending;
+        private float pendingFeedPct;
+        private float pendingSpindlePct;
+
+        // Baseline cutting state cached from alert context
+        private float baselineForceN = 145f;
+        private float baselineToolLifeMin = 32f;
+        private float baselineRa = 0.8f;
+        private float baselineSpindleRPM = 8000f;
+        private float baselineFeedRate = 500f;
+
+        // Known unstable RPM zones (percentage of baseline) for chatter detection
+        private static readonly (float min, float max)[] UnstableZones = new[]
+        {
+            (0.72f, 0.78f),  // 3rd harmonic of natural frequency
+            (1.15f, 1.22f),  // near-resonance zone
+        };
 
         // Contextual action mapping: anomaly type keywords -> recommended action text
         private static readonly Dictionary<string, string> ContextualActionMap = new()
@@ -61,19 +102,163 @@ namespace MiracleTwin.UI
             situationLabel = root.Q<Label>("decision-situation");
             rootCauseLabel = root.Q<Label>("decision-root-cause");
             actionsListContainer = root.Q<VisualElement>("decision-actions-list");
+
+            // Feed override slider
             whatIfSlider = root.Q<Slider>("whatif-slider");
-            whatIfResultLabel = root.Q<Label>("whatif-result");
+            whatIfFeedValueLabel = root.Q<Label>("whatif-feed-value");
+
+            // Spindle RPM override slider
+            spindleSlider = root.Q<Slider>("whatif-spindle-slider");
+            spindleValueLabel = root.Q<Label>("whatif-spindle-value");
+
+            // Impact preview labels
+            impactPreviewContainer = root.Q<VisualElement>("whatif-impact-preview");
+            impactForceLabel = root.Q<Label>("whatif-impact-force");
+            impactToolLifeLabel = root.Q<Label>("whatif-impact-toollife");
+            impactSurfaceLabel = root.Q<Label>("whatif-impact-surface");
+            impactChatterLabel = root.Q<Label>("whatif-impact-chatter");
+            computingIndicator = root.Q<Label>("whatif-computing");
+
+            // Action buttons
+            applyOverrideButton = root.Q<Button>("whatif-apply-btn");
+            revertButton = root.Q<Button>("whatif-revert-btn");
             closeButton = root.Q<Button>("decision-close-btn");
 
             if (closeButton != null)
                 closeButton.clicked += Hide;
 
             if (whatIfSlider != null)
+            {
+                whatIfSlider.lowValue = 50f;
+                whatIfSlider.highValue = 120f;
+                whatIfSlider.value = 100f;
                 whatIfSlider.RegisterValueChangedCallback(OnWhatIfSliderChanged);
+            }
+
+            if (spindleSlider != null)
+            {
+                spindleSlider.lowValue = 50f;
+                spindleSlider.highValue = 120f;
+                spindleSlider.value = 100f;
+                spindleSlider.label = "Spindle RPM Override";
+                spindleSlider.RegisterValueChangedCallback(OnSpindleSliderChanged);
+            }
+
+            if (applyOverrideButton != null)
+                applyOverrideButton.clicked += OnApplyOverride;
+
+            if (revertButton != null)
+                revertButton.clicked += OnRevertOverride;
+
+            // Dynamically create UI elements that may not exist in UXML
+            EnsurePreviewUIExists();
 
             // Start hidden
             isVisible = false;
             panelRoot.RemoveFromClassList("visible");
+
+            // Auto-resolve MiracleBridge if not assigned
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+        }
+
+        /// <summary>
+        /// Create impact preview UI elements programmatically if they are not defined
+        /// in the UXML template. This ensures the panel works even without UXML updates.
+        /// </summary>
+        private void EnsurePreviewUIExists()
+        {
+            if (panelRoot == null) return;
+
+            // Create spindle slider if not in UXML
+            if (spindleSlider == null && whatIfSlider != null)
+            {
+                spindleSlider = new Slider("Spindle RPM Override", 50f, 120f)
+                {
+                    name = "whatif-spindle-slider",
+                    value = 100f
+                };
+                spindleSlider.AddToClassList("whatif-slider");
+                spindleSlider.RegisterValueChangedCallback(OnSpindleSliderChanged);
+
+                spindleValueLabel = new Label("RPM: 100%");
+                spindleValueLabel.name = "whatif-spindle-value";
+                spindleValueLabel.AddToClassList("whatif-value-label");
+
+                // Insert after feed slider
+                int feedIdx = panelRoot.IndexOf(whatIfSlider.parent ?? whatIfSlider);
+                if (feedIdx >= 0)
+                {
+                    panelRoot.Insert(feedIdx + 1, spindleSlider);
+                    panelRoot.Insert(feedIdx + 2, spindleValueLabel);
+                }
+                else
+                {
+                    panelRoot.Add(spindleSlider);
+                    panelRoot.Add(spindleValueLabel);
+                }
+            }
+
+            // Create impact preview container if not in UXML
+            if (impactPreviewContainer == null)
+            {
+                impactPreviewContainer = new VisualElement { name = "whatif-impact-preview" };
+                impactPreviewContainer.AddToClassList("whatif-impact-preview");
+
+                var header = new Label("Preview Impact");
+                header.AddToClassList("whatif-impact-header");
+                impactPreviewContainer.Add(header);
+
+                computingIndicator = new Label("") { name = "whatif-computing" };
+                computingIndicator.AddToClassList("whatif-computing");
+                impactPreviewContainer.Add(computingIndicator);
+
+                impactForceLabel = new Label("Force:     -- -> --") { name = "whatif-impact-force" };
+                impactForceLabel.AddToClassList("whatif-impact-row");
+                impactPreviewContainer.Add(impactForceLabel);
+
+                impactToolLifeLabel = new Label("Tool Life: -- -> --") { name = "whatif-impact-toollife" };
+                impactToolLifeLabel.AddToClassList("whatif-impact-row");
+                impactPreviewContainer.Add(impactToolLifeLabel);
+
+                impactSurfaceLabel = new Label("Surface:   -- -> --") { name = "whatif-impact-surface" };
+                impactSurfaceLabel.AddToClassList("whatif-impact-row");
+                impactPreviewContainer.Add(impactSurfaceLabel);
+
+                impactChatterLabel = new Label("Chatter:   -- -> --") { name = "whatif-impact-chatter" };
+                impactChatterLabel.AddToClassList("whatif-impact-row");
+                impactPreviewContainer.Add(impactChatterLabel);
+
+                panelRoot.Add(impactPreviewContainer);
+            }
+
+            // Create Apply/Revert buttons if not in UXML
+            if (applyOverrideButton == null)
+            {
+                var buttonRow = new VisualElement();
+                buttonRow.AddToClassList("whatif-button-row");
+                buttonRow.style.flexDirection = FlexDirection.Row;
+
+                applyOverrideButton = new Button(OnApplyOverride) { text = "Apply Override", name = "whatif-apply-btn" };
+                applyOverrideButton.AddToClassList("whatif-apply-btn");
+
+                revertButton = new Button(OnRevertOverride) { text = "Revert to Programmed", name = "whatif-revert-btn" };
+                revertButton.AddToClassList("whatif-revert-btn");
+
+                buttonRow.Add(applyOverrideButton);
+                buttonRow.Add(revertButton);
+                panelRoot.Add(buttonRow);
+            }
+        }
+
+        void Update()
+        {
+            // Process debounced slider changes
+            if (predictionPending && Time.time - lastSliderChangeTime >= SLIDER_DEBOUNCE_SEC)
+            {
+                predictionPending = false;
+                RequestWhatIfPrediction(pendingFeedPct, pendingSpindlePct);
+            }
         }
 
         /// <summary>Show the decision support panel with slide-in animation.</summary>
@@ -131,12 +316,14 @@ namespace MiracleTwin.UI
             // Recommended Actions
             PopulateActions(msg);
 
-            // Reset what-if slider
+            // Reset sliders
             if (whatIfSlider != null)
                 whatIfSlider.value = 100f;
+            if (spindleSlider != null)
+                spindleSlider.value = 100f;
 
-            if (whatIfResultLabel != null)
-                whatIfResultLabel.text = "";
+            // Clear impact preview
+            ClearImpactPreview();
         }
 
         private void PopulateActions(CorrelatedAlertMsg msg)
@@ -213,30 +400,259 @@ namespace MiracleTwin.UI
             return true;
         }
 
+        // --- Slider Callbacks (debounced) ---
+
         private void OnWhatIfSliderChanged(ChangeEvent<float> evt)
         {
-            if (whatIfResultLabel == null || currentAlert == null) return;
+            float feedPct = evt.newValue;
+            float spindlePct = spindleSlider != null ? spindleSlider.value : 100f;
 
-            float feedOverride = evt.newValue;
-            float baseImpact = (float)currentAlert.estimated_impact;
+            UpdateSliderValueLabels(feedPct, spindlePct);
+            SchedulePrediction(feedPct, spindlePct);
+        }
 
-            // Simulate: lower feed override reduces force proportionally, reducing anomaly impact
-            float adjustedImpact = baseImpact * (feedOverride / 100f);
-            float reduction = baseImpact - adjustedImpact;
+        private void OnSpindleSliderChanged(ChangeEvent<float> evt)
+        {
+            float feedPct = whatIfSlider != null ? whatIfSlider.value : 100f;
+            float spindlePct = evt.newValue;
 
-            string result;
-            if (feedOverride < 100f)
+            UpdateSliderValueLabels(feedPct, spindlePct);
+            SchedulePrediction(feedPct, spindlePct);
+        }
+
+        private void UpdateSliderValueLabels(float feedPct, float spindlePct)
+        {
+            if (whatIfFeedValueLabel != null)
+                whatIfFeedValueLabel.text = $"Feed: {feedPct:F0}% ({baselineFeedRate * feedPct / 100f:F0} mm/min)";
+
+            if (spindleValueLabel != null)
+                spindleValueLabel.text = $"RPM: {spindlePct:F0}% ({baselineSpindleRPM * spindlePct / 100f:F0} RPM)";
+        }
+
+        private void SchedulePrediction(float feedPct, float spindlePct)
+        {
+            pendingFeedPct = feedPct;
+            pendingSpindlePct = spindlePct;
+            lastSliderChangeTime = Time.time;
+            predictionPending = true;
+
+            // Show computing indicator
+            if (computingIndicator != null)
+                computingIndicator.text = "Computing...";
+        }
+
+        // --- Prediction Request ---
+
+        /// <summary>
+        /// Request a what-if prediction. Tries MiracleBridge prediction service first,
+        /// falls back to improved analytical model if unavailable.
+        /// </summary>
+        private void RequestWhatIfPrediction(float feedOverridePct, float spindleOverridePct)
+        {
+            if (currentAlert == null)
             {
-                result = $"At {feedOverride:F0}% feed: estimated impact drops from " +
-                         $"{baseImpact:F1} to {adjustedImpact:F1} " +
-                         $"(reduction: {reduction:F1})";
+                ApplyAnalyticalFallback(feedOverridePct, spindleOverridePct);
+                return;
+            }
+
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+
+            if (miracleBridge != null)
+            {
+                miracleBridge.RequestPrediction(feedOverridePct, spindleOverridePct, result =>
+                {
+                    if (result != null)
+                    {
+                        DisplayPredictionResult(result);
+                    }
+                    else
+                    {
+                        // Service unavailable — use analytical fallback
+                        ApplyAnalyticalFallback(feedOverridePct, spindleOverridePct);
+                    }
+                });
             }
             else
             {
-                result = "Current feed rate: no override applied.";
+                ApplyAnalyticalFallback(feedOverridePct, spindleOverridePct);
+            }
+        }
+
+        // --- Improved Analytical Fallback Model ---
+
+        /// <summary>
+        /// Analytical fallback when prediction service is unavailable.
+        /// Uses non-linear models instead of simple linear scaling:
+        ///   - Force proportional to feed^0.8 (chip load saturation)
+        ///   - Tool life via Taylor equation ratio: life proportional to (1/speed)^(1/n)
+        ///   - Surface roughness proportional to feed^2 / (nose_radius) approximation
+        ///   - Chatter risk from known unstable RPM zones
+        /// </summary>
+        private void ApplyAnalyticalFallback(float feedPct, float spindlePct)
+        {
+            float feedRatio = feedPct / 100f;
+            float spindleRatio = spindlePct / 100f;
+
+            // Force: F proportional to feed^0.8 (non-linear chip load saturation)
+            // At low feed, force doesn't drop linearly because edge forces dominate
+            float forceMultiplier = Mathf.Pow(feedRatio, 0.8f);
+            float predictedForce = baselineForceN * forceMultiplier;
+            float forceDeltaPct = (predictedForce - baselineForceN) / baselineForceN * 100f;
+
+            // Tool life: Taylor equation — T proportional to (1/V)^(1/n)
+            // For HSS on 6061-T6: n ~ 0.125
+            // Life ratio = (V_base / V_new)^(1/n) = (1/spindleRatio)^(1/0.125) = (1/spindleRatio)^8
+            // Also account for feed effect: life proportional to (1/feed)^(a/n) where a~0.5
+            // -> feed factor = (1/feedRatio)^(0.5/0.125) = (1/feedRatio)^4
+            float taylorN = 0.125f;
+            float taylorA = 0.5f;
+            float speedLifeFactor = Mathf.Pow(1f / Mathf.Max(spindleRatio, 0.01f), 1f / taylorN);
+            float feedLifeFactor = Mathf.Pow(1f / Mathf.Max(feedRatio, 0.01f), taylorA / taylorN);
+
+            // Clamp life multiplier to avoid extreme values from Taylor exponents
+            float lifeMultiplier = Mathf.Clamp(speedLifeFactor * feedLifeFactor, 0.01f, 100f);
+            float predictedToolLife = baselineToolLifeMin * lifeMultiplier;
+            float toolLifeDeltaPct = (predictedToolLife - baselineToolLifeMin) / baselineToolLifeMin * 100f;
+
+            // Surface roughness: Ra proportional to f^2 / (8 * r) — theoretical finish
+            // Ratio: Ra_new / Ra_base = (feed_new / feed_base)^2 = feedRatio^2
+            // Spindle effect: higher RPM generally improves finish slightly
+            float raMultiplier = Mathf.Pow(feedRatio, 2f) * Mathf.Pow(1f / Mathf.Max(spindleRatio, 0.01f), 0.1f);
+            float predictedRa = baselineRa * raMultiplier;
+            string qualityChange = predictedRa < baselineRa * 0.95f ? "improved"
+                : predictedRa > baselineRa * 1.05f ? "degraded"
+                : "unchanged";
+
+            // Chatter risk: check if RPM override moves into known unstable zone
+            string baseChatter = EvaluateChatterRisk(1.0f);
+            string predictedChatter = EvaluateChatterRisk(spindleRatio);
+
+            var result = new MiracleBridge.PredictionResult
+            {
+                BaselineForceN = baselineForceN,
+                PredictedForceN = predictedForce,
+                ForceDeltaPct = forceDeltaPct,
+                BaselineToolLifeMin = baselineToolLifeMin,
+                PredictedToolLifeMin = predictedToolLife,
+                ToolLifeDeltaPct = toolLifeDeltaPct,
+                BaselineRa = baselineRa,
+                PredictedRa = predictedRa,
+                QualityChange = qualityChange,
+                BaselineChatterRisk = baseChatter,
+                PredictedChatterRisk = predictedChatter,
+                Confidence = 0.6f,  // Lower confidence for analytical fallback
+                FromService = false
+            };
+
+            DisplayPredictionResult(result);
+        }
+
+        /// <summary>
+        /// Evaluate chatter risk based on RPM ratio relative to known unstable zones.
+        /// </summary>
+        private static string EvaluateChatterRisk(float rpmRatio)
+        {
+            foreach (var zone in UnstableZones)
+            {
+                if (rpmRatio >= zone.min && rpmRatio <= zone.max)
+                    return "HIGH";
+                // Near an unstable zone boundary
+                float distToZone = Mathf.Min(
+                    Mathf.Abs(rpmRatio - zone.min),
+                    Mathf.Abs(rpmRatio - zone.max));
+                if (distToZone < 0.03f)
+                    return "MEDIUM";
+            }
+            return "LOW";
+        }
+
+        // --- Display ---
+
+        private void DisplayPredictionResult(MiracleBridge.PredictionResult result)
+        {
+            if (computingIndicator != null)
+                computingIndicator.text = result.FromService ? "" : "(analytical estimate)";
+
+            if (impactForceLabel != null)
+            {
+                string sign = result.ForceDeltaPct >= 0 ? "+" : "";
+                impactForceLabel.text =
+                    $"Force:     {result.BaselineForceN:F0}N -> {result.PredictedForceN:F0}N ({sign}{result.ForceDeltaPct:F0}%)";
             }
 
-            whatIfResultLabel.text = result;
+            if (impactToolLifeLabel != null)
+            {
+                string sign = result.ToolLifeDeltaPct >= 0 ? "+" : "";
+                impactToolLifeLabel.text =
+                    $"Tool Life: {result.BaselineToolLifeMin:F0}min -> {result.PredictedToolLifeMin:F0}min ({sign}{result.ToolLifeDeltaPct:F0}%)";
+            }
+
+            if (impactSurfaceLabel != null)
+            {
+                impactSurfaceLabel.text =
+                    $"Surface:   Ra {result.BaselineRa:F1} -> Ra {result.PredictedRa:F1} ({result.QualityChange})";
+            }
+
+            if (impactChatterLabel != null)
+            {
+                string stability = result.PredictedChatterRisk == result.BaselineChatterRisk
+                    ? "stable"
+                    : "CHANGED";
+                impactChatterLabel.text =
+                    $"Chatter:   {result.BaselineChatterRisk} -> {result.PredictedChatterRisk} ({stability})";
+            }
+        }
+
+        private void ClearImpactPreview()
+        {
+            if (computingIndicator != null) computingIndicator.text = "";
+            if (impactForceLabel != null) impactForceLabel.text = "Force:     -- -> --";
+            if (impactToolLifeLabel != null) impactToolLifeLabel.text = "Tool Life: -- -> --";
+            if (impactSurfaceLabel != null) impactSurfaceLabel.text = "Surface:   -- -> --";
+            if (impactChatterLabel != null) impactChatterLabel.text = "Chatter:   -- -> --";
+        }
+
+        // --- Override Application ---
+
+        private void OnApplyOverride()
+        {
+            float feedPct = whatIfSlider != null ? whatIfSlider.value : 100f;
+            float spindlePct = spindleSlider != null ? spindleSlider.value : 100f;
+
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+
+            if (miracleBridge != null)
+            {
+                string reason = $"Operator what-if override: feed={feedPct:F0}%, spindle={spindlePct:F0}%";
+                miracleBridge.PublishFeedOverride(feedPct, spindlePct, reason);
+                Debug.Log($"[DecisionSupportPanel] Applied override: feed={feedPct}%, spindle={spindlePct}%");
+            }
+            else
+            {
+                Debug.LogWarning("[DecisionSupportPanel] Cannot apply override: MiracleBridge not available.");
+            }
+        }
+
+        private void OnRevertOverride()
+        {
+            // Reset sliders to 100%
+            if (whatIfSlider != null)
+                whatIfSlider.value = 100f;
+            if (spindleSlider != null)
+                spindleSlider.value = 100f;
+
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+
+            if (miracleBridge != null)
+            {
+                miracleBridge.PublishFeedOverride(100f, 100f, "Operator reverted to programmed values");
+                Debug.Log("[DecisionSupportPanel] Reverted to programmed values (100%/100%).");
+            }
+
+            ClearImpactPreview();
         }
 
         void OnDestroy()
@@ -246,6 +662,15 @@ namespace MiracleTwin.UI
 
             if (whatIfSlider != null)
                 whatIfSlider.UnregisterValueChangedCallback(OnWhatIfSliderChanged);
+
+            if (spindleSlider != null)
+                spindleSlider.UnregisterValueChangedCallback(OnSpindleSliderChanged);
+
+            if (applyOverrideButton != null)
+                applyOverrideButton.clicked -= OnApplyOverride;
+
+            if (revertButton != null)
+                revertButton.clicked -= OnRevertOverride;
         }
     }
 }

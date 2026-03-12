@@ -14,6 +14,21 @@ from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import KnowledgeUpdate
 
+try:
+    from miracle_msgs.msg import InferredAction
+except ImportError:
+    InferredAction = None
+
+
+# Maps (predicate, object) from rule conclusions to actionable control types
+_ACTION_MAPPING = {
+    ('requires', 'FeedRateReduction'): 'REDUCE_FEED',
+    ('causesRisk', 'QualityDrop'): 'TOOL_CHANGE',
+    ('mayHave', 'Chatter'): 'REDUCE_SPEED',
+    ('requires', 'CoolantIncrease'): 'COOLANT_INCREASE',
+    ('requires', 'EmergencyStop'): 'PAUSE',
+}
+
 
 @dataclass
 class Rule:
@@ -40,6 +55,7 @@ class ReasoningEngineNode(MiracleLifecycleNode):
         self._lock = threading.Lock()
         self._update_sub = None
         self._inference_pub = None
+        self._action_pub = None
         self._reason_timer = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
@@ -55,6 +71,13 @@ class ReasoningEngineNode(MiracleLifecycleNode):
         self._inference_pub = self.create_publisher(
             KnowledgeUpdate, 'inferences', QoSProfiles.state_data(),
         )
+
+        if InferredAction is not None:
+            self._action_pub = self.create_publisher(
+                InferredAction,
+                '/miracle/cognitive/inferred_actions',
+                QoSProfiles.state_data(),
+            )
 
         self._load_manufacturing_rules()
         self.get_logger().info("Reasoning engine configured")
@@ -92,6 +115,27 @@ class ReasoningEngineNode(MiracleLifecycleNode):
                 conditions=[('?machine', 'hasSpindleLoad', 'OVERLOAD')],
                 conclusion=('?machine', 'requires', 'FeedRateReduction'),
             ),
+            Rule(
+                name='thermal_overload_requires_coolant',
+                conditions=[('?machine', 'hasTemperature', 'CRITICAL')],
+                conclusion=('?machine', 'requires', 'CoolantIncrease'),
+                confidence=0.85,
+            ),
+            Rule(
+                name='combined_wear_vibration_requires_stop',
+                conditions=[
+                    ('?machine', 'hasWearLevel', 'HIGH'),
+                    ('?machine', 'hasVibrationLevel', 'HIGH'),
+                ],
+                conclusion=('?machine', 'requires', 'EmergencyStop'),
+                confidence=0.95,
+            ),
+            Rule(
+                name='sustained_overload_degrades_tool',
+                conditions=[('?machine', 'hasSpindleLoad', 'OVERLOAD')],
+                conclusion=('?machine', 'causesRisk', 'ToolDegradation'),
+                confidence=0.8,
+            ),
         ]
 
     def _on_knowledge_update(self, msg: KnowledgeUpdate) -> None:
@@ -124,6 +168,24 @@ class ReasoningEngineNode(MiracleLifecycleNode):
                 msg.source = 'reasoning_engine'
                 msg.reasoning = 'forward_chaining'
                 self._inference_pub.publish(msg)
+
+                # Publish actionable inference if it maps to a control action
+                action_type = _ACTION_MAPPING.get((p, o))
+                if action_type is not None and self._action_pub is not None and InferredAction is not None:
+                    action_msg = InferredAction()
+                    action_msg.timestamp = self.get_clock().now().to_msg()
+                    action_msg.machine_id = s
+                    action_msg.inference_rule = msg.reasoning
+                    action_msg.action_type = action_type
+                    action_msg.subject = s
+                    action_msg.predicate = p
+                    action_msg.object_value = o
+                    action_msg.confidence = c
+                    action_msg.reasoning = f'{action_type} triggered by ({s}, {p}, {o}) conf={c:.2f}'
+                    self._action_pub.publish(action_msg)
+                    self.get_logger().info(
+                        f"Published inferred action: {action_type} for {s} (confidence={c:.2f})"
+                    )
 
     def _match_rule(self, rule: Rule) -> List[Dict[str, str]]:
         """Find variable bindings that satisfy rule conditions."""

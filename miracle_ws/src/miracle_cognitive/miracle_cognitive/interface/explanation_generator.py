@@ -22,6 +22,12 @@ from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import AnomalyAlert, Explanation
 
+try:
+    from miracle_cognitive.knowledge.causal_inference import CausalLink
+except ImportError:
+    # Graceful fallback when ROS2 deps are mocked (e.g. in tests)
+    CausalLink = None  # type: ignore[misc,assignment]
+
 
 @dataclass
 class FeatureContribution:
@@ -107,6 +113,27 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         'typical_features': ['sensor_reading', 'threshold'],
     }
 
+    # ---- Causal-inference integration ------------------------------------
+
+    # Maps anomaly_type strings to causal graph node names.
+    _ANOMALY_TO_EFFECTS: Dict[str, str] = {
+        'vibration_anomaly': 'Vibration',
+        'force_anomaly': 'ToolWear',
+        'thermal_anomaly': 'ThermalExpansion',
+        'tool_wear_anomaly': 'ToolWear',
+        'surface_quality_anomaly': 'SurfaceRoughnessIncrease',
+    }
+
+    # Maps root-cause node names to actionable counterfactual text.
+    _CAUSAL_COUNTERFACTUALS: Dict[str, str] = {
+        'HighFeedRate': 'Reducing the feed rate would lower tool stress and prevent downstream wear effects.',
+        'HighSpindleSpeed': 'Lowering spindle speed would reduce thermal expansion and improve dimensional accuracy.',
+        'ImproperToolpath': 'Correcting the toolpath strategy would eliminate chatter and improve surface finish.',
+        'WornBearing': 'Inspecting and replacing the worn bearing would eliminate the vibration source.',
+        'LowCoolant': 'Restoring adequate coolant flow would prevent thermal damage to the workpiece.',
+        'ToolWear': 'Replacing the worn tool would restore cutting performance and surface quality.',
+    }
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(
             'explanation_generator',
@@ -118,6 +145,17 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         self._history_size: int = 500
         self._detail_level: str = 'medium'
         self._explanation_pub = None
+
+        # Causal links mirroring causal_inference._init_causal_model().
+        # Stored as effect -> (cause, strength) for backward tracing.
+        self._causal_links: Dict[str, Tuple[str, float]] = {
+            'ToolWear': ('HighFeedRate', 0.7),
+            'SurfaceRoughnessIncrease': ('ToolWear', 0.8),
+            'ThermalExpansion': ('HighSpindleSpeed', 0.6),
+            'Chatter': ('ImproperToolpath', 0.75),
+            'Vibration': ('WornBearing', 0.85),
+            'ThermalDamage': ('LowCoolant', 0.9),
+        }
 
     def _do_configure(self) -> TransitionCallbackReturn:
         params = self.declare_and_validate_parameters({
@@ -211,6 +249,15 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
 
         summary = template['summary'].format(**fmt_kwargs)
         counterfactual = template['counterfactual'].format(**fmt_kwargs)
+
+        # Enhance counterfactual with causal root-cause insight
+        causal_result = self._build_causal_chain(anomaly_type, severity)
+        if causal_result is not None:
+            chain, confidence = causal_result
+            root_cause = chain[0]
+            causal_cf = self._CAUSAL_COUNTERFACTUALS.get(root_cause)
+            if causal_cf:
+                counterfactual += f' Causal insight ({confidence:.0%} confidence): {causal_cf}'
 
         # Add temporal context from historical resolution data
         temporal_context = self._get_temporal_resolution_context(
@@ -334,6 +381,44 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         variance = sum((s - mean) ** 2 for s in severities) / len(severities)
         return variance
 
+    # ---- Causal chain helpers --------------------------------------------
+
+    def _build_causal_chain(
+        self, anomaly_type: str, severity: float,
+    ) -> Optional[Tuple[List[str], float]]:
+        """Trace backward through causal links to find the root cause chain.
+
+        Returns ``(chain, confidence)`` where *chain* is a list of node names
+        from root cause to the observed effect (e.g.
+        ``['HighFeedRate', 'ToolWear', 'SurfaceRoughnessIncrease']``) and
+        *confidence* is the product of the individual link strengths.
+
+        Returns ``None`` when the anomaly type has no mapping in the causal
+        graph.
+        """
+        effect = self._ANOMALY_TO_EFFECTS.get(anomaly_type)
+        if effect is None:
+            return None
+
+        chain: List[str] = [effect]
+        confidence: float = 1.0
+
+        current = effect
+        visited = {current}
+        while current in self._causal_links:
+            cause, strength = self._causal_links[current]
+            if cause in visited:
+                break  # prevent cycles
+            confidence *= strength
+            chain.insert(0, cause)
+            visited.add(cause)
+            current = cause
+
+        if len(chain) < 2:
+            return None
+
+        return chain, confidence
+
     def _build_detail(
         self, prefix: str, features: List[FeatureContribution],
         severity: float, recommended_action: str,
@@ -350,6 +435,25 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
                     f'  {i}. {f.feature_name}: {f.contribution_pct:.1f}% contribution '
                     f'(value={f.value:.3f}{threshold_str}{ci_str})'
                 )
+
+        # Causal analysis section
+        causal_result = self._build_causal_chain(anomaly_type, severity)
+        if causal_result is not None:
+            chain, confidence = causal_result
+            chain_str = ' \u2192 '.join(chain)
+            root_cause = chain[0]
+            lines.append('\nCausal analysis:')
+            lines.append(f'  Root cause hypothesis: {root_cause} (confidence: {confidence:.0%})')
+            lines.append(f'  Causal chain: {chain_str}')
+            # Show individual link strengths
+            link_details = []
+            for i in range(len(chain) - 1):
+                src, dst = chain[i], chain[i + 1]
+                if dst in self._causal_links:
+                    _, strength = self._causal_links[dst]
+                    link_details.append(f'{src}\u2192{dst} ({strength:.0%})')
+            if link_details:
+                lines.append(f'  Link strengths: {", ".join(link_details)}')
 
         context = self._get_historical_context(machine_id, anomaly_type)
         if context:

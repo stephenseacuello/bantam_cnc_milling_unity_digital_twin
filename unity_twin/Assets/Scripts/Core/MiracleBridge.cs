@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 using Unity.Robotics.ROSTCPConnector;
 using RosMessageTypes.Miracle;
@@ -49,6 +50,7 @@ namespace MiracleTwin.Core
         [SerializeField] private CuttingStateEventSO onCuttingState;
         [SerializeField] private RobotJointStateEventSO onRobotJointState;
         [SerializeField] private FeedOverrideEventSO onFeedOverride;
+        [SerializeField] private StabilityRecommendationEventSO onStabilityRecommendation;
 
         /// <summary>True when the ROS TCP bridge connection is established and healthy.</summary>
         public bool IsConnected { get; private set; }
@@ -236,6 +238,10 @@ namespace MiracleTwin.Core
             if (enableHeartbeat)
                 ros.RegisterPublisher<HeartbeatMsg>("/miracle/unity/heartbeat");
             ros.RegisterPublisher<RobotJointStateMsg>("/miracle/robots/joint_states");
+            ros.RegisterPublisher<FeedOverrideMsg>(
+                $"/miracle/{machineId}/feed_override_cmd");
+            ros.RegisterPublisher<StabilityRecommendationMsg>(
+                $"/miracle/{machineId}/stability_recommendation");
         }
 
         private void RegisterServices()
@@ -246,6 +252,8 @@ namespace MiracleTwin.Core
                 "/miracle/mes/validate_gcode");
             ros.RegisterRosService<GetFleetStatusRequest, GetFleetStatusResponse>(
                 "/miracle/fleet/get_status");
+            ros.RegisterRosService<RunPredictionRequest, RunPredictionResponse>(
+                "/miracle/twin/run_prediction");
         }
 
         // --- Subscription Callbacks ---
@@ -381,6 +389,17 @@ namespace MiracleTwin.Core
             ros.Publish("/miracle/robots/joint_states", msg);
         }
 
+        /// <summary>Publish a stability recommendation to ROS2 and raise the event channel.</summary>
+        public void PublishStabilityRecommendation(StabilityRecommendationMsg msg)
+        {
+            if (ros == null) return;
+
+            string topic = $"/miracle/{msg.machine_id}/stability_recommendation";
+            ros.Publish(topic, msg);
+            TryRecord(topic, msg);
+            onStabilityRecommendation?.Raise(msg);
+        }
+
         // --- Service Calls ---
         public void CallEStop(string reason, Action<TriggerEStopResponse> callback)
         {
@@ -417,6 +436,184 @@ namespace MiracleTwin.Core
                 "/miracle/mes/validate_gcode", request, callback);
         }
 
+        // --- What-If Prediction ---
+
+        /// <summary>
+        /// Result of a what-if prediction, returned from the prediction service
+        /// or computed locally as a fallback.
+        /// </summary>
+        public class PredictionResult
+        {
+            public float BaselineForceN;
+            public float PredictedForceN;
+            public float ForceDeltaPct;
+            public float BaselineToolLifeMin;
+            public float PredictedToolLifeMin;
+            public float ToolLifeDeltaPct;
+            public float BaselineRa;
+            public float PredictedRa;
+            public string QualityChange;
+            public string BaselineChatterRisk;
+            public string PredictedChatterRisk;
+            public float Confidence;
+            public bool FromService;
+        }
+
+        /// <summary>
+        /// Request a what-if prediction via the ROS prediction service.
+        /// Falls back to null callback if service unavailable.
+        /// </summary>
+        /// <param name="feedOverridePct">Feed override percentage (e.g. 80 = 80%).</param>
+        /// <param name="spindleOverridePct">Spindle RPM override percentage.</param>
+        /// <param name="callback">Callback invoked on main thread with result, or null if service unavailable.</param>
+        public void RequestPrediction(float feedOverridePct, float spindleOverridePct, Action<PredictionResult> callback)
+        {
+            if (!IsConnected || !enableServiceRegistration)
+            {
+                Debug.Log("[MiracleBridge] Prediction service unavailable, returning null for fallback.");
+                callback?.Invoke(null);
+                return;
+            }
+
+            var request = new RunPredictionRequest
+            {
+                machine_id = machineId,
+                scenario_type = $"what_if:feed={feedOverridePct},spindle={spindleOverridePct}",
+                prediction_horizon_hours = 1.0
+            };
+
+            try
+            {
+                ros.SendServiceMessage<RunPredictionResponse>(
+                    "/miracle/twin/run_prediction", request, response =>
+                    {
+                        if (response == null || !response.success)
+                        {
+                            callback?.Invoke(null);
+                            return;
+                        }
+
+                        // Parse the detailed_report_json for prediction values
+                        var result = ParsePredictionResponse(response, feedOverridePct, spindleOverridePct);
+                        callback?.Invoke(result);
+                    });
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[MiracleBridge] Prediction service call failed: {ex.Message}");
+                callback?.Invoke(null);
+            }
+        }
+
+        private PredictionResult ParsePredictionResponse(RunPredictionResponse response, float feedPct, float spindlePct)
+        {
+            var result = new PredictionResult
+            {
+                Confidence = (float)response.confidence,
+                FromService = true
+            };
+
+            // Try to parse JSON report for detailed values
+            try
+            {
+                string json = response.detailed_report_json ?? "";
+                // Simple JSON value extraction (avoids JsonUtility dependency for flat dicts)
+                result.BaselineForceN = ExtractJsonFloat(json, "baseline_force", 145f);
+                result.PredictedForceN = ExtractJsonFloat(json, "predicted_force", 145f * feedPct / 100f);
+                result.BaselineToolLifeMin = ExtractJsonFloat(json, "baseline_life_min", 32f);
+                result.PredictedToolLifeMin = ExtractJsonFloat(json, "predicted_life_min", 32f);
+                result.BaselineRa = ExtractJsonFloat(json, "baseline_ra", 0.8f);
+                result.PredictedRa = ExtractJsonFloat(json, "predicted_ra", 0.8f);
+                result.BaselineChatterRisk = ExtractJsonString(json, "baseline_chatter", "LOW");
+                result.PredictedChatterRisk = ExtractJsonString(json, "predicted_chatter", "LOW");
+            }
+            catch
+            {
+                // If JSON parsing fails, set reasonable defaults
+                result.BaselineForceN = 145f;
+                result.PredictedForceN = 145f * feedPct / 100f;
+                result.BaselineToolLifeMin = 32f;
+                result.PredictedToolLifeMin = 32f;
+                result.BaselineRa = 0.8f;
+                result.PredictedRa = 0.8f;
+                result.BaselineChatterRisk = "LOW";
+                result.PredictedChatterRisk = "LOW";
+            }
+
+            // Compute deltas
+            if (result.BaselineForceN > 0)
+                result.ForceDeltaPct = (result.PredictedForceN - result.BaselineForceN) / result.BaselineForceN * 100f;
+            if (result.BaselineToolLifeMin > 0)
+                result.ToolLifeDeltaPct = (result.PredictedToolLifeMin - result.BaselineToolLifeMin) / result.BaselineToolLifeMin * 100f;
+
+            result.QualityChange = result.PredictedRa < result.BaselineRa ? "improved"
+                : result.PredictedRa > result.BaselineRa ? "degraded"
+                : "unchanged";
+
+            return result;
+        }
+
+        private static float ExtractJsonFloat(string json, string key, float fallback)
+        {
+            string pattern = $"\"{key}\"";
+            int idx = json.IndexOf(pattern, StringComparison.Ordinal);
+            if (idx < 0) return fallback;
+            idx = json.IndexOf(':', idx + pattern.Length);
+            if (idx < 0) return fallback;
+            int start = idx + 1;
+            int end = start;
+            while (end < json.Length && json[end] != ',' && json[end] != '}') end++;
+            if (float.TryParse(json.Substring(start, end - start).Trim(), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float val))
+                return val;
+            return fallback;
+        }
+
+        private static string ExtractJsonString(string json, string key, string fallback)
+        {
+            string pattern = $"\"{key}\"";
+            int idx = json.IndexOf(pattern, StringComparison.Ordinal);
+            if (idx < 0) return fallback;
+            idx = json.IndexOf(':', idx + pattern.Length);
+            if (idx < 0) return fallback;
+            int qStart = json.IndexOf('"', idx + 1);
+            if (qStart < 0) return fallback;
+            int qEnd = json.IndexOf('"', qStart + 1);
+            if (qEnd < 0) return fallback;
+            return json.Substring(qStart + 1, qEnd - qStart - 1);
+        }
+
+        /// <summary>
+        /// Publish a feed/spindle override command to the adaptive controller.
+        /// </summary>
+        /// <param name="feedPct">Feed override percentage (100 = programmed).</param>
+        /// <param name="spindlePct">Spindle RPM override percentage (100 = programmed).</param>
+        /// <param name="reason">Human-readable reason for the override.</param>
+        public void PublishFeedOverride(float feedPct, float spindlePct, string reason)
+        {
+            if (ros == null)
+            {
+                Debug.LogWarning("[MiracleBridge] Cannot publish feed override: no ROS connection.");
+                return;
+            }
+
+            var msg = new FeedOverrideMsg
+            {
+                timestamp = new RosMessageTypes.BuiltinInterfaces.TimeMsg(),
+                machine_id = machineId,
+                feed_override_pct = feedPct,
+                spindle_override_pct = spindlePct,
+                reason = reason ?? "",
+                confidence = 1.0,
+                revert_after_sec = 0.0
+            };
+
+            string topic = $"/miracle/{machineId}/feed_override_cmd";
+            ros.Publish(topic, msg);
+            TryRecord(topic, msg);
+            Debug.Log($"[MiracleBridge] Published feed override: feed={feedPct}%, spindle={spindlePct}%, reason={reason}");
+        }
+
 #if UNITY_EDITOR
         void OnValidate()
         {
@@ -431,6 +628,7 @@ namespace MiracleTwin.Core
             if (onCuttingState == null) Debug.LogWarning("[MiracleBridge] onCuttingState event channel not assigned.", this);
             if (onRobotJointState == null) Debug.LogWarning("[MiracleBridge] onRobotJointState event channel not assigned.", this);
             if (onFeedOverride == null) Debug.LogWarning("[MiracleBridge] onFeedOverride event channel not assigned.", this);
+            if (onStabilityRecommendation == null) Debug.LogWarning("[MiracleBridge] onStabilityRecommendation event channel not assigned.", this);
             if (requireTLS && rosBridgePort == 10000)
                 Debug.LogWarning("[MiracleBridge] TLS enabled but port is 10000 (plaintext). Use 10001 for TLS.", this);
         }

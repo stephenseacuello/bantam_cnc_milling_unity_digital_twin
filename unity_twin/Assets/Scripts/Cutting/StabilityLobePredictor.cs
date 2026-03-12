@@ -1,5 +1,6 @@
 using UnityEngine;
 using System;
+using RosMessageTypes.Miracle;
 
 namespace MiracleTwin.Cutting
 {
@@ -182,6 +183,48 @@ namespace MiracleTwin.Cutting
             float apLim = CalculateStabilityLimit(rpm);
             if (apLim <= 0) return 1f;
             return Mathf.Clamp01(depthMM / apLim);
+        }
+
+        /// <summary>
+        /// Build a structured stability recommendation for the given operating point.
+        /// Includes risk level, recommended RPM, max stable depth, stability margin,
+        /// and a human-readable recommendation string.
+        /// </summary>
+        public StabilityRecommendationMsg GetStabilityRecommendation(string machineId, float rpm, float depthMM)
+        {
+            var risk = EvaluateChatterRisk(rpm, depthMM);
+            float apLim = LastStabilityLimit;
+            float recommendedRPM = RecommendStableRPM(rpm, depthMM);
+            float margin = apLim > 0 ? Mathf.Clamp01(1f - depthMM / apLim) : 0f;
+
+            string riskStr = risk.ToString();
+            string text;
+
+            switch (risk)
+            {
+                case ChatterRisk.HIGH:
+                    text = $"Chatter risk HIGH. Reduce depth below {apLim:F2}mm or change RPM to {recommendedRPM:F0}. " +
+                           $"Current depth {depthMM:F2}mm exceeds {highRiskMargin * 100f:F0}% of stability limit.";
+                    break;
+                case ChatterRisk.MEDIUM:
+                    text = $"Chatter risk MEDIUM. Current depth {depthMM:F2}mm is approaching stability limit {apLim:F2}mm. " +
+                           $"Consider reducing depth or shifting RPM to {recommendedRPM:F0}.";
+                    break;
+                default:
+                    text = $"Operating within stable zone. Stability margin: {margin * 100f:F0}%.";
+                    break;
+            }
+
+            return new StabilityRecommendationMsg(
+                machine_id: machineId,
+                current_rpm: rpm,
+                recommended_rpm: recommendedRPM,
+                current_depth: depthMM,
+                max_stable_depth: apLim,
+                risk_level: riskStr,
+                stability_margin: margin,
+                recommendation: text
+            );
         }
     }
 }

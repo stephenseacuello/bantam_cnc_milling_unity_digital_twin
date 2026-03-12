@@ -19,12 +19,28 @@ namespace MiracleTwin.Cutting
         public float remainingLifeMin;
         public float chatterRiskScore;
         public bool collisionFlag;
+        public FixtureProfile.CollisionSeverity collisionSeverity;
+    }
+
+    /// <summary>
+    /// Describes a contiguous range of segments that share the same collision risk severity.
+    /// Used by UI/visualization to highlight dangerous path segments.
+    /// </summary>
+    public struct CollisionRiskSegment
+    {
+        public int startIndex;
+        public int endIndex;
+        public FixtureProfile.CollisionSeverity severity;
     }
 
     /// <summary>
     /// Performs lookahead analysis on upcoming G-code segments to predict
     /// forces, power, temperature rise, cumulative wear, remaining tool life,
     /// chatter risk, and fixture collisions. Re-runs when feed/spindle overrides change.
+    ///
+    /// When a FixtureProfile is assigned, uses oriented clamp-zone collision checks
+    /// (including tool shank) instead of the legacy AABB BoxCollider check.
+    /// For rapid moves (G0), intermediate points along the path are also tested.
     /// </summary>
     public class GCodeLookahead : MonoBehaviour
     {
@@ -39,8 +55,15 @@ namespace MiracleTwin.Cutting
         [SerializeField] private float wearWarningThresholdMM = 0.25f;
 
         [Header("Fixture Collision")]
-        [Tooltip("Fixture bounds for AABB collision check. Leave null to skip.")]
+        [Tooltip("Fixture profile for oriented clamp-zone collision checks. Overrides legacy BoxCollider when assigned.")]
+        [SerializeField] private FixtureProfile fixtureProfile;
+
+        [Tooltip("Legacy fixture bounds for AABB collision check. Used only if fixtureProfile is null.")]
         [SerializeField] private BoxCollider fixtureCollider;
+
+        [Header("Tool Geometry")]
+        [SerializeField] private float toolDiameter = 6.35f;  // mm (1/4")
+        [SerializeField] private float toolLength = 50f;       // mm
 
         // Altintas cutting coefficients (matching CuttingForceEngine)
         private const float Ktc = 796f;
@@ -53,6 +76,9 @@ namespace MiracleTwin.Cutting
         private const int DefaultFlutes = 2;
         private const float DefaultAxialDepth = 1.0f; // mm
         private const float DefaultRadialDepth = 3.175f; // mm (half tool diameter)
+
+        /// <summary>Step size in mm for sampling intermediate points on rapid moves.</summary>
+        private const float RapidCollisionSampleStep = 5f;
 
         private List<LookaheadResult> cachedResults = new();
         private float lastFeedOverride = 1f;
@@ -113,7 +139,10 @@ namespace MiracleTwin.Cutting
         {
             var result = new LookaheadResult { segmentIndex = index };
 
-            // Skip rapids — no cutting forces
+            // --- Fixture collision check (applies to all move types including rapids) ---
+            CheckSegmentCollision(seg, ref result);
+
+            // Skip force/wear analysis for rapids — no cutting forces
             if (seg.type == SegmentType.Rapid)
             {
                 result.remainingLifeMin = EstimateRemainingLife(cumulativeWear);
@@ -178,17 +207,85 @@ namespace MiracleTwin.Cutting
                 };
             }
 
-            // AABB collision check
-            if (fixtureCollider != null)
+            return result;
+        }
+
+        /// <summary>
+        /// Check a segment for fixture collision using the FixtureProfile (preferred)
+        /// or legacy BoxCollider fallback.
+        /// For rapid moves, intermediate points along the path are sampled.
+        /// </summary>
+        private void CheckSegmentCollision(ToolpathSegment seg, ref LookaheadResult result)
+        {
+            if (fixtureProfile != null)
             {
+                CheckSegmentWithProfile(seg, ref result);
+            }
+            else if (fixtureCollider != null)
+            {
+                // Legacy AABB check
                 Bounds fixtureBounds = fixtureCollider.bounds;
                 if (fixtureBounds.Contains(seg.endPos) || fixtureBounds.Contains(seg.startPos))
                 {
                     result.collisionFlag = true;
+                    result.collisionSeverity = FixtureProfile.CollisionSeverity.FixtureCollision;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Perform collision checks using the FixtureProfile.
+        /// For rapid moves (G0), sample intermediate points along the path to catch
+        /// collisions during long traversals.
+        /// </summary>
+        private void CheckSegmentWithProfile(ToolpathSegment seg, ref LookaheadResult result)
+        {
+            // Always check start and end
+            var startCheck = fixtureProfile.CheckCollision(seg.startPos, toolDiameter, toolLength);
+            if (startCheck.isCollision)
+            {
+                result.collisionFlag = true;
+                result.collisionSeverity = startCheck.severity;
+                return;
+            }
+
+            var endCheck = fixtureProfile.CheckCollision(seg.endPos, toolDiameter, toolLength);
+            if (endCheck.isCollision)
+            {
+                result.collisionFlag = true;
+                result.collisionSeverity = endCheck.severity;
+                return;
+            }
+
+            // For rapid moves, also check intermediate points along the path
+            if (seg.type == SegmentType.Rapid)
+            {
+                float pathLength = Vector3.Distance(seg.startPos, seg.endPos);
+                if (pathLength > RapidCollisionSampleStep)
+                {
+                    int steps = Mathf.CeilToInt(pathLength / RapidCollisionSampleStep);
+                    for (int s = 1; s < steps; s++)
+                    {
+                        float t = (float)s / steps;
+                        Vector3 samplePoint = Vector3.Lerp(seg.startPos, seg.endPos, t);
+                        var midCheck = fixtureProfile.CheckCollision(samplePoint, toolDiameter, toolLength);
+                        if (midCheck.isCollision)
+                        {
+                            result.collisionFlag = true;
+                            result.collisionSeverity = midCheck.severity;
+                            return;
+                        }
+                    }
                 }
             }
 
-            return result;
+            // Check for near-misses on endpoints (informational, does not set collisionFlag)
+            var nearMiss = fixtureProfile.CheckNearMiss(seg.endPos, toolDiameter);
+            if (nearMiss.severity == FixtureProfile.CollisionSeverity.NearMiss
+                && result.collisionSeverity == FixtureProfile.CollisionSeverity.None)
+            {
+                result.collisionSeverity = FixtureProfile.CollisionSeverity.NearMiss;
+            }
         }
 
         private float EstimateRemainingLife(float currentWear)
@@ -207,6 +304,51 @@ namespace MiracleTwin.Cutting
         {
             return Mathf.Abs(feedOverride - lastFeedOverride) > 0.01f ||
                    Mathf.Abs(spindleOverride - lastSpindleOverride) > 0.01f;
+        }
+
+        /// <summary>
+        /// Returns contiguous ranges of segments grouped by collision risk severity.
+        /// Used by UI/visualization to highlight dangerous path segments with color coding.
+        /// Only segments with severity > None are included.
+        /// </summary>
+        public List<CollisionRiskSegment> GetCollisionRiskSegments()
+        {
+            var riskSegments = new List<CollisionRiskSegment>();
+            if (cachedResults.Count == 0) return riskSegments;
+
+            int i = 0;
+            while (i < cachedResults.Count)
+            {
+                var severity = cachedResults[i].collisionSeverity;
+                if (severity == FixtureProfile.CollisionSeverity.None)
+                {
+                    i++;
+                    continue;
+                }
+
+                // Start a new risk segment
+                int startIdx = cachedResults[i].segmentIndex;
+                int endIdx = startIdx;
+
+                // Extend while consecutive results share the same severity
+                int j = i + 1;
+                while (j < cachedResults.Count && cachedResults[j].collisionSeverity == severity)
+                {
+                    endIdx = cachedResults[j].segmentIndex;
+                    j++;
+                }
+
+                riskSegments.Add(new CollisionRiskSegment
+                {
+                    startIndex = startIdx,
+                    endIndex = endIdx,
+                    severity = severity
+                });
+
+                i = j;
+            }
+
+            return riskSegments;
         }
     }
 }

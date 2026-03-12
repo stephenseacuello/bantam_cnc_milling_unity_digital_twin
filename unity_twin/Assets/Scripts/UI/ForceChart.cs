@@ -28,12 +28,24 @@ namespace MiracleTwin.UI
         [SerializeField] private int gridLinesHorizontal = 4;
         [SerializeField] private int gridLinesVertical = 5;
 
+        [Header("Force Thresholds")]
+        [SerializeField] private float warningForceThreshold = 150f;
+        [SerializeField] private float criticalForceThreshold = 180f;
+        [SerializeField] private float maxForceCapacity = 200f;
+
         private static readonly Color FxColor = new(1f, 0.2f, 0.2f, 1f);   // Red
         private static readonly Color FyColor = new(0.2f, 0.8f, 0.2f, 1f); // Green
         private static readonly Color FzColor = new(0.3f, 0.3f, 1f, 1f);   // Blue
         private static readonly Color GridColor = new(0.3f, 0.3f, 0.3f, 0.5f);
         private static readonly Color BackgroundColor = new(0.1f, 0.1f, 0.12f, 0.9f);
         private static readonly Color AxisLabelColor = new(0.7f, 0.7f, 0.7f, 1f);
+
+        // Threshold zone colors (semi-transparent)
+        private static readonly Color SafeZoneColor = new(0.1f, 0.6f, 0.1f, 0.12f);
+        private static readonly Color WarningZoneColor = new(0.9f, 0.8f, 0.0f, 0.15f);
+        private static readonly Color CriticalZoneColor = new(0.9f, 0.15f, 0.1f, 0.18f);
+        private static readonly Color WarningLineColor = new(0.95f, 0.85f, 0.1f, 0.9f);
+        private static readonly Color CriticalLineColor = new(1f, 0.2f, 0.15f, 0.9f);
 
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
         private static readonly ProfilerMarker s_GenerateVisualContentMarker = new("ForceChart.OnGenerateVisualContent");
@@ -45,6 +57,12 @@ namespace MiracleTwin.UI
         private float[] predictedForces = Array.Empty<float>();
         private float lastSampleTime;
         private VisualElement chartElement;
+
+        // Threshold exceedance tracking
+        private int warningExceedanceCount;
+        private int criticalExceedanceCount;
+        private bool wasInWarningZone;
+        private bool wasInCriticalZone;
 
         void OnEnable()
         {
@@ -153,6 +171,9 @@ namespace MiracleTwin.UI
             painter.ClosePath();
             painter.Fill();
 
+            // 1b. Draw force threshold zone bands
+            DrawThresholdBands(painter, chartLeft, chartTop, chartWidth, chartHeight);
+
             // 2. Draw grid lines
             painter.strokeColor = GridColor;
             painter.lineWidth = 1f;
@@ -192,6 +213,12 @@ namespace MiracleTwin.UI
                 DrawPredictedTrace(painter, predictedForces, new Color(1f, 0.8f, 0.2f, 0.6f),
                     chartLeft, chartTop, chartWidth, chartHeight);
             }
+
+            // 3c. Draw threshold lines with pulse effect when exceeded
+            DrawThresholdLines(painter, samples, chartLeft, chartTop, chartWidth, chartHeight);
+
+            // 3d. Track exceedance zone transitions
+            TrackExceedance(samples);
 
             // 4. Draw axis border
             painter.strokeColor = new Color(0.5f, 0.5f, 0.5f, 0.8f);
@@ -349,6 +376,150 @@ namespace MiracleTwin.UI
         {
             predictedForces = Array.Empty<float>();
         }
+
+        /// <summary>
+        /// Draw semi-transparent threshold zone bands (green/yellow/red).
+        /// </summary>
+        private void DrawThresholdBands(Painter2D painter, float left, float top, float width, float height)
+        {
+            float chartBottom = top + height;
+            float center = top + height * 0.5f;
+
+            // Helper: map a force value to Y pixel (positive side only, mirrored for negative)
+            float WarningY(bool positive) => positive
+                ? center - (warningForceThreshold / maxForce) * (height * 0.5f)
+                : center + (warningForceThreshold / maxForce) * (height * 0.5f);
+            float CriticalY(bool positive) => positive
+                ? center - (criticalForceThreshold / maxForce) * (height * 0.5f)
+                : center + (criticalForceThreshold / maxForce) * (height * 0.5f);
+
+            // --- Positive half ---
+            // Green zone: center to warning threshold
+            DrawRect(painter, SafeZoneColor, left, WarningY(true), width, center - WarningY(true));
+            // Yellow zone: warning to critical
+            DrawRect(painter, WarningZoneColor, left, CriticalY(true), width, WarningY(true) - CriticalY(true));
+            // Red zone: critical to top
+            DrawRect(painter, CriticalZoneColor, left, top, width, CriticalY(true) - top);
+
+            // --- Negative half (mirrored) ---
+            DrawRect(painter, SafeZoneColor, left, center, width, WarningY(false) - center);
+            DrawRect(painter, WarningZoneColor, left, WarningY(false), width, CriticalY(false) - WarningY(false));
+            DrawRect(painter, CriticalZoneColor, left, CriticalY(false), width, chartBottom - CriticalY(false));
+        }
+
+        /// <summary>
+        /// Draw threshold lines with pulse effect when any trace crosses into the zone.
+        /// </summary>
+        private void DrawThresholdLines(Painter2D painter, Vector3[] samples,
+            float left, float top, float width, float height)
+        {
+            float center = top + height * 0.5f;
+            float warningYPos = center - (warningForceThreshold / maxForce) * (height * 0.5f);
+            float warningYNeg = center + (warningForceThreshold / maxForce) * (height * 0.5f);
+            float criticalYPos = center - (criticalForceThreshold / maxForce) * (height * 0.5f);
+            float criticalYNeg = center + (criticalForceThreshold / maxForce) * (height * 0.5f);
+
+            // Determine if any current sample exceeds thresholds for pulse effect
+            bool inWarning = false;
+            bool inCritical = false;
+            if (samples != null && samples.Length > 0)
+            {
+                var latest = samples[samples.Length - 1];
+                float maxAbs = Mathf.Max(Mathf.Abs(latest.x), Mathf.Max(Mathf.Abs(latest.y), Mathf.Abs(latest.z)));
+                inWarning = maxAbs >= warningForceThreshold;
+                inCritical = maxAbs >= criticalForceThreshold;
+            }
+
+            // Warning threshold lines (pulse when exceeded)
+            float warningAlpha = inWarning ? 0.6f + 0.4f * Mathf.Abs(Mathf.Sin(Time.time * 4f)) : 0.5f;
+            float warningWidth = inWarning ? 2.5f : 1.5f;
+            Color warningColor = new(WarningLineColor.r, WarningLineColor.g, WarningLineColor.b, warningAlpha);
+
+            painter.strokeColor = warningColor;
+            painter.lineWidth = warningWidth;
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(left, warningYPos));
+            painter.LineTo(new Vector2(left + width, warningYPos));
+            painter.Stroke();
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(left, warningYNeg));
+            painter.LineTo(new Vector2(left + width, warningYNeg));
+            painter.Stroke();
+
+            // Critical threshold lines (pulse when exceeded)
+            float criticalAlpha = inCritical ? 0.7f + 0.3f * Mathf.Abs(Mathf.Sin(Time.time * 6f)) : 0.5f;
+            float criticalWidth = inCritical ? 3f : 1.5f;
+            Color criticalColor = new(CriticalLineColor.r, CriticalLineColor.g, CriticalLineColor.b, criticalAlpha);
+
+            painter.strokeColor = criticalColor;
+            painter.lineWidth = criticalWidth;
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(left, criticalYPos));
+            painter.LineTo(new Vector2(left + width, criticalYPos));
+            painter.Stroke();
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(left, criticalYNeg));
+            painter.LineTo(new Vector2(left + width, criticalYNeg));
+            painter.Stroke();
+
+            // Draw threshold labels on the right side
+            // Note: Painter2D does not support text; labels are drawn as small
+            // colored indicator rectangles on the right edge of the chart.
+            float labelW = 6f;
+            float labelH = 4f;
+            float labelX = left + width + 2f;
+
+            painter.fillColor = warningColor;
+            DrawRect(painter, warningColor, labelX, warningYPos - labelH * 0.5f, labelW, labelH);
+            DrawRect(painter, warningColor, labelX, warningYNeg - labelH * 0.5f, labelW, labelH);
+
+            painter.fillColor = criticalColor;
+            DrawRect(painter, criticalColor, labelX, criticalYPos - labelH * 0.5f, labelW, labelH);
+            DrawRect(painter, criticalColor, labelX, criticalYNeg - labelH * 0.5f, labelW, labelH);
+        }
+
+        /// <summary>
+        /// Track zone transitions and increment exceedance counters.
+        /// </summary>
+        private void TrackExceedance(Vector3[] samples)
+        {
+            if (samples == null || samples.Length == 0) return;
+
+            var latest = samples[samples.Length - 1];
+            float maxAbs = Mathf.Max(Mathf.Abs(latest.x), Mathf.Max(Mathf.Abs(latest.y), Mathf.Abs(latest.z)));
+
+            bool inWarning = maxAbs >= warningForceThreshold;
+            bool inCritical = maxAbs >= criticalForceThreshold;
+
+            if (inWarning && !wasInWarningZone)
+                warningExceedanceCount++;
+            if (inCritical && !wasInCriticalZone)
+                criticalExceedanceCount++;
+
+            wasInWarningZone = inWarning;
+            wasInCriticalZone = inCritical;
+        }
+
+        /// <summary>
+        /// Draw a filled rectangle using Painter2D.
+        /// </summary>
+        private static void DrawRect(Painter2D painter, Color color, float x, float y, float w, float h)
+        {
+            painter.fillColor = color;
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(x, y));
+            painter.LineTo(new Vector2(x + w, y));
+            painter.LineTo(new Vector2(x + w, y + h));
+            painter.LineTo(new Vector2(x, y + h));
+            painter.ClosePath();
+            painter.Fill();
+        }
+
+        /// <summary>Number of times any force trace transitioned into the warning zone.</summary>
+        public int WarningExceedanceCount => warningExceedanceCount;
+
+        /// <summary>Number of times any force trace transitioned into the critical zone.</summary>
+        public int CriticalExceedanceCount => criticalExceedanceCount;
 
         public Vector3[] GetSamples()
         {

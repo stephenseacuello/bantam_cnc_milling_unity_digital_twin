@@ -398,6 +398,34 @@
     margin-left: 4px;
 }
 
+.fleet-sparkline-mode-row {
+    flex-direction: row;
+    justify-content: center;
+    margin-bottom: 4px;
+}
+
+.fleet-sparkline-mode-btn {
+    font-size: 9px;
+    padding: 1px 4px;
+    margin: 0 1px;
+    min-width: 18px;
+    background-color: rgba(40, 40, 60, 0.6);
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: rgba(60, 60, 80, 0.4);
+    -unity-text-align: middle-center;
+    -unity-font-style: bold;
+}
+
+.fleet-sparkline-mode-btn:hover {
+    background-color: rgba(60, 60, 90, 0.8);
+}
+
+.fleet-sparkline-mode-btn-active {
+    background-color: rgba(80, 140, 220, 0.35);
+    border-color: rgba(100, 170, 255, 0.6);
+}
+
 .fleet-metrics-row {
     flex-direction: row;
     justify-content: space-around;
@@ -516,4 +544,138 @@
     font-size: 11px;
     color: rgb(180, 200, 220);
     white-space: normal;
+}
+
+/* Alert Timeline Panel */
+.alert-timeline-panel {
+    position: absolute;
+    left: 260px;
+    bottom: 0;
+    width: 350px;
+    height: 300px;
+    background-color: rgba(20, 22, 28, 0.95);
+    border-color: rgba(255, 255, 255, 0.1);
+    border-width: 1px;
+    border-radius: 8px;
+    padding: 8px;
+}
+
+.alert-timeline-header {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 6px;
+    border-bottom-width: 1px;
+    border-bottom-color: rgba(255, 255, 255, 0.1);
+}
+
+.alert-timeline-title {
+    font-size: 14px;
+    color: rgb(200, 210, 225);
+    -unity-font-style: bold;
+}
+
+.alert-timeline-count {
+    font-size: 11px;
+    color: rgba(200, 210, 225, 0.6);
+}
+
+.alert-timeline-filters {
+    flex-direction: row;
+    padding: 4px 0;
+}
+
+.alert-filter-btn {
+    font-size: 10px;
+    padding: 2px 8px;
+    margin-right: 4px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.05);
+    color: rgba(200, 210, 225, 0.7);
+    border-width: 0;
+}
+
+.alert-filter-active {
+    background-color: rgba(59, 130, 246, 0.3);
+    color: rgb(147, 197, 253);
+}
+
+.alert-timeline-scroll {
+    flex-grow: 1;
+}
+
+.alert-card {
+    flex-direction: row;
+    margin-bottom: 4px;
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.03);
+    overflow: hidden;
+}
+
+.alert-severity-bar {
+    width: 3px;
+    min-height: 40px;
+}
+
+.alert-card-content {
+    flex-grow: 1;
+    padding: 4px 8px;
+}
+
+.alert-card-header {
+    flex-direction: row;
+    justify-content: space-between;
+}
+
+.alert-type-label {
+    font-size: 11px;
+    color: rgb(200, 210, 225);
+    -unity-font-style: bold;
+}
+
+.alert-time-label {
+    font-size: 10px;
+    color: rgba(200, 210, 225, 0.5);
+}
+
+.alert-card-detail {
+    flex-direction: row;
+    padding-top: 2px;
+}
+
+.alert-machine-label {
+    font-size: 10px;
+    color: rgba(200, 210, 225, 0.6);
+    background-color: rgba(255, 255, 255, 0.05);
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-right: 8px;
+}
+
+.alert-severity-label {
+    font-size: 10px;
+    -unity-font-style: bold;
+}
+
+.alert-category-badge {
+    font-size: 9px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    margin-top: 2px;
+    align-self: flex-start;
+}
+
+.alert-badge-anomaly {
+    background-color: rgba(234, 179, 8, 0.2);
+    color: rgb(250, 204, 21);
+}
+
+.alert-badge-correlated {
+    background-color: rgba(168, 85, 247, 0.2);
+    color: rgb(196, 148, 249);
+}
+
+.alert-badge-security {
+    background-color: rgba(239, 68, 68, 0.2);
+    color: rgb(248, 113, 113);
 }

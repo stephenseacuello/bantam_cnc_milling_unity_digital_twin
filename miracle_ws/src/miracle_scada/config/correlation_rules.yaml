@@ -76,3 +76,29 @@ rules:
       - "Inspect spindle drive VFD parameters"
       - "Reduce spindle load"
     min_confidence: 0.7
+
+# Fleet-wide correlation rules
+# These detect patterns across multiple machines, indicating shared
+# environmental, supply, or infrastructure root causes.
+fleet_rules:
+  - name: fleet_same_anomaly
+    description: "Same anomaly type detected across multiple machines"
+    min_machines: 2
+    time_window_sec: 60
+    min_confidence: 0.8
+    root_cause: "Shared environmental or supply factor"
+    recommended_actions:
+      - "Check shared coolant supply"
+      - "Verify power quality across facility"
+      - "Inspect common material batch"
+
+  - name: fleet_cascading_failure
+    description: "Multiple different anomalies across fleet within window"
+    min_machines: 3
+    time_window_sec: 120
+    min_confidence: 0.7
+    root_cause: "Potential facility-wide issue"
+    recommended_actions:
+      - "Check HVAC and ambient temperature"
+      - "Verify facility power supply stability"
+      - "Review recent maintenance schedule"

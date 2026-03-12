@@ -2,6 +2,7 @@ using UnityEngine;
 using MiracleTwin.Core;
 using MiracleTwin.CNC;
 using MiracleTwin.Visualization;
+using RosMessageTypes.Miracle;
 
 namespace MiracleTwin.Cutting
 {
@@ -29,6 +30,10 @@ namespace MiracleTwin.Cutting
         [SerializeField] private ToolDefinition activeTool;
         [SerializeField] private StabilityLobeChart stabilityLobeChart;
         [SerializeField] private StabilityLobePredictor stabilityLobePredictor;
+        [SerializeField] private GCodeExecutor executor;
+
+        /// <summary>Whether the linked GCodeExecutor is currently in preview mode.</summary>
+        public bool IsPreviewActive => executor != null && executor.IsPreviewMode;
 
         [Header("Simulation Settings")]
         [SerializeField] private bool autoStartCutting = false;
@@ -148,6 +153,9 @@ namespace MiracleTwin.Cutting
 
         private void UpdateCutting(Vector3 toolPos, float rpm, float feedRate, float dt)
         {
+            // In preview mode, skip all state-modifying operations (voxel subtraction, wear)
+            if (IsPreviewActive) return;
+
             IsCutting = true;
             TotalCuttingTime += dt;
 
@@ -256,7 +264,26 @@ namespace MiracleTwin.Cutting
                     }
                     lastChatterRisk = risk;
                 }
+
+                // Publish stability recommendation to adaptive controller when risk is elevated
+                if (risk == ChatterRisk.MEDIUM || risk == ChatterRisk.HIGH)
+                {
+                    PublishStabilityRecommendation(rpm, depthMM);
+                }
             }
+        }
+
+        /// <summary>
+        /// Get a stability recommendation from the predictor and publish it
+        /// via MiracleBridge for the adaptive controller to consume.
+        /// </summary>
+        private void PublishStabilityRecommendation(float rpm, float depthMM)
+        {
+            if (stabilityLobePredictor == null || MiracleBridge.Instance == null) return;
+
+            string machineId = MiracleBridge.Instance.MachineId;
+            var recommendation = stabilityLobePredictor.GetStabilityRecommendation(machineId, rpm, depthMM);
+            MiracleBridge.Instance.PublishStabilityRecommendation(recommendation);
         }
 
         private void StopCutting()
@@ -385,6 +412,36 @@ namespace MiracleTwin.Cutting
         private void OnSimulationReset()
         {
             ResetSimulation();
+        }
+
+        // ── Preview Force Estimation ─────────────────────────────────────
+
+        // Altintas coefficients (must match GCodeLookahead/CuttingForceEngine)
+        private const float PreviewKtc = 796f;
+        private const float PreviewKrc = 168f;
+        private const float PreviewKte = 14.5f;
+        private const float PreviewKre = 10.2f;
+        private const float PreviewDefaultAxialDepth = 1.0f; // mm
+        private const int PreviewDefaultFlutes = 2;
+        private const float PreviewDefaultToolDiameter = 6.35f; // mm
+
+        /// <summary>
+        /// Estimate the cutting force for a move between two points at the given
+        /// feed rate and spindle speed. This is a pure calculation that does NOT
+        /// modify any simulation state (voxels, wear, temperature).
+        /// </summary>
+        /// <returns>Estimated resultant force in Newtons.</returns>
+        public float GetPreviewForceEstimate(Vector3 start, Vector3 end, float feed, float rpm)
+        {
+            if (rpm < 1f || feed < 0.01f) return 0f;
+
+            float fz = feed / (rpm * PreviewDefaultFlutes);
+            float chipThickness = fz;
+
+            float Ft = PreviewKtc * PreviewDefaultAxialDepth * chipThickness + PreviewKte * PreviewDefaultAxialDepth;
+            float Fr = PreviewKrc * PreviewDefaultAxialDepth * chipThickness + PreviewKre * PreviewDefaultAxialDepth;
+
+            return Mathf.Sqrt(Ft * Ft + Fr * Fr);
         }
 
         /// <summary>

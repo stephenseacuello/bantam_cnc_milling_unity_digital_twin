@@ -9,6 +9,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from miracle_twin.tool_library import ToolDefinition, ToolLibrary
+
 
 @dataclass
 class CuttingCoefficients:
@@ -40,6 +42,20 @@ class GCodeBlock:
     axial_depth_mm: float = 1.5
     radial_depth_mm: float = 3.175
     length_mm: float = 10.0  # segment length
+    # Arc-specific fields (None for linear moves)
+    arc_center_i: Optional[float] = None
+    arc_center_j: Optional[float] = None
+    arc_center_k: Optional[float] = None
+    arc_direction: Optional[str] = None  # 'CW' or 'CCW'
+    start_x: float = 0.0
+    start_y: float = 0.0
+    end_x: float = 0.0
+    end_y: float = 0.0
+
+    @property
+    def is_arc(self) -> bool:
+        """Return True if this block represents an arc move."""
+        return self.arc_direction is not None
 
 
 @dataclass
@@ -67,6 +83,14 @@ class SimulationResult:
     recommended_action: str = ''
 
 
+@dataclass
+class WhatIfComparison:
+    """Result of a what-if comparison between baseline and override parameters."""
+    baseline: Dict[str, float] = field(default_factory=dict)
+    override: Dict[str, float] = field(default_factory=dict)
+    delta: Dict[str, float] = field(default_factory=dict)
+
+
 class CuttingSimProxy:
     """Python proxy for cutting force + wear simulation.
 
@@ -74,7 +98,10 @@ class CuttingSimProxy:
     from the Unity C# implementation to Python for use by PredictionRunner.
     """
 
-    # Taylor equation constants (6061-T6 + HSS)
+    # Shared tool library — loaded once per process
+    _tool_library: Optional[ToolLibrary] = None
+
+    # Taylor equation constants (6061-T6 + HSS) — defaults / fallback
     TAYLOR_N = 0.125
     TAYLOR_A = 0.5
     TAYLOR_B = 0.15
@@ -88,8 +115,53 @@ class CuttingSimProxy:
     C2 = 0.004       # Steady-state wear rate (mm/min at V=100)
     VBMAX = 0.30     # End-of-life criterion (mm)
 
+    @classmethod
+    def get_tool_library(cls) -> ToolLibrary:
+        """Return the shared ToolLibrary, creating it on first access."""
+        if cls._tool_library is None:
+            cls._tool_library = ToolLibrary()
+        return cls._tool_library
+
     def __init__(self, coefficients: Optional[CuttingCoefficients] = None):
         self.coeffs = coefficients or CuttingCoefficients()
+        self._active_tool_def: Optional[ToolDefinition] = None
+
+    def set_tool(self, tool_id: str) -> bool:
+        """Load a tool from the library by ID and apply its parameters.
+
+        Updates cutting coefficients, Taylor wear parameters, and geometry.
+        Returns True if the tool was found and applied, False otherwise.
+        """
+        library = self.get_tool_library()
+        tool_def = library.get(tool_id)
+        if tool_def is None:
+            return False
+        self.set_tool_definition(tool_def)
+        return True
+
+    def set_tool_definition(self, tool_def: ToolDefinition) -> None:
+        """Apply a ToolDefinition directly, overriding all coefficients."""
+        self._active_tool_def = tool_def
+
+        # Update cutting coefficients
+        self.coeffs.Ktc = tool_def.ktc
+        self.coeffs.Krc = tool_def.krc
+        self.coeffs.Kac = tool_def.kac
+        self.coeffs.Kte = tool_def.kte
+        self.coeffs.Kre = tool_def.kre
+        self.coeffs.Kae = tool_def.kae
+
+        # Update Taylor parameters
+        self.TAYLOR_C = tool_def.taylor_C
+        self.TAYLOR_N = tool_def.taylor_n
+        self.TAYLOR_A = tool_def.taylor_f_exp
+        self.TAYLOR_B = tool_def.taylor_ap_exp
+        self.VBMAX = tool_def.vb_max_mm
+
+    @property
+    def active_tool(self) -> Optional[ToolDefinition]:
+        """Return the currently active ToolDefinition, or None."""
+        return self._active_tool_def
 
     def calculate_forces(
         self,
@@ -243,11 +315,139 @@ class CuttingSimProxy:
             return float('inf')
         return (self.TAYLOR_C / denom) ** (1.0 / self.TAYLOR_N)
 
+    def simulate_arc_block(
+        self,
+        block: GCodeBlock,
+        tool: ToolState,
+        vb: float,
+        cutting_time: float,
+        overrides: Optional[Dict[str, float]] = None,
+        n_segments: int = 8,
+    ) -> tuple:
+        """Simulate an arc block by splitting into linear chord segments.
+
+        Computes varying chip thickness around the arc (thicker on inside of
+        arc, thinner on outside) and returns an averaged BlockPrediction.
+
+        Args:
+            block: GCodeBlock with arc data populated.
+            tool: Current tool state.
+            vb: Current flank wear in mm.
+            cutting_time: Accumulated cutting time in minutes.
+            overrides: Optional parameter overrides.
+            n_segments: Number of chord segments for arc approximation.
+
+        Returns:
+            Tuple of (BlockPrediction, updated_vb, updated_cutting_time).
+        """
+        overrides = overrides or {}
+        rpm = overrides.get('spindle_rpm', block.spindle_rpm)
+        feed = overrides.get('feed_rate', block.feed_rate_mmpm)
+        ap = overrides.get('axial_depth', block.axial_depth_mm)
+        ae = overrides.get('radial_depth', block.radial_depth_mm)
+        helix_rad = math.radians(tool.helix_angle_deg)
+
+        if rpm <= 0 or feed <= 0:
+            return BlockPrediction(), vb, cutting_time
+
+        # Compute arc geometry
+        cx = block.start_x + (block.arc_center_i or 0.0)
+        cy = block.start_y + (block.arc_center_j or 0.0)
+        radius = math.sqrt((block.start_x - cx) ** 2 + (block.start_y - cy) ** 2)
+        if radius <= 0.0:
+            return BlockPrediction(), vb, cutting_time
+
+        # Compute start and end angles
+        start_angle = math.atan2(block.start_y - cy, block.start_x - cx)
+        end_angle = math.atan2(block.end_y - cy, block.end_x - cx)
+
+        # Compute sweep angle based on direction
+        if block.arc_direction == 'CW':
+            sweep = start_angle - end_angle
+            if sweep <= 0:
+                sweep += 2.0 * math.pi
+        else:  # CCW
+            sweep = end_angle - start_angle
+            if sweep <= 0:
+                sweep += 2.0 * math.pi
+
+        arc_length = radius * sweep
+        seg_length = arc_length / n_segments
+        fz_base = feed / (rpm * tool.flute_count)
+        v_mpm = math.pi * tool.diameter_mm * rpm / 1000.0
+
+        # Accumulate predictions across segments
+        total_peak = 0.0
+        total_avg = 0.0
+        total_power = 0.0
+        total_torque = 0.0
+        total_mrr = 0.0
+        total_temp = 0.0
+        total_time = 0.0
+
+        for i in range(n_segments):
+            # Chip thickness varies with arc: inside cuts thicker
+            # Scale factor based on curvature relative to tool diameter
+            curvature_ratio = tool.diameter_mm / (2.0 * radius)
+            if block.arc_direction == 'CW':
+                # Climb milling on outside: slightly thinner chips
+                thickness_scale = 1.0 - 0.5 * curvature_ratio * math.cos(
+                    sweep * (i + 0.5) / n_segments
+                )
+            else:
+                # Conventional: slightly thicker chips on inside
+                thickness_scale = 1.0 + 0.5 * curvature_ratio * math.cos(
+                    sweep * (i + 0.5) / n_segments
+                )
+            fz_seg = fz_base * max(0.2, min(2.0, thickness_scale))
+
+            forces = self.calculate_forces(
+                spindle_rpm=rpm,
+                feed_per_tooth=fz_seg,
+                axial_depth=ap,
+                radial_depth=ae,
+                tool_diameter=tool.diameter_mm,
+                flute_count=tool.flute_count,
+                helix_angle_rad=helix_rad,
+                flank_wear_vb=vb,
+            )
+
+            seg_time = seg_length / feed if feed > 0 else 0.0
+            total_time += seg_time
+            vb, cutting_time = self.update_wear(
+                vb, cutting_time, v_mpm, fz_seg, ap, seg_time
+            )
+
+            peak = math.sqrt(
+                forces['fx_peak'] ** 2 + forces['fy_peak'] ** 2 + forces['fz_peak'] ** 2
+            )
+            avg = math.sqrt(
+                forces['fx_avg'] ** 2 + forces['fy_avg'] ** 2 + forces['fz_avg'] ** 2
+            )
+            total_peak = max(total_peak, peak)
+            total_avg += avg
+            total_power += forces['power_w']
+            total_torque += forces['torque_nm']
+            total_mrr += forces['mrr']
+            total_temp += forces['power_w'] * 0.05
+
+        pred = BlockPrediction(
+            peak_force_n=total_peak,
+            avg_force_n=total_avg / n_segments if n_segments > 0 else 0.0,
+            power_w=total_power / n_segments if n_segments > 0 else 0.0,
+            torque_nm=total_torque / n_segments if n_segments > 0 else 0.0,
+            mrr_mm3pm=total_mrr / n_segments if n_segments > 0 else 0.0,
+            wear_after_block_mm=vb,
+            temperature_rise_c=total_temp / n_segments if n_segments > 0 else 0.0,
+        )
+        return pred, vb, cutting_time
+
     def simulate_program(
         self,
         gcode_blocks: List[GCodeBlock],
         tool_state: Optional[ToolState] = None,
         parameter_overrides: Optional[Dict[str, float]] = None,
+        tool_id: Optional[str] = None,
     ) -> SimulationResult:
         """Simulate an entire G-code program and predict forces, wear, and RUL.
 
@@ -255,11 +455,22 @@ class CuttingSimProxy:
             gcode_blocks: List of G-code blocks to simulate.
             tool_state: Current tool state (wear, cutting time).
             parameter_overrides: Optional dict to override spindle_rpm, feed_rate, etc.
+            tool_id: Optional tool library ID. If provided, the tool's cutting
+                coefficients, Taylor parameters, and geometry are applied before
+                simulation begins.
 
         Returns:
             SimulationResult with per-block predictions and overall RUL.
         """
+        if tool_id is not None:
+            self.set_tool(tool_id)
+
         tool = tool_state or ToolState()
+        # If an active tool definition is loaded, sync geometry into ToolState
+        if self._active_tool_def is not None:
+            tool.diameter_mm = self._active_tool_def.diameter_mm
+            tool.flute_count = self._active_tool_def.flute_count
+            tool.helix_angle_deg = self._active_tool_def.helix_angle_deg
         overrides = parameter_overrides or {}
 
         vb = tool.flank_wear_vb
@@ -271,6 +482,19 @@ class CuttingSimProxy:
         total_time = 0.0
 
         for block in gcode_blocks:
+            # Handle arc blocks via dedicated arc simulation
+            if block.is_arc:
+                pred, vb, cutting_time = self.simulate_arc_block(
+                    block, tool, vb, cutting_time, overrides
+                )
+                block_time = block.length_mm / max(
+                    overrides.get('feed_rate', block.feed_rate_mmpm), 1e-9
+                )
+                total_time += block_time
+                block_predictions.append(pred)
+                health_trend.append(max(0.0, 1.0 - vb / self.VBMAX))
+                continue
+
             rpm = overrides.get('spindle_rpm', block.spindle_rpm)
             feed = overrides.get('feed_rate', block.feed_rate_mmpm)
             ap = overrides.get('axial_depth', block.axial_depth_mm)
@@ -377,3 +601,163 @@ class CuttingSimProxy:
             trend_data=health_trend[-10:] if health_trend else [health_index],
             recommended_action=action,
         )
+
+    def what_if_compare(
+        self,
+        blocks: List[GCodeBlock],
+        tool_state: Optional[ToolState] = None,
+        baseline_params: Optional[Dict[str, float]] = None,
+        override_params: Optional[Dict[str, float]] = None,
+    ) -> WhatIfComparison:
+        """Run simulation with baseline and override parameters, return comparison.
+
+        Computes both scenarios using the full mechanistic force model and Taylor
+        wear equations, then returns a structured comparison of key metrics.
+
+        Args:
+            blocks: G-code blocks to simulate.
+            tool_state: Current tool state (wear, cutting time).
+            baseline_params: Parameter overrides for baseline (None = programmed).
+            override_params: Parameter overrides for the what-if scenario.
+
+        Returns:
+            WhatIfComparison with baseline, override, and delta dicts containing:
+                peak_force, rul_minutes, max_ra, chatter_risk
+        """
+        baseline_result = self.simulate_program(
+            blocks, tool_state=tool_state, parameter_overrides=baseline_params
+        )
+        override_result = self.simulate_program(
+            blocks, tool_state=tool_state, parameter_overrides=override_params
+        )
+
+        # Extract peak force across all blocks
+        baseline_peak = max(
+            (bp.peak_force_n for bp in baseline_result.block_predictions),
+            default=0.0,
+        )
+        override_peak = max(
+            (bp.peak_force_n for bp in override_result.block_predictions),
+            default=0.0,
+        )
+
+        # RUL in minutes
+        baseline_rul_min = baseline_result.remaining_useful_life_hours * 60.0
+        override_rul_min = override_result.remaining_useful_life_hours * 60.0
+
+        # Estimate surface roughness Ra from feed per tooth
+        # Ra ~ f_z^2 / (8 * R) for ideal finish; use ratio approach
+        baseline_ra = self._estimate_surface_ra(blocks, baseline_params)
+        override_ra = self._estimate_surface_ra(blocks, override_params)
+
+        # Chatter risk based on spindle RPM relative to stability lobes
+        baseline_rpm = self._effective_rpm(blocks, baseline_params)
+        override_rpm = self._effective_rpm(blocks, override_params)
+        baseline_chatter = self._chatter_risk_score(baseline_rpm)
+        override_chatter = self._chatter_risk_score(override_rpm)
+
+        baseline_dict = {
+            'peak_force': baseline_peak,
+            'rul_minutes': baseline_rul_min,
+            'max_ra': baseline_ra,
+            'chatter_risk': baseline_chatter,
+        }
+        override_dict = {
+            'peak_force': override_peak,
+            'rul_minutes': override_rul_min,
+            'max_ra': override_ra,
+            'chatter_risk': override_chatter,
+        }
+
+        # Delta calculations
+        force_pct = (
+            (override_peak - baseline_peak) / baseline_peak * 100.0
+            if baseline_peak > 0 else 0.0
+        )
+        life_pct = (
+            (override_rul_min - baseline_rul_min) / baseline_rul_min * 100.0
+            if baseline_rul_min > 0 else 0.0
+        )
+        quality_change = (
+            -1.0 if override_ra > baseline_ra * 1.05
+            else 1.0 if override_ra < baseline_ra * 0.95
+            else 0.0
+        )
+        risk_change = override_chatter - baseline_chatter
+
+        delta_dict = {
+            'force_pct': force_pct,
+            'life_pct': life_pct,
+            'quality_change': quality_change,
+            'risk_change': risk_change,
+        }
+
+        return WhatIfComparison(
+            baseline=baseline_dict,
+            override=override_dict,
+            delta=delta_dict,
+        )
+
+    def _effective_rpm(
+        self,
+        blocks: List[GCodeBlock],
+        overrides: Optional[Dict[str, float]] = None,
+    ) -> float:
+        """Get effective spindle RPM from overrides or first block."""
+        if overrides and 'spindle_rpm' in overrides:
+            return overrides['spindle_rpm']
+        for block in blocks:
+            if block.spindle_rpm > 0:
+                return block.spindle_rpm
+        return 0.0
+
+    def _estimate_surface_ra(
+        self,
+        blocks: List[GCodeBlock],
+        overrides: Optional[Dict[str, float]] = None,
+    ) -> float:
+        """Estimate surface roughness Ra (um) from cutting parameters.
+
+        Uses the theoretical finish formula: Ra = f_z^2 / (32 * R)
+        where f_z is feed per tooth and R is tool nose radius (approximated
+        as tool_diameter / 2 for end mills).
+        """
+        ovr = overrides or {}
+        max_ra = 0.0
+        for block in blocks:
+            rpm = ovr.get('spindle_rpm', block.spindle_rpm)
+            feed = ovr.get('feed_rate', block.feed_rate_mmpm)
+            if rpm <= 0 or feed <= 0:
+                continue
+            fz = feed / (rpm * 2)  # 2-flute default
+            R = 6.35 / 2.0  # default tool radius mm
+            # Ra in um: (fz^2 / (32 * R)) * 1000
+            ra = (fz ** 2 / (32.0 * R)) * 1000.0
+            max_ra = max(max_ra, ra)
+        return max_ra if max_ra > 0 else 0.8  # fallback
+
+    def _chatter_risk_score(self, rpm: float) -> float:
+        """Compute chatter risk score (0.0 = low, 1.0 = high).
+
+        Uses simplified stability lobe boundaries. Known unstable zones
+        are near harmonics of the natural frequency (~250 Hz for typical
+        CNC spindle-tool assembly).
+        """
+        if rpm <= 0:
+            return 0.0
+
+        # Natural frequency of spindle-tool system (Hz)
+        fn = 250.0
+        # Check proximity to stability lobe boundaries
+        # Unstable RPM = 60 * fn / (k + 1) for integer k
+        risk = 0.0
+        for k in range(1, 10):
+            unstable_rpm = 60.0 * fn / (k + 1)
+            ratio = abs(rpm - unstable_rpm) / unstable_rpm
+            if ratio < 0.05:
+                risk = max(risk, 1.0)
+            elif ratio < 0.10:
+                risk = max(risk, 0.5)
+            elif ratio < 0.15:
+                risk = max(risk, 0.2)
+        return risk

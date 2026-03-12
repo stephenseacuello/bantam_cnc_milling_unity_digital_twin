@@ -121,6 +121,103 @@ class TestFeatureRanking:
         assert normalized[0] == 100.0
 
 
+@pytest.mark.skipif(_node_is_mock, reason="ExplanationGeneratorNode is a Mock (rclpy mock ordering)")
+class TestCausalChainBuilding:
+    """Tests for causal-inference integration in the explanation generator."""
+
+    def _make_node(self):
+        """Create an ExplanationGeneratorNode with mocked super().__init__."""
+        node = ExplanationGeneratorNode.__new__(ExplanationGeneratorNode)
+        # Manually replicate __init__ state without calling super()
+        node._history = []
+        node._history_lock = __import__('threading').Lock()
+        node._history_size = 500
+        node._detail_level = 'medium'
+        node._explanation_pub = None
+        node._causal_links = {
+            'ToolWear': ('HighFeedRate', 0.7),
+            'SurfaceRoughnessIncrease': ('ToolWear', 0.8),
+            'ThermalExpansion': ('HighSpindleSpeed', 0.6),
+            'Chatter': ('ImproperToolpath', 0.75),
+            'Vibration': ('WornBearing', 0.85),
+            'ThermalDamage': ('LowCoolant', 0.9),
+        }
+        return node
+
+    def test_vibration_traces_back_to_worn_bearing(self):
+        node = self._make_node()
+        result = node._build_causal_chain('vibration_anomaly', 0.8)
+        assert result is not None
+        chain, confidence = result
+        assert chain == ['WornBearing', 'Vibration']
+        assert chain[0] == 'WornBearing'
+
+    def test_surface_quality_traces_full_chain(self):
+        node = self._make_node()
+        result = node._build_causal_chain('surface_quality_anomaly', 0.7)
+        assert result is not None
+        chain, confidence = result
+        assert chain == ['HighFeedRate', 'ToolWear', 'SurfaceRoughnessIncrease']
+
+    def test_chain_confidence_is_product_of_strengths(self):
+        node = self._make_node()
+        # vibration: WornBearing->Vibration  strength=0.85
+        result = node._build_causal_chain('vibration_anomaly', 0.8)
+        assert result is not None
+        _, confidence = result
+        assert confidence == pytest.approx(0.85)
+
+        # surface_quality: HighFeedRate(0.7)->ToolWear(0.8)->SurfaceRoughnessIncrease
+        result = node._build_causal_chain('surface_quality_anomaly', 0.7)
+        assert result is not None
+        _, confidence = result
+        assert confidence == pytest.approx(0.7 * 0.8)
+
+    def test_causal_detail_section_in_output(self):
+        node = self._make_node()
+        features = []
+        detail = node._build_detail(
+            'Test prefix.', features, 0.8, '', 'cnc1', 'vibration_anomaly',
+        )
+        assert 'Causal analysis' in detail
+        assert 'WornBearing' in detail
+        assert 'Causal chain:' in detail
+
+    def test_counterfactual_uses_causal_root_cause(self):
+        node = self._make_node()
+        record = node.generate_explanation(
+            anomaly_type='vibration_anomaly',
+            machine_id='cnc1',
+            severity=0.8,
+        )
+        assert 'bearing' in record.counterfactual.lower()
+        assert 'Causal insight' in record.counterfactual
+
+    def test_counterfactual_feed_rate_for_surface_quality(self):
+        node = self._make_node()
+        record = node.generate_explanation(
+            anomaly_type='surface_quality_anomaly',
+            machine_id='cnc1',
+            severity=0.7,
+        )
+        assert 'feed rate' in record.counterfactual.lower()
+        assert 'Causal insight' in record.counterfactual
+
+    def test_unknown_anomaly_type_falls_back_gracefully(self):
+        node = self._make_node()
+        result = node._build_causal_chain('completely_unknown_anomaly', 0.5)
+        assert result is None
+
+        # generate_explanation should still work without causal section
+        record = node.generate_explanation(
+            anomaly_type='completely_unknown_anomaly',
+            machine_id='cnc1',
+            severity=0.5,
+        )
+        assert record.summary  # still produces output
+        assert 'Causal analysis' not in record.detail
+
+
 class TestHistoricalContext:
     def test_first_occurrence_message(self):
         recent = []

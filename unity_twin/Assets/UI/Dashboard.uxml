@@ -37,6 +37,10 @@
                         <Label name="load-value" text="0%" class="data-value" />
                     </VisualElement>
                     <VisualElement class="data-row">
+                        <Label text="Spindle T:" class="data-label" />
+                        <Label name="spindle-temp-value" text="-- C" class="data-value" />
+                    </VisualElement>
+                    <VisualElement class="data-row">
                         <Label text="Line:" class="data-label" />
                         <Label name="line-value" text="0" class="data-value" />
                     </VisualElement>
@@ -59,15 +63,15 @@
                     <Label text="Forces (N)" class="panel-title" />
                     <VisualElement class="data-row">
                         <Label text="Fx:" class="data-label force-x" />
-                        <Label name="fx-value" text="0.0 N" class="data-value" />
+                        <Label name="force-x-value" text="0.0 N" class="data-value" />
                     </VisualElement>
                     <VisualElement class="data-row">
                         <Label text="Fy:" class="data-label force-y" />
-                        <Label name="fy-value" text="0.0 N" class="data-value" />
+                        <Label name="force-y-value" text="0.0 N" class="data-value" />
                     </VisualElement>
                     <VisualElement class="data-row">
                         <Label text="Fz:" class="data-label force-z" />
-                        <Label name="fz-value" text="0.0 N" class="data-value" />
+                        <Label name="force-z-value" text="0.0 N" class="data-value" />
                     </VisualElement>
                 </VisualElement>
 
@@ -77,7 +81,7 @@
                     <ProgressBar name="wear-bar" title="Wear" low-value="0" high-value="100" class="wear-progress" />
                     <VisualElement class="data-row">
                         <Label text="VB:" class="data-label" />
-                        <Label name="vb-value" text="0.020 mm" class="data-value" />
+                        <Label name="wear-vb-value" text="0.020 mm" class="data-value" />
                     </VisualElement>
                     <VisualElement class="data-row">
                         <Label text="Wear:" class="data-label" />
@@ -153,15 +157,15 @@
                     </VisualElement>
                     <VisualElement class="data-row">
                         <Label text="Avail:" class="data-label" />
-                        <Label name="avail-value" text="0%" class="data-value" />
+                        <Label name="availability-value" text="0%" class="data-value" />
                     </VisualElement>
                     <VisualElement class="data-row">
                         <Label text="Perf:" class="data-label" />
-                        <Label name="perf-value" text="0%" class="data-value" />
+                        <Label name="performance-value" text="0%" class="data-value" />
                     </VisualElement>
                     <VisualElement class="data-row">
                         <Label text="Qual:" class="data-label" />
-                        <Label name="qual-value" text="0%" class="data-value" />
+                        <Label name="quality-value" text="0%" class="data-value" />
                     </VisualElement>
                 </VisualElement>
 
@@ -218,6 +222,21 @@
                     <Button name="fleet-close-btn" text="X" class="control-btn" />
                 </VisualElement>
                 <VisualElement name="fleet-grid" class="fleet-grid" />
+            </VisualElement>
+
+            <!-- Alert Timeline Panel -->
+            <VisualElement name="alert-timeline-panel" class="alert-timeline-panel">
+                <VisualElement class="alert-timeline-header">
+                    <Label text="Alert Timeline" class="alert-timeline-title" />
+                    <Label name="alert-count" text="0 alerts" class="alert-timeline-count" />
+                </VisualElement>
+                <VisualElement class="alert-timeline-filters">
+                    <Button text="All" class="alert-filter-btn alert-filter-active" />
+                    <Button text="Anomaly" class="alert-filter-btn" />
+                    <Button text="Correlated" class="alert-filter-btn" />
+                    <Button text="Security" class="alert-filter-btn" />
+                </VisualElement>
+                <ScrollView name="alert-scroll-view" class="alert-timeline-scroll" />
             </VisualElement>
 
             <!-- Decision Support Panel (slide-out) -->

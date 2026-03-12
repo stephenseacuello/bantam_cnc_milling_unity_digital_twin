@@ -43,6 +43,8 @@ set(msg_files
   "msg/Explanation.msg"
   "msg/MaterialBatch.msg"
   "msg/PartRecord.msg"
+  "msg/StabilityRecommendation.msg"
+  "msg/InferredAction.msg"
 )
 
 set(srv_files

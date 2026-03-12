@@ -6,9 +6,16 @@ of process parameter changes before applying to physical machine.
 """
 
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 import re
 import threading
+import logging
+
+try:
+    from miracle_twin.prediction_validator import PredictionValidatorNode
+except ImportError:
+    PredictionValidatorNode = None  # type: ignore[assignment,misc]
 
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
@@ -21,6 +28,22 @@ from miracle_msgs.msg import MachineState, PHMPrediction
 from miracle_msgs.action import RunPrediction
 from miracle_msgs.srv import RunPrediction as RunPredictionSrv
 from miracle_twin.cutting_sim_proxy import CuttingSimProxy, GCodeBlock, ToolState
+from miracle_twin.tool_library import ToolLibrary
+
+
+@dataclass
+class GCodeParserState:
+    """Tracks modal G-code state across parsed lines."""
+    absolute_mode: bool = True    # G90 (True) vs G91 (False)
+    units_mm: bool = True         # G21 (True) vs G20 inches (False)
+    feed_mode_per_min: bool = True  # G94 (True) vs G95 per-rev (False)
+    current_x: float = 0.0
+    current_y: float = 0.0
+    current_z: float = 0.0
+    current_feed: float = 100.0
+    current_spindle: float = 1000.0
+    current_tool: int = 1
+    active_plane: str = 'XY'     # G17=XY, G18=ZX, G19=YZ
 
 
 @dataclass
@@ -49,11 +72,14 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         ~/predictions (PHMPrediction): Prediction results.
     """
 
-    # Regex for parsing G-code lines with G0/G1 motion commands
+    # Regex patterns for G-code parsing
     _GCODE_LINE_RE = re.compile(
-        r'^\s*[Nn]?\d*\s*([Gg]\s*[01])\s*(.*)', re.IGNORECASE
+        r'^\s*([Gg]\s*\d+\.?\d*)\s*(.*)', re.IGNORECASE
     )
     _PARAM_RE = re.compile(r'([A-Za-z])\s*([+-]?\d+\.?\d*)')
+    _LINE_NUMBER_RE = re.compile(r'^\s*[Nn]\s*\d+\s*')
+    _INLINE_COMMENT_RE = re.compile(r'\([^)]*\)')
+    _SEMICOLON_COMMENT_RE = re.compile(r';.*$')
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(
@@ -68,6 +94,8 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         self._active_predictions: int = 0
         self._lock = threading.Lock()
         self._latest_machine_state: Optional[MachineState] = None
+        self._tool_library = ToolLibrary()
+        self._validator: Optional[Any] = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure prediction runner."""
@@ -143,105 +171,412 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         """Cache latest machine state for use in predictions."""
         self._latest_machine_state = msg
 
-    def _parse_gcode_to_blocks(self, gcode_text: str) -> List[GCodeBlock]:
+    def set_validator(self, validator: Any) -> None:
+        """Attach a PredictionValidatorNode for prediction-vs-actual tracking.
+
+        Args:
+            validator: A PredictionValidatorNode instance (or any object
+                with a ``register_prediction(machine_id, predictions)`` method).
+        """
+        self._validator = validator
+
+    @staticmethod
+    def _strip_comments(line: str) -> str:
+        """Remove inline (...) and end-of-line ; comments from a G-code line."""
+        # Remove inline parenthesised comments
+        line = PredictionRunnerNode._INLINE_COMMENT_RE.sub('', line)
+        # Remove semicolon end-of-line comments
+        line = PredictionRunnerNode._SEMICOLON_COMMENT_RE.sub('', line)
+        return line.strip()
+
+    @staticmethod
+    def _strip_line_number(line: str) -> str:
+        """Remove N#### line number prefix."""
+        return PredictionRunnerNode._LINE_NUMBER_RE.sub('', line)
+
+    @staticmethod
+    def _parse_params(text: str) -> Dict[str, float]:
+        """Extract letter-value pairs from a G-code parameter string."""
+        params: Dict[str, float] = {}
+        for m in PredictionRunnerNode._PARAM_RE.finditer(text):
+            params[m.group(1).upper()] = float(m.group(2))
+        return params
+
+    @staticmethod
+    def _arc_length(
+        sx: float, sy: float, ex: float, ey: float,
+        ci: float, cj: float, direction: str,
+    ) -> float:
+        """Compute arc length from start/end points and center offsets."""
+        cx = sx + ci
+        cy = sy + cj
+        radius = math.sqrt((sx - cx) ** 2 + (sy - cy) ** 2)
+        if radius <= 0.0:
+            return 0.0
+        start_angle = math.atan2(sy - cy, sx - cx)
+        end_angle = math.atan2(ey - cy, ex - cx)
+        if direction == 'CW':
+            sweep = start_angle - end_angle
+            if sweep <= 0:
+                sweep += 2.0 * math.pi
+        else:
+            sweep = end_angle - start_angle
+            if sweep <= 0:
+                sweep += 2.0 * math.pi
+        return radius * sweep
+
+    def _parse_gcode_to_blocks(
+        self,
+        gcode_text: str,
+        depth_override: Optional[float] = None,
+    ) -> List[GCodeBlock]:
         """Parse raw G-code text into a list of GCodeBlock objects.
 
-        Extracts G0/G1 motion commands and their F (feed), S (spindle),
-        X/Y/Z coordinate parameters. Depth of cut is inferred from
-        negative Z movements.
+        Handles G0/G1 linear moves, G2/G3 arcs, G81/G83/G73 canned cycles,
+        modal state tracking, comments, line numbers, and tool changes.
 
         Args:
             gcode_text: Raw G-code program content as a string.
+            depth_override: Optional depth-of-cut scaling factor. When
+                provided, all Z movements are scaled proportionally
+                (e.g. 0.5 = half depth, 2.0 = double depth).
 
         Returns:
             List of GCodeBlock objects extracted from cutting moves.
             Returns empty list if no valid cutting moves are found.
         """
         blocks: List[GCodeBlock] = []
+        state = GCodeParserState()
+        logger = logging.getLogger('prediction_runner.gcode_parser')
 
-        # Track modal state across lines (G-code is modal)
-        current_feed = 0.0
-        current_spindle = 0.0
-        prev_z: Optional[float] = None
+        # Track the original Z reference for depth scaling
+        z_reference: Optional[float] = None
 
-        for line in gcode_text.splitlines():
-            line = line.strip()
-            if not line or line.startswith('(') or line.startswith('%'):
+        for raw_line in gcode_text.splitlines():
+            # --- Pre-processing ---
+            line = self._strip_comments(raw_line)
+            line = self._strip_line_number(line)
+
+            # Skip blank lines and program delimiters
+            if not line or line == '%':
                 continue
 
-            # Check for standalone S command (spindle speed)
-            s_match = re.search(r'[Ss]\s*(\d+\.?\d*)', line)
-            if s_match:
-                current_spindle = float(s_match.group(1))
+            # --- Extract all G/M codes and parameters from line ---
+            # A single line can contain multiple G/M words (e.g. "G90 G21")
+            all_params = self._parse_params(line)
 
-            # Check for standalone F command (feed rate)
-            f_match = re.search(r'[Ff]\s*(\d+\.?\d*)', line)
-            if f_match:
-                current_feed = float(f_match.group(1))
+            # Update modal feed / spindle from any line
+            if 'F' in all_params:
+                state.current_feed = all_params['F']
+            if 'S' in all_params:
+                state.current_spindle = all_params['S']
 
-            # Match G0/G1 motion commands
-            motion_match = self._GCODE_LINE_RE.match(line)
-            if not motion_match:
-                continue
+            # Find all G-codes on this line
+            g_codes = re.findall(r'[Gg]\s*(\d+\.?\d*)', line)
+            g_codes = [g.replace(' ', '') for g in g_codes]
 
-            g_cmd = motion_match.group(1).replace(' ', '').upper()
-            params_str = motion_match.group(2)
+            # Find all M-codes on this line
+            m_codes = re.findall(r'[Mm]\s*(\d+)', line)
 
-            # Parse parameters from the rest of the line
-            params: Dict[str, float] = {}
-            for p_match in self._PARAM_RE.finditer(params_str):
-                params[p_match.group(1).upper()] = float(p_match.group(2))
+            # --- Handle M-codes ---
+            for m in m_codes:
+                m_num = int(m)
+                if m_num == 6:
+                    # Tool change — update tool number from T word
+                    if 'T' in all_params:
+                        state.current_tool = int(all_params['T'])
+                    logger.debug(
+                        "Tool change M6: tool T%d", state.current_tool
+                    )
+                elif m_num == 98:
+                    # Subprogram call — not expanded
+                    p_num = all_params.get('P', 0)
+                    logger.warning(
+                        "Subprogram call M98 P%d not expanded; "
+                        "subroutine content will be skipped",
+                        int(p_num),
+                    )
 
-            # Update modal feed/spindle from this line
-            if 'F' in params:
-                current_feed = params['F']
-            if 'S' in params:
-                current_spindle = params['S']
+            # --- Process G-codes ---
+            for g_raw in g_codes:
+                g_num_str = g_raw.lstrip('0') or '0'
+                # Handle decimal G-codes like G28.1
+                try:
+                    g_val = float(g_raw)
+                except ValueError:
+                    continue
+                g_int = int(g_val)
 
-            # G0 is rapid — skip for cutting simulation
-            if g_cmd == 'G0':
-                if 'Z' in params:
-                    prev_z = params['Z']
-                continue
+                # --- Modal state changes ---
+                if g_int == 90:
+                    state.absolute_mode = True
+                    continue
+                elif g_int == 91:
+                    state.absolute_mode = False
+                    continue
+                elif g_int == 20:
+                    state.units_mm = False
+                    continue
+                elif g_int == 21:
+                    state.units_mm = True
+                    continue
+                elif g_int == 94:
+                    state.feed_mode_per_min = True
+                    continue
+                elif g_int == 95:
+                    state.feed_mode_per_min = False
+                    continue
+                elif g_int == 17:
+                    state.active_plane = 'XY'
+                    continue
+                elif g_int == 18:
+                    state.active_plane = 'ZX'
+                    continue
+                elif g_int == 19:
+                    state.active_plane = 'YZ'
+                    continue
 
-            # G1 is a cutting move
-            x = params.get('X')
-            y = params.get('Y')
-            z = params.get('Z')
+                # --- Convert inch coordinates if needed ---
+                inch_scale = 25.4 if not state.units_mm else 1.0
 
-            # Compute segment length from coordinate deltas
-            length = 0.0
-            if x is not None or y is not None:
-                # Approximate segment length from XY; assume small moves
-                dx = abs(x) if x is not None else 0.0
-                dy = abs(y) if y is not None else 0.0
-                length = (dx ** 2 + dy ** 2) ** 0.5
-            if length <= 0.0 and z is not None:
-                length = abs(z - (prev_z if prev_z is not None else 0.0))
+                # --- Rapid move G0 ---
+                if g_int == 0:
+                    if 'X' in all_params:
+                        val = all_params['X'] * inch_scale
+                        state.current_x = val if state.absolute_mode else state.current_x + val
+                    if 'Y' in all_params:
+                        val = all_params['Y'] * inch_scale
+                        state.current_y = val if state.absolute_mode else state.current_y + val
+                    if 'Z' in all_params:
+                        val = all_params['Z'] * inch_scale
+                        state.current_z = val if state.absolute_mode else state.current_z + val
+                    continue
 
-            # Infer axial depth from Z movement (negative Z = deeper cut)
-            axial_depth = 1.5  # default
-            if z is not None and prev_z is not None:
-                dz = prev_z - z  # positive when cutting deeper
-                if dz > 0:
-                    axial_depth = dz
+                # --- Linear cutting move G1 ---
+                if g_int == 1:
+                    prev_x, prev_y, prev_z = state.current_x, state.current_y, state.current_z
 
-            if z is not None:
-                prev_z = z
+                    if 'X' in all_params:
+                        val = all_params['X'] * inch_scale
+                        state.current_x = val if state.absolute_mode else state.current_x + val
+                    if 'Y' in all_params:
+                        val = all_params['Y'] * inch_scale
+                        state.current_y = val if state.absolute_mode else state.current_y + val
+                    if 'Z' in all_params:
+                        val = all_params['Z'] * inch_scale
+                        if depth_override is not None:
+                            if state.absolute_mode:
+                                val = val * depth_override
+                            else:
+                                val = val * depth_override
+                        state.current_z = val if state.absolute_mode else state.current_z + val
 
-            # Skip zero-length or zero-feed moves
-            if current_feed <= 0 or length <= 0.0:
-                continue
+                    dx = state.current_x - prev_x
+                    dy = state.current_y - prev_y
+                    dz = state.current_z - prev_z
+                    length = math.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
 
-            blocks.append(GCodeBlock(
-                feed_rate_mmpm=current_feed,
-                spindle_rpm=current_spindle,
-                axial_depth_mm=axial_depth,
-                radial_depth_mm=3.175,  # default half-tool-diameter
-                length_mm=length,
-            ))
+                    # Axial depth from Z movement
+                    axial_depth = 1.5  # default
+                    if dz < 0:
+                        axial_depth = abs(dz)
+                    elif prev_z < 0 and abs(dz) < 1e-9:
+                        # Lateral move at depth
+                        axial_depth = abs(prev_z) if abs(prev_z) > 0.01 else 1.5
+
+                    if state.current_feed <= 0 or length <= 0.0:
+                        continue
+
+                    blocks.append(GCodeBlock(
+                        feed_rate_mmpm=state.current_feed,
+                        spindle_rpm=state.current_spindle,
+                        axial_depth_mm=axial_depth,
+                        radial_depth_mm=3.175,
+                        length_mm=length,
+                    ))
+                    continue
+
+                # --- Arc moves G2 (CW) / G3 (CCW) ---
+                if g_int in (2, 3):
+                    direction = 'CW' if g_int == 2 else 'CCW'
+                    prev_x, prev_y = state.current_x, state.current_y
+
+                    end_x = all_params.get('X', state.current_x)
+                    end_y = all_params.get('Y', state.current_y)
+                    if state.absolute_mode:
+                        end_x *= inch_scale
+                        end_y *= inch_scale
+                    else:
+                        end_x = state.current_x + end_x * inch_scale
+                        end_y = state.current_y + end_y * inch_scale
+
+                    ci = all_params.get('I', 0.0) * inch_scale
+                    cj = all_params.get('J', 0.0) * inch_scale
+                    ck = all_params.get('K', 0.0) * inch_scale
+
+                    # R-format arc: compute I, J from radius
+                    if 'R' in all_params and 'I' not in all_params:
+                        r = all_params['R'] * inch_scale
+                        mid_x = (prev_x + end_x) / 2.0
+                        mid_y = (prev_y + end_y) / 2.0
+                        chord_dx = end_x - prev_x
+                        chord_dy = end_y - prev_y
+                        chord_len = math.sqrt(chord_dx ** 2 + chord_dy ** 2)
+                        if chord_len > 0 and abs(r) >= chord_len / 2.0:
+                            h = math.sqrt(max(0, r ** 2 - (chord_len / 2.0) ** 2))
+                            # Direction of perpendicular offset
+                            sign = -1.0 if (r > 0) == (direction == 'CW') else 1.0
+                            cx = mid_x + sign * h * (-chord_dy / chord_len)
+                            cy = mid_y + sign * h * (chord_dx / chord_len)
+                            ci = cx - prev_x
+                            cj = cy - prev_y
+
+                    arc_len = self._arc_length(
+                        prev_x, prev_y, end_x, end_y, ci, cj, direction
+                    )
+
+                    # Handle Z change during arc
+                    if 'Z' in all_params:
+                        val = all_params['Z'] * inch_scale
+                        if depth_override is not None:
+                            val = val * depth_override
+                        state.current_z = val if state.absolute_mode else state.current_z + val
+
+                    state.current_x = end_x
+                    state.current_y = end_y
+
+                    if state.current_feed <= 0 or arc_len <= 0.0:
+                        continue
+
+                    blocks.append(GCodeBlock(
+                        feed_rate_mmpm=state.current_feed,
+                        spindle_rpm=state.current_spindle,
+                        axial_depth_mm=1.5,
+                        radial_depth_mm=3.175,
+                        length_mm=arc_len,
+                        arc_center_i=ci,
+                        arc_center_j=cj,
+                        arc_center_k=ck,
+                        arc_direction=direction,
+                        start_x=prev_x,
+                        start_y=prev_y,
+                        end_x=end_x,
+                        end_y=end_y,
+                    ))
+                    continue
+
+                # --- Canned drilling cycles ---
+                if g_int in (81, 83, 73):
+                    drill_x = all_params.get('X', state.current_x)
+                    drill_y = all_params.get('Y', state.current_y)
+                    z_depth = all_params.get('Z', state.current_z) * inch_scale
+                    r_plane = all_params.get('R', 0.0) * inch_scale
+                    q_peck = all_params.get('Q', 0.0) * inch_scale
+
+                    if depth_override is not None:
+                        z_depth = z_depth * depth_override
+
+                    total_depth = abs(r_plane - z_depth)
+                    if total_depth <= 0:
+                        continue
+
+                    if g_int == 81:
+                        # Simple drill: single plunge
+                        blocks.append(GCodeBlock(
+                            feed_rate_mmpm=state.current_feed,
+                            spindle_rpm=state.current_spindle,
+                            axial_depth_mm=total_depth,
+                            radial_depth_mm=3.175,
+                            length_mm=total_depth,
+                        ))
+                    elif g_int in (83, 73):
+                        # Peck drill / chip break: multiple plunge passes
+                        if q_peck <= 0:
+                            q_peck = total_depth  # degenerate: single pass
+                        remaining = total_depth
+                        while remaining > 0:
+                            peck = min(q_peck, remaining)
+                            blocks.append(GCodeBlock(
+                                feed_rate_mmpm=state.current_feed,
+                                spindle_rpm=state.current_spindle,
+                                axial_depth_mm=peck,
+                                radial_depth_mm=3.175,
+                                length_mm=peck,
+                            ))
+                            remaining -= peck
+
+                    # Update position
+                    state.current_z = z_depth
+                    if state.absolute_mode:
+                        if 'X' in all_params:
+                            state.current_x = drill_x * inch_scale
+                        if 'Y' in all_params:
+                            state.current_y = drill_y * inch_scale
+                    continue
+
+            # If no G-code was found on this line but there are coordinate
+            # words, treat as modal continuation of last motion (G1)
+            if not g_codes and ('X' in all_params or 'Y' in all_params or 'Z' in all_params):
+                prev_x, prev_y, prev_z = state.current_x, state.current_y, state.current_z
+                if 'X' in all_params:
+                    val = all_params['X'] * (25.4 if not state.units_mm else 1.0)
+                    state.current_x = val if state.absolute_mode else state.current_x + val
+                if 'Y' in all_params:
+                    val = all_params['Y'] * (25.4 if not state.units_mm else 1.0)
+                    state.current_y = val if state.absolute_mode else state.current_y + val
+                if 'Z' in all_params:
+                    val = all_params['Z'] * (25.4 if not state.units_mm else 1.0)
+                    if depth_override is not None:
+                        val = val * depth_override
+                    state.current_z = val if state.absolute_mode else state.current_z + val
+
+                dx = state.current_x - prev_x
+                dy = state.current_y - prev_y
+                dz = state.current_z - prev_z
+                length = math.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+                axial_depth = abs(dz) if dz < 0 else 1.5
+                if state.current_feed > 0 and length > 0.0:
+                    blocks.append(GCodeBlock(
+                        feed_rate_mmpm=state.current_feed,
+                        spindle_rpm=state.current_spindle,
+                        axial_depth_mm=axial_depth,
+                        radial_depth_mm=3.175,
+                        length_mm=length,
+                    ))
 
         return blocks
+
+    def generate_explanation(
+        self,
+        blocks: List[GCodeBlock],
+        parameter_overrides: Optional[Dict[str, float]] = None,
+        depth_override: Optional[float] = None,
+    ) -> str:
+        """Generate a human-readable explanation of a parsed program.
+
+        Args:
+            blocks: Parsed G-code blocks.
+            parameter_overrides: Optional feed/speed overrides.
+            depth_override: Optional depth scaling factor.
+
+        Returns:
+            Multi-line summary string.
+        """
+        overrides = parameter_overrides or {}
+        n_linear = sum(1 for b in blocks if not b.is_arc)
+        n_arc = sum(1 for b in blocks if b.is_arc)
+        total_length = sum(b.length_mm for b in blocks)
+
+        lines = [
+            f"Program: {len(blocks)} cutting blocks "
+            f"({n_linear} linear, {n_arc} arc)",
+            f"Total toolpath length: {total_length:.1f} mm",
+        ]
+        if overrides:
+            lines.append(f"Parameter overrides: {overrides}")
+        if depth_override is not None:
+            lines.append(f"Depth-of-cut override: {depth_override:.2f}x")
+        return '\n'.join(lines)
 
     def _get_tool_state_from_machine(self) -> Optional[ToolState]:
         """Build a ToolState from cached machine state if available."""
@@ -345,12 +680,26 @@ class PredictionRunnerNode(MiracleLifecycleNode):
             if not blocks:
                 blocks = self._build_blocks_for_machine(request.machine_id)
 
+            # Extract tool_id from request goals if present
+            tool_id = getattr(request, 'tool_id', None) or None
+
             # Run real simulation via CuttingSimProxy
             proxy = CuttingSimProxy()
             tool_state = self._get_tool_state_from_machine()
             sim_result = proxy.simulate_program(
-                blocks, tool_state=tool_state
+                blocks, tool_state=tool_state, tool_id=tool_id,
             )
+
+            # Build tool info string for reporting
+            tool_info = ''
+            if proxy.active_tool is not None:
+                td = proxy.active_tool
+                tool_info = (
+                    f', "tool": {{"id": "{td.tool_id}", '
+                    f'"name": "{td.name}", '
+                    f'"material": "{td.tool_material}", '
+                    f'"diameter_mm": {td.diameter_mm}}}'
+                )
 
             prediction = PHMPrediction()
             prediction.timestamp = self.get_clock().now().to_msg()
@@ -365,10 +714,35 @@ class PredictionRunnerNode(MiracleLifecycleNode):
 
             self._prediction_pub.publish(prediction)
 
+            # Register predictions with the validator for accuracy tracking
+            if self._validator is not None:
+                peak_force = max(
+                    (bp.peak_force_n for bp in sim_result.block_predictions),
+                    default=0.0,
+                )
+                max_temp = max(
+                    (bp.temperature_rise_c for bp in sim_result.block_predictions),
+                    default=0.0,
+                )
+                max_power = max(
+                    (bp.power_w for bp in sim_result.block_predictions),
+                    default=0.0,
+                )
+                self._validator.register_prediction(
+                    request.machine_id,
+                    {
+                        'force': peak_force,
+                        'temperature': max_temp,
+                        'power': max_power,
+                    },
+                )
+
             goal_handle.succeed()
             result.success = True
             result.prediction = prediction
-            result.detailed_report_json = '{"status": "completed"}'
+            result.detailed_report_json = (
+                f'{{"status": "completed"{tool_info}}}'
+            )
 
         except Exception as exc:
             self.get_logger().error(f"Prediction error: {exc}")
@@ -410,12 +784,26 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         if not blocks:
             blocks = self._build_blocks_for_machine(request.machine_id)
 
+        # Extract tool_id from request if present
+        tool_id = getattr(request, 'tool_id', None) or None
+
         # Run real simulation via CuttingSimProxy
         proxy = CuttingSimProxy()
         tool_state = self._get_tool_state_from_machine()
         sim_result = proxy.simulate_program(
-            blocks, tool_state=tool_state
+            blocks, tool_state=tool_state, tool_id=tool_id,
         )
+
+        # Build tool info for reporting
+        tool_summary = ''
+        tool_json_fragment = ''
+        if proxy.active_tool is not None:
+            td = proxy.active_tool
+            tool_summary = f', Tool={td.name}'
+            tool_json_fragment = (
+                f', "tool_id": "{td.tool_id}", '
+                f'"tool_name": "{td.name}"'
+            )
 
         prediction = PHMPrediction()
         prediction.timestamp = self.get_clock().now().to_msg()
@@ -430,19 +818,44 @@ class PredictionRunnerNode(MiracleLifecycleNode):
 
         self._prediction_pub.publish(prediction)
 
+        # Register predictions with the validator for accuracy tracking
+        if self._validator is not None:
+            peak_force = max(
+                (bp.peak_force_n for bp in sim_result.block_predictions),
+                default=0.0,
+            )
+            max_temp = max(
+                (bp.temperature_rise_c for bp in sim_result.block_predictions),
+                default=0.0,
+            )
+            max_power = max(
+                (bp.power_w for bp in sim_result.block_predictions),
+                default=0.0,
+            )
+            self._validator.register_prediction(
+                request.machine_id,
+                {
+                    'force': peak_force,
+                    'temperature': max_temp,
+                    'power': max_power,
+                },
+            )
+
         response.success = True
         response.summary = (
             f"Prediction for {request.machine_id}: "
             f"RUL={prediction.remaining_useful_life_hours:.0f}h, "
             f"Health={prediction.health_index:.0%}, "
             f"Action: {prediction.recommended_action}"
+            f"{tool_summary}"
         )
         response.confidence = prediction.confidence
         response.detailed_report_json = (
             f'{{"machine_id": "{request.machine_id}", '
             f'"rul_hours": {prediction.remaining_useful_life_hours}, '
             f'"health_index": {prediction.health_index}, '
-            f'"confidence": {prediction.confidence}}}'
+            f'"confidence": {prediction.confidence}'
+            f'{tool_json_fragment}}}'
         )
         return response
 

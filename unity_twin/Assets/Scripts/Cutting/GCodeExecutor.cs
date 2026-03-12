@@ -13,6 +13,10 @@ namespace MiracleTwin.Cutting
     /// Handles linear moves (G0/G1) via position lerp and arc moves (G2/G3) via
     /// angular interpolation around the arc center. Integrates with SimulationClock
     /// for time scaling and pause/resume support.
+    ///
+    /// Supports a dry-run preview mode that simulates the entire toolpath without
+    /// affecting the physical machine, reporting predicted forces, wear, and
+    /// collision risks via the OnPreviewComplete event.
     /// </summary>
     public class GCodeExecutor : MonoBehaviour
     {
@@ -35,6 +39,20 @@ namespace MiracleTwin.Cutting
         [SerializeField] private GCodeLookahead lookahead;
         [SerializeField] private float lookaheadInterval = 0.5f;
         [SerializeField] private bool pauseOnLookaheadWarning = false;
+
+        [Header("Collision Response")]
+        [Tooltip("Auto-pause execution on FixtureCollision or OutOfEnvelope severity.")]
+        [SerializeField] private bool autoPauseOnCollision = true;
+
+        [Header("Preview Mode")]
+        [Tooltip("When true, execution simulates the toolpath without sending commands to the CNC controller.")]
+        [SerializeField] private bool previewMode = false;
+
+        /// <summary>Whether the executor is currently in dry-run preview mode.</summary>
+        public bool IsPreviewMode => previewMode;
+
+        /// <summary>Fired when a dry-run preview completes with the full analysis report.</summary>
+        public event Action<PreviewReport> OnPreviewComplete;
 
         // Interface reference resolved at runtime
         private ICNCController cncController;
@@ -212,8 +230,9 @@ namespace MiracleTwin.Cutting
                 // Guard against zero-duration segments
                 if (duration <= 0.0001f)
                 {
-                    // Jump instantly to end position
-                    cncController.SetTargetPosition(seg.endPos);
+                    // In preview mode, skip CNC controller commands
+                    if (!previewMode)
+                        cncController.SetTargetPosition(seg.endPos);
                     AdvanceToNextSegment();
                     continue;
                 }
@@ -225,9 +244,14 @@ namespace MiracleTwin.Cutting
                     // Finish this segment
                     dt -= remainingInSegment;
                     ElapsedDuration += remainingInSegment;
-                    cncController.SetTargetPosition(seg.endPos);
-                    cncController.SetSpindleSpeed(seg.spindleRPM);
-                    cncController.SetFeedRate(seg.feedRate);
+
+                    // In preview mode, skip CNC controller commands
+                    if (!previewMode)
+                    {
+                        cncController.SetTargetPosition(seg.endPos);
+                        cncController.SetSpindleSpeed(seg.spindleRPM);
+                        cncController.SetFeedRate(seg.feedRate);
+                    }
                     AdvanceToNextSegment();
                 }
                 else
@@ -238,10 +262,14 @@ namespace MiracleTwin.Cutting
                     ElapsedDuration += dt;
                     dt = 0f;
 
-                    Vector3 pos = InterpolateSegment(seg, segmentProgress);
-                    cncController.SetTargetPosition(pos);
-                    cncController.SetSpindleSpeed(seg.spindleRPM);
-                    cncController.SetFeedRate(seg.feedRate);
+                    // In preview mode, skip CNC controller commands
+                    if (!previewMode)
+                    {
+                        Vector3 pos = InterpolateSegment(seg, segmentProgress);
+                        cncController.SetTargetPosition(pos);
+                        cncController.SetSpindleSpeed(seg.spindleRPM);
+                        cncController.SetFeedRate(seg.feedRate);
+                    }
                 }
             }
 
@@ -254,7 +282,38 @@ namespace MiracleTwin.Cutting
                     var results = lookahead.RunLookahead(segments, currentSegmentIndex);
                     OnLookaheadUpdated?.Invoke(results);
 
-                    if (pauseOnLookaheadWarning && lookahead.HasWarnings)
+                    // Log and react to collision detections by severity
+                    bool shouldPauseForCollision = false;
+                    foreach (var r in results)
+                    {
+                        if (!r.collisionFlag) continue;
+
+                        switch (r.collisionSeverity)
+                        {
+                            case FixtureProfile.CollisionSeverity.OutOfEnvelope:
+                                Debug.LogError($"[GCodeExecutor] COLLISION: Segment {r.segmentIndex} — tool outside work envelope.");
+                                shouldPauseForCollision = true;
+                                break;
+                            case FixtureProfile.CollisionSeverity.FixtureCollision:
+                                Debug.LogError($"[GCodeExecutor] COLLISION: Segment {r.segmentIndex} — tool tip hits fixture.");
+                                shouldPauseForCollision = true;
+                                break;
+                            case FixtureProfile.CollisionSeverity.ShankCollision:
+                                Debug.LogWarning($"[GCodeExecutor] COLLISION: Segment {r.segmentIndex} — tool shank hits fixture.");
+                                shouldPauseForCollision = true;
+                                break;
+                            case FixtureProfile.CollisionSeverity.NearMiss:
+                                Debug.LogWarning($"[GCodeExecutor] Near-miss at segment {r.segmentIndex} — tool within 2x clearance of fixture.");
+                                break;
+                        }
+                    }
+
+                    if (autoPauseOnCollision && shouldPauseForCollision)
+                    {
+                        Debug.LogError("[GCodeExecutor] Fixture collision detected — auto-pausing execution.");
+                        IsPausedByUser = true;
+                    }
+                    else if (pauseOnLookaheadWarning && lookahead.HasWarnings)
                     {
                         Debug.LogWarning("[GCodeExecutor] Lookahead detected warnings — pausing execution.");
                         IsPausedByUser = true;
@@ -357,6 +416,262 @@ namespace MiracleTwin.Cutting
             segmentProgress = 0f;
             cncController?.SetTargetPosition(segments[index].startPos);
             OnSegmentChanged?.Invoke(index);
+        }
+
+        // ── Preview / Dry-Run Mode ──────────────────────────────────────────
+
+        /// <summary>
+        /// Enter preview mode: parses and validates the G-code, then runs
+        /// a full dry-run analysis over every block without sending any
+        /// commands to the CNC controller or modifying the workpiece.
+        /// </summary>
+        public void EnterPreviewMode(string gcodeText)
+        {
+            if (string.IsNullOrWhiteSpace(gcodeText))
+            {
+                Debug.LogWarning("[GCodeExecutor] Empty program, nothing to preview.");
+                return;
+            }
+
+            // Signature verification
+            var sigResult = GCodeSignatureVerifier.Verify(
+                gcodeText,
+                signaturePublicKey != null ? signaturePublicKey.text : null
+            );
+
+            if (sigResult == SignatureResult.Invalid)
+            {
+                Debug.LogError("[GCodeExecutor] G-code signature is INVALID — preview aborted.");
+                return;
+            }
+
+            if (sigResult == SignatureResult.Missing && requireSignedGCode)
+            {
+                Debug.LogError("[GCodeExecutor] G-code is unsigned and requireSignedGCode is enabled — preview aborted.");
+                return;
+            }
+
+            interpreter.Reset();
+            segments = interpreter.Interpret(gcodeText);
+
+            if (segments.Count == 0)
+            {
+                Debug.LogWarning("[GCodeExecutor] Program produced zero toolpath segments — nothing to preview.");
+                return;
+            }
+
+            // Validate against machine limits
+            var validation = GCodeValidator.ValidateProgram(segments, machineProfile);
+            foreach (var warn in validation.Warnings)
+                Debug.LogWarning($"[GCodeValidator] {warn}");
+            foreach (var err in validation.Errors)
+                Debug.LogError($"[GCodeValidator] {err}");
+
+            previewMode = true;
+            currentSegmentIndex = 0;
+            segmentProgress = 0f;
+
+            OnProgramLoaded?.Invoke(segments);
+            RunPreview();
+        }
+
+        /// <summary>
+        /// Exit preview mode and clear all preview data.
+        /// </summary>
+        public void ExitPreviewMode()
+        {
+            previewMode = false;
+            segments = null;
+            currentSegmentIndex = 0;
+            segmentProgress = 0f;
+            IsExecuting = false;
+            ElapsedDuration = 0f;
+        }
+
+        /// <summary>
+        /// Run a complete dry-run analysis over ALL segments using the
+        /// lookahead engine. Accumulates per-segment predictions for force,
+        /// power, wear, collision, and chatter risk, then fires OnPreviewComplete
+        /// with the full report.
+        /// </summary>
+        public void RunPreview()
+        {
+            if (segments == null || segments.Count == 0)
+            {
+                Debug.LogWarning("[GCodeExecutor] No segments loaded — cannot run preview.");
+                return;
+            }
+
+            var report = new PreviewReport
+            {
+                totalBlocks = segments.Count,
+                segments = new List<PreviewReport.PreviewSegment>(segments.Count)
+            };
+
+            // Run full lookahead over ALL blocks (not the default 50)
+            List<LookaheadResult> lookaheadResults = null;
+            if (lookahead != null)
+            {
+                lookaheadResults = lookahead.RunLookahead(segments, 0, segments.Count);
+            }
+
+            float cumulativeWear = 0f;
+            float estimatedTime = 0f;
+            float peakForce = 0f;
+            float peakPower = 0f;
+            int collisionCount = 0;
+            int chatterHigh = 0;
+            int chatterMedium = 0;
+
+            for (int i = 0; i < segments.Count; i++)
+            {
+                var seg = segments[i];
+                var previewSeg = new PreviewReport.PreviewSegment
+                {
+                    blockIndex = i,
+                    startPos = seg.startPos,
+                    endPos = seg.endPos
+                };
+
+                // Accumulate time from feed rate and distance
+                float segLength = Vector3.Distance(seg.startPos, seg.endPos);
+                if (seg.type == SegmentType.Rapid)
+                {
+                    // Rapid moves use a high feed rate estimate
+                    float rapidFeed = seg.feedRate > 0 ? seg.feedRate * rapidSpeedMultiplier : 10000f;
+                    estimatedTime += (segLength / rapidFeed) * 60f;
+                }
+                else if (seg.feedRate > 0.01f)
+                {
+                    estimatedTime += (segLength / seg.feedRate) * 60f;
+                }
+
+                // Pull predictions from the lookahead results
+                if (lookaheadResults != null && i < lookaheadResults.Count)
+                {
+                    var la = lookaheadResults[i];
+                    previewSeg.forceN = la.peakForceN;
+                    previewSeg.powerW = la.powerW;
+                    previewSeg.collisionSeverity = la.collisionSeverity;
+
+                    // Wear contribution is the delta from previous cumulative wear
+                    float wearDelta = la.cumulativeWearMM - cumulativeWear;
+                    previewSeg.wearContribution = Mathf.Max(0f, wearDelta);
+                    cumulativeWear = la.cumulativeWearMM;
+
+                    // Track peaks
+                    if (la.peakForceN > peakForce) peakForce = la.peakForceN;
+                    if (la.powerW > peakPower) peakPower = la.powerW;
+
+                    // Collision count
+                    if (la.collisionFlag) collisionCount++;
+
+                    // Chatter risk classification
+                    if (la.chatterRiskScore >= 0.7f)
+                    {
+                        previewSeg.chatterRisk = "HIGH";
+                        chatterHigh++;
+                    }
+                    else if (la.chatterRiskScore >= 0.4f)
+                    {
+                        previewSeg.chatterRisk = "MEDIUM";
+                        chatterMedium++;
+                    }
+                    else
+                    {
+                        previewSeg.chatterRisk = "LOW";
+                    }
+
+                    // Assign risk color based on combined risk assessment
+                    previewSeg.riskColor = DetermineRiskColor(la);
+                }
+                else
+                {
+                    previewSeg.chatterRisk = "LOW";
+                    previewSeg.riskColor = Color.green;
+                }
+
+                report.segments.Add(previewSeg);
+            }
+
+            report.estimatedTimeSeconds = estimatedTime;
+            report.peakForceN = peakForce;
+            report.peakPowerW = peakPower;
+            report.totalWearMM = cumulativeWear;
+            report.collisionCount = collisionCount;
+            report.chatterRiskHighCount = chatterHigh;
+            report.chatterRiskMediumCount = chatterMedium;
+
+            // Estimate remaining tool life from total wear
+            const float VBmax = 0.30f;
+            float remainingWearBudget = VBmax - cumulativeWear;
+            if (remainingWearBudget > 0 && estimatedTime > 0 && cumulativeWear > 0)
+                report.estimatedToolLifeMin = (remainingWearBudget / cumulativeWear) * (estimatedTime / 60f);
+            else if (cumulativeWear <= 0)
+                report.estimatedToolLifeMin = float.MaxValue;
+            else
+                report.estimatedToolLifeMin = 0f;
+
+            Debug.Log($"[GCodeExecutor] Preview complete: {report.totalBlocks} blocks, " +
+                      $"est. {report.estimatedTimeSeconds:F1}s, {report.collisionCount} collisions, " +
+                      $"peak force {report.peakForceN:F1}N");
+
+            OnPreviewComplete?.Invoke(report);
+        }
+
+        /// <summary>
+        /// Determine a risk color for a segment based on collision, chatter, and force levels.
+        /// Green = safe, Yellow = medium risk, Red = collision or high chatter risk.
+        /// </summary>
+        private Color DetermineRiskColor(LookaheadResult la)
+        {
+            // Red: collision detected or high chatter risk
+            if (la.collisionFlag)
+                return Color.red;
+            if (la.chatterRiskScore >= 0.7f)
+                return Color.red;
+
+            // Yellow: medium chatter risk, near-miss, or elevated force
+            if (la.chatterRiskScore >= 0.4f)
+                return Color.yellow;
+            if (la.collisionSeverity == FixtureProfile.CollisionSeverity.NearMiss)
+                return Color.yellow;
+
+            // Green: safe
+            return Color.green;
+        }
+
+        /// <summary>
+        /// Full report produced by a dry-run preview analysis.
+        /// Contains aggregate statistics and per-segment predictions.
+        /// </summary>
+        [Serializable]
+        public class PreviewReport
+        {
+            public int totalBlocks;
+            public float estimatedTimeSeconds;
+            public float peakForceN;
+            public float peakPowerW;
+            public float totalWearMM;
+            public float estimatedToolLifeMin;
+            public int collisionCount;
+            public int chatterRiskHighCount;
+            public int chatterRiskMediumCount;
+            public List<PreviewSegment> segments;
+
+            [Serializable]
+            public class PreviewSegment
+            {
+                public int blockIndex;
+                public Vector3 startPos;
+                public Vector3 endPos;
+                public float forceN;
+                public float powerW;
+                public float wearContribution;
+                public FixtureProfile.CollisionSeverity collisionSeverity;
+                public string chatterRisk; // "LOW", "MEDIUM", "HIGH"
+                public Color riskColor;    // Green=safe, Yellow=warning, Red=danger
+            }
         }
     }
 }

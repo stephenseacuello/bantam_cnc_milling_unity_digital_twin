@@ -1,0 +1,8 @@
+string machine_id
+float32 current_rpm
+float32 recommended_rpm
+float32 current_depth
+float32 max_stable_depth
+string risk_level
+float32 stability_margin
+string recommendation

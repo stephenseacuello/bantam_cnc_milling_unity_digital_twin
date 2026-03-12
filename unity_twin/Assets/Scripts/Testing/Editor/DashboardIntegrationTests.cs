@@ -88,9 +88,9 @@ namespace MiracleTwin.Testing.Editor
         [Test]
         public void ForcePanel_HasFxFyFzLabels()
         {
-            Assert.IsNotNull(root.Q<Label>("fx-value"), "fx-value missing");
-            Assert.IsNotNull(root.Q<Label>("fy-value"), "fy-value missing");
-            Assert.IsNotNull(root.Q<Label>("fz-value"), "fz-value missing");
+            Assert.IsNotNull(root.Q<Label>("force-x-value"), "force-x-value missing");
+            Assert.IsNotNull(root.Q<Label>("force-y-value"), "force-y-value missing");
+            Assert.IsNotNull(root.Q<Label>("force-z-value"), "force-z-value missing");
         }
 
         // ── Tool Wear ──────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ namespace MiracleTwin.Testing.Editor
         public void ToolWearPanel_HasProgressBarAndLabels()
         {
             Assert.IsNotNull(root.Q<ProgressBar>("wear-bar"), "wear-bar ProgressBar missing");
-            Assert.IsNotNull(root.Q<Label>("vb-value"), "vb-value missing");
+            Assert.IsNotNull(root.Q<Label>("wear-vb-value"), "wear-vb-value missing");
             Assert.IsNotNull(root.Q<Label>("wear-pct-value"), "wear-pct-value missing");
             Assert.IsNotNull(root.Q<Label>("wear-life-value"), "wear-life-value missing");
         }
@@ -235,9 +235,9 @@ namespace MiracleTwin.Testing.Editor
         public void OEEPanel_HasLabels()
         {
             Assert.IsNotNull(root.Q<Label>("oee-value"), "oee-value missing");
-            Assert.IsNotNull(root.Q<Label>("avail-value"), "avail-value missing");
-            Assert.IsNotNull(root.Q<Label>("perf-value"), "perf-value missing");
-            Assert.IsNotNull(root.Q<Label>("qual-value"), "qual-value missing");
+            Assert.IsNotNull(root.Q<Label>("availability-value"), "availability-value missing");
+            Assert.IsNotNull(root.Q<Label>("performance-value"), "performance-value missing");
+            Assert.IsNotNull(root.Q<Label>("quality-value"), "quality-value missing");
         }
 
         // ── Surface Roughness ──────────────────────────────────────────────

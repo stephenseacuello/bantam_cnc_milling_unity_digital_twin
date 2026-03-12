@@ -8,7 +8,7 @@ namespace MiracleTwin.UI
 {
     /// <summary>
     /// Fleet overview panel showing a grid of machine cards.
-    /// Each card displays: status indicator, sparkline (60s spindle load),
+    /// Each card displays: status indicator, multi-metric sparklines (load, temp, power, wear),
     /// wear bar, program progress, and alert badge count.
     /// Click a card to switch the dashboard to that machine's detailed view.
     /// </summary>
@@ -21,10 +21,15 @@ namespace MiracleTwin.UI
         [SerializeField] private AnomalyAlertEventSO onAnomalyAlert;
         [SerializeField] private ToolWearEventSO onToolWear;
         [SerializeField] private JobStatusEventSO onJobStatus;
+        [SerializeField] private CuttingStateEventSO cuttingStateEvent;
 
         [Header("Fleet Settings")]
         [SerializeField] private string[] machineIds = { "cnc1", "cnc2", "cnc3" };
         [SerializeField] private int sparklineSamples = 60;
+
+        [Header("Severity Thresholds (0-1 normalized)")]
+        [SerializeField] private float warningThreshold = 0.70f;
+        [SerializeField] private float criticalThreshold = 0.90f;
 
         /// <summary>Fired when user clicks a machine card. Parameter is machine_id.</summary>
         public event Action<string> OnMachineSelected;
@@ -34,6 +39,26 @@ namespace MiracleTwin.UI
         private readonly Dictionary<string, MachineCardData> cardData = new();
         private readonly Dictionary<string, VisualElement> cardElements = new();
 
+        /// <summary>Which metric(s) to display on the sparkline.</summary>
+        public enum SparklineMode
+        {
+            SpindleLoad,
+            Temperature,
+            Power,
+            Wear,
+            All
+        }
+
+        private static readonly Color SpindleLoadColor = new(0.3f, 0.9f, 1f, 0.9f);   // cyan
+        private static readonly Color TemperatureColor = new(1f, 0.65f, 0.15f, 0.9f);  // orange
+        private static readonly Color PowerColor = new(1f, 0.95f, 0.2f, 0.9f);         // yellow
+        private static readonly Color WearColor = new(0.95f, 0.25f, 0.25f, 0.9f);      // red
+
+        private static readonly Color StatusGreen = new(0.2f, 0.8f, 0.3f);
+        private static readonly Color StatusYellow = new(0.9f, 0.7f, 0.1f);
+        private static readonly Color StatusRed = new(0.9f, 0.2f, 0.2f);
+        private static readonly Color StatusGray = new(0.5f, 0.5f, 0.6f);
+
         private class MachineCardData
         {
             public string machineId;
@@ -42,8 +67,61 @@ namespace MiracleTwin.UI
             public float wearPercent;
             public float programProgress;
             public int alertCount;
-            public readonly Queue<float> sparklineData = new();
+            public bool hasActiveAnomaly;
+            public SparklineMode sparklineMode = SparklineMode.SpindleLoad;
             public Color statusColor = new(0.5f, 0.5f, 0.6f);
+
+            // Multi-metric history arrays (ring buffers)
+            public readonly float[] spindleLoadHistory;
+            public readonly float[] temperatureHistory;
+            public readonly float[] powerHistory;
+            public readonly float[] wearHistory;
+            public int historyIndex;
+            public int historyCount;
+
+            // Latest metric values for severity calculation
+            public float latestTemperature;
+            public float latestPower;
+            public float latestWear;
+
+            public MachineCardData(int samples)
+            {
+                spindleLoadHistory = new float[samples];
+                temperatureHistory = new float[samples];
+                powerHistory = new float[samples];
+                wearHistory = new float[samples];
+            }
+
+            public void PushSample(float load, float temp, float power, float wear)
+            {
+                spindleLoadHistory[historyIndex] = load;
+                temperatureHistory[historyIndex] = temp;
+                powerHistory[historyIndex] = power;
+                wearHistory[historyIndex] = wear;
+                historyIndex = (historyIndex + 1) % spindleLoadHistory.Length;
+                if (historyCount < spindleLoadHistory.Length) historyCount++;
+            }
+
+            public void PushLoadSample(float load)
+            {
+                spindleLoadHistory[historyIndex] = load;
+                temperatureHistory[historyIndex] = latestTemperature;
+                powerHistory[historyIndex] = latestPower;
+                wearHistory[historyIndex] = latestWear;
+                historyIndex = (historyIndex + 1) % spindleLoadHistory.Length;
+                if (historyCount < spindleLoadHistory.Length) historyCount++;
+            }
+
+            /// <summary>Get ordered samples from the ring buffer for the given metric.</summary>
+            public float[] GetOrdered(float[] ring)
+            {
+                if (historyCount == 0) return Array.Empty<float>();
+                var result = new float[historyCount];
+                int start = (historyCount < ring.Length) ? 0 : historyIndex;
+                for (int i = 0; i < historyCount; i++)
+                    result[i] = ring[(start + i) % ring.Length];
+                return result;
+            }
         }
 
         void Start()
@@ -59,7 +137,7 @@ namespace MiracleTwin.UI
             // Initialize card data for each machine
             foreach (var id in machineIds)
             {
-                cardData[id] = new MachineCardData { machineId = id };
+                cardData[id] = new MachineCardData(sparklineSamples) { machineId = id };
             }
 
             BuildCards();
@@ -75,6 +153,8 @@ namespace MiracleTwin.UI
                 onToolWear.Register(OnToolWearUpdate);
             if (onJobStatus != null)
                 onJobStatus.Register(OnJobStatusUpdate);
+            if (cuttingStateEvent != null)
+                cuttingStateEvent.Register(OnCuttingStateUpdate);
         }
 
         void OnDisable()
@@ -87,6 +167,8 @@ namespace MiracleTwin.UI
                 onToolWear.Unregister(OnToolWearUpdate);
             if (onJobStatus != null)
                 onJobStatus.Unregister(OnJobStatusUpdate);
+            if (cuttingStateEvent != null)
+                cuttingStateEvent.Unregister(OnCuttingStateUpdate);
         }
 
         /// <summary>Toggle fleet panel visibility.</summary>
@@ -183,6 +265,37 @@ namespace MiracleTwin.UI
             sparkline.generateVisualContent += (ctx) => DrawSparkline(ctx, machineId);
             card.Add(sparkline);
 
+            // Sparkline mode toggle button row
+            var modeRow = new VisualElement();
+            modeRow.AddToClassList("fleet-sparkline-mode-row");
+            string[] modeLabels = { "L", "T", "P", "W", "A" };
+            SparklineMode[] modes = {
+                SparklineMode.SpindleLoad, SparklineMode.Temperature,
+                SparklineMode.Power, SparklineMode.Wear, SparklineMode.All
+            };
+            Color[] modeColors = { SpindleLoadColor, TemperatureColor, PowerColor, WearColor, new Color(0.7f, 0.7f, 0.8f) };
+
+            for (int i = 0; i < modeLabels.Length; i++)
+            {
+                var btn = new Button();
+                btn.text = modeLabels[i];
+                btn.name = $"fleet-sparkmode-{machineId}-{i}";
+                btn.AddToClassList("fleet-sparkline-mode-btn");
+                btn.style.color = modeColors[i];
+                var capturedMode = modes[i];
+                var capturedId = machineId;
+                btn.clicked += () =>
+                {
+                    if (cardData.TryGetValue(capturedId, out var d))
+                    {
+                        d.sparklineMode = capturedMode;
+                        UpdateModeButtonHighlight(capturedId);
+                    }
+                };
+                modeRow.Add(btn);
+            }
+            card.Add(modeRow);
+
             // Wear bar
             var wearRow = new VisualElement();
             wearRow.AddToClassList("fleet-data-row");
@@ -213,13 +326,29 @@ namespace MiracleTwin.UI
             return card;
         }
 
+        private void UpdateModeButtonHighlight(string machineId)
+        {
+            if (!cardElements.TryGetValue(machineId, out var card)) return;
+            if (!cardData.TryGetValue(machineId, out var data)) return;
+
+            for (int i = 0; i < 5; i++)
+            {
+                var btn = card.Q<Button>($"fleet-sparkmode-{machineId}-{i}");
+                if (btn == null) continue;
+                bool active = (int)data.sparklineMode == i;
+                if (active)
+                    btn.AddToClassList("fleet-sparkline-mode-btn-active");
+                else
+                    btn.RemoveFromClassList("fleet-sparkline-mode-btn-active");
+            }
+
+            card.Q<VisualElement>($"fleet-sparkline-{machineId}")?.MarkDirtyRepaint();
+        }
+
         private void DrawSparkline(MeshGenerationContext ctx, string machineId)
         {
             if (!cardData.TryGetValue(machineId, out var data)) return;
-            if (data.sparklineData.Count < 2) return;
-
-            var painter = ctx.painter2D;
-            var samples = data.sparklineData.ToArray();
+            if (data.historyCount < 2) return;
 
             var sparklineEl = cardElements.TryGetValue(machineId, out var card)
                 ? card.Q<VisualElement>($"fleet-sparkline-{machineId}")
@@ -229,15 +358,68 @@ namespace MiracleTwin.UI
             Rect rect = sparklineEl.contentRect;
             if (rect.width < 5 || rect.height < 5) return;
 
-            painter.strokeColor = new Color(0.3f, 0.7f, 1f, 0.8f);
+            var painter = ctx.painter2D;
+
+            if (data.sparklineMode == SparklineMode.All)
+            {
+                // Draw all 4 metrics overlaid, each auto-scaled to its own range
+                DrawSingleMetricLine(painter, data.GetOrdered(data.spindleLoadHistory), rect, SpindleLoadColor);
+                DrawSingleMetricLine(painter, data.GetOrdered(data.temperatureHistory), rect, TemperatureColor);
+                DrawSingleMetricLine(painter, data.GetOrdered(data.powerHistory), rect, PowerColor);
+                DrawSingleMetricLine(painter, data.GetOrdered(data.wearHistory), rect, WearColor);
+            }
+            else
+            {
+                float[] samples;
+                Color color;
+                switch (data.sparklineMode)
+                {
+                    case SparklineMode.Temperature:
+                        samples = data.GetOrdered(data.temperatureHistory);
+                        color = TemperatureColor;
+                        break;
+                    case SparklineMode.Power:
+                        samples = data.GetOrdered(data.powerHistory);
+                        color = PowerColor;
+                        break;
+                    case SparklineMode.Wear:
+                        samples = data.GetOrdered(data.wearHistory);
+                        color = WearColor;
+                        break;
+                    default:
+                        samples = data.GetOrdered(data.spindleLoadHistory);
+                        color = SpindleLoadColor;
+                        break;
+                }
+
+                DrawSingleMetricLine(painter, samples, rect, color);
+            }
+        }
+
+        /// <summary>Draw a single sparkline series auto-scaled to its own min/max range.</summary>
+        private void DrawSingleMetricLine(Painter2D painter, float[] samples, Rect rect, Color color)
+        {
+            if (samples == null || samples.Length < 2) return;
+
+            // Find auto-scale range
+            float minVal = float.MaxValue, maxVal = float.MinValue;
+            for (int i = 0; i < samples.Length; i++)
+            {
+                if (samples[i] < minVal) minVal = samples[i];
+                if (samples[i] > maxVal) maxVal = samples[i];
+            }
+            float range = maxVal - minVal;
+            if (range < 0.001f) range = 1f; // avoid division by zero for flat lines
+
+            painter.strokeColor = color;
             painter.lineWidth = 1.5f;
             painter.BeginPath();
 
-            float maxVal = 100f;
             for (int i = 0; i < samples.Length; i++)
             {
-                float x = (i / (float)(sparklineSamples - 1)) * rect.width;
-                float y = rect.height - (samples[i] / maxVal) * rect.height;
+                float x = (i / (float)(samples.Length - 1)) * rect.width;
+                float normalized = (samples[i] - minVal) / range;
+                float y = rect.height - normalized * rect.height;
                 y = Mathf.Clamp(y, 0, rect.height);
 
                 if (i == 0) painter.MoveTo(new Vector2(x, y));
@@ -247,31 +429,61 @@ namespace MiracleTwin.UI
             painter.Stroke();
         }
 
+        /// <summary>Compute severity color from worst metric. Green = normal, Yellow = warning, Red = critical.</summary>
+        private Color ComputeSeverityColor(MachineCardData data)
+        {
+            // Normalize each metric to 0-1 range against reasonable maxes
+            float loadNorm = Mathf.Clamp01(data.spindleLoad / 100f);
+            float tempNorm = Mathf.Clamp01(data.latestTemperature / 100f);
+            float powerNorm = Mathf.Clamp01(data.latestPower / 1000f);
+            float wearNorm = Mathf.Clamp01(data.latestWear / 100f);
+
+            float worst = Mathf.Max(loadNorm, Mathf.Max(tempNorm, Mathf.Max(powerNorm, wearNorm)));
+
+            if (data.hasActiveAnomaly || worst >= criticalThreshold)
+                return StatusRed;
+            if (worst >= warningThreshold)
+                return StatusYellow;
+            return StatusGreen;
+        }
+
         private void OnMachineStateUpdate(RosMessageTypes.Miracle.MachineStateMsg msg)
         {
             string id = msg.machine_id;
             if (!cardData.ContainsKey(id)) return;
 
             var data = cardData[id];
-            data.status = msg.machine_status ?? "UNKNOWN";
+            data.status = msg.status ?? "UNKNOWN";
             data.spindleLoad = (float)msg.spindle_load;
 
-            // Add to sparkline
-            data.sparklineData.Enqueue(data.spindleLoad);
-            while (data.sparklineData.Count > sparklineSamples)
-                data.sparklineData.Dequeue();
+            // Derive temperature from spindle_speed as proxy (no spindle_temp field on ROS msg)
+            // and power from spindle_load * 10
+            data.latestPower = data.spindleLoad * 10f;
 
-            // Update status color
-            data.statusColor = data.status switch
-            {
-                "RUNNING" => new Color(0.2f, 0.8f, 0.3f),
-                "IDLE" => new Color(0.5f, 0.5f, 0.6f),
-                "ERROR" or "FAULT" => new Color(0.9f, 0.2f, 0.2f),
-                "MAINTENANCE" => new Color(0.9f, 0.7f, 0.1f),
-                _ => new Color(0.5f, 0.5f, 0.6f),
-            };
+            // Push history sample with latest known values
+            data.PushLoadSample(data.spindleLoad);
+
+            // Update status color based on worst metric severity
+            data.statusColor = ComputeSeverityColor(data);
 
             UpdateCardUI(id, data);
+        }
+
+        private void OnCuttingStateUpdate(CuttingStateData cuttingData)
+        {
+            // CuttingStateData is not machine-keyed; apply to all machines or first active
+            // For fleet view, apply to all cards (the simulation drives all machines)
+            foreach (var kvp in cardData)
+            {
+                var data = kvp.Value;
+                data.latestTemperature = cuttingData.toolTemperature;
+                data.latestPower = cuttingData.powerWatts;
+                data.latestWear = cuttingData.wearPercentage;
+
+                // Re-derive severity
+                data.statusColor = ComputeSeverityColor(data);
+                UpdateCardUI(kvp.Key, data);
+            }
         }
 
         private void OnAnomalyAlert(RosMessageTypes.Miracle.AnomalyAlertMsg msg)
@@ -281,6 +493,8 @@ namespace MiracleTwin.UI
 
             var data = cardData[id];
             data.alertCount++;
+            data.hasActiveAnomaly = true;
+            data.statusColor = ComputeSeverityColor(data);
             UpdateCardUI(id, data);
 
             Debug.Log($"[FleetOverview] Anomaly alert for {id}: {msg.anomaly_type} " +
@@ -294,6 +508,8 @@ namespace MiracleTwin.UI
 
             var data = cardData[id];
             data.wearPercent = (float)msg.wear_percentage;
+            data.latestWear = data.wearPercent;
+            data.statusColor = ComputeSeverityColor(data);
             UpdateCardUI(id, data);
         }
 
@@ -313,6 +529,8 @@ namespace MiracleTwin.UI
             if (cardData.TryGetValue(machineId, out var data))
             {
                 data.alertCount = count;
+                data.hasActiveAnomaly = count > 0;
+                data.statusColor = ComputeSeverityColor(data);
                 UpdateCardUI(machineId, data);
             }
         }
@@ -323,6 +541,8 @@ namespace MiracleTwin.UI
             if (cardData.TryGetValue(machineId, out var data))
             {
                 data.wearPercent = percent;
+                data.latestWear = percent;
+                data.statusColor = ComputeSeverityColor(data);
                 UpdateCardUI(machineId, data);
             }
         }
@@ -333,6 +553,17 @@ namespace MiracleTwin.UI
             if (cardData.TryGetValue(machineId, out var data))
             {
                 data.programProgress = progress;
+                UpdateCardUI(machineId, data);
+            }
+        }
+
+        /// <summary>Clear active anomaly flag for a machine (e.g. after operator acknowledges).</summary>
+        public void ClearAnomaly(string machineId)
+        {
+            if (cardData.TryGetValue(machineId, out var data))
+            {
+                data.hasActiveAnomaly = false;
+                data.statusColor = ComputeSeverityColor(data);
                 UpdateCardUI(machineId, data);
             }
         }

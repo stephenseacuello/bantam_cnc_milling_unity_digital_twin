@@ -18,7 +18,13 @@ from miracle_msgs.msg import (
     AnomalyAlert,
     MachineState,
     FeedOverride,
+    StabilityRecommendation,
 )
+
+try:
+    from miracle_msgs.msg import InferredAction
+except ImportError:
+    InferredAction = None
 
 
 @dataclass
@@ -74,6 +80,10 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
         self._min_feed_override: float = 20.0
         self._dismissed_until: float = 0.0
         self._max_force_capacity: float = 1000.0  # Newtons, configurable
+        self._consecutive_medium_count: int = 0
+        self._medium_persistence_threshold: int = 3
+        self._last_stability_recommendation: Optional['StabilityRecommendation'] = None
+        self._last_inferred_actions: dict = {}  # action_type -> timestamp (seconds)
 
     def _do_configure(self) -> TransitionCallbackReturn:
         params = self.declare_and_validate_parameters({
@@ -110,6 +120,21 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
             AnomalyAlert, 'anomaly', self._on_anomaly,
             QoSProfiles.alert(), [self._machine_id],
         )
+
+        self.create_subscription(
+            StabilityRecommendation,
+            f'/miracle/{self._machine_id}/stability_recommendation',
+            self._on_stability_recommendation,
+            QoSProfiles.sensor_data(),
+        )
+
+        if InferredAction is not None:
+            self.create_subscription(
+                InferredAction,
+                '/miracle/cognitive/inferred_actions',
+                self._on_inferred_action,
+                QoSProfiles.sensor_data(),
+            )
 
         self.get_logger().info(f"Adaptive controller configured for '{self._machine_id}'")
         return TransitionCallbackReturn.SUCCESS
@@ -169,6 +194,126 @@ class AdaptiveControllerNode(MiracleLifecycleNode):
                 self._state.chatter_risk = 'LOW'
         if 'wear' in atype:
             self._state.wear_ratio = msg.severity
+
+    def _on_stability_recommendation(self, msg: 'StabilityRecommendation') -> None:
+        """Handle stability recommendation from the digital twin's StabilityLobePredictor.
+
+        HIGH risk: if recommended RPM differs by >5%, publish spindle override immediately.
+        MEDIUM risk: only trigger override after 3 consecutive MEDIUM messages.
+        LOW risk: reset consecutive counter.
+        """
+        self._last_stability_recommendation = msg
+        risk = msg.risk_level.upper()
+
+        if risk == 'HIGH':
+            self._consecutive_medium_count = 0
+            rpm_diff_pct = abs(msg.recommended_rpm - msg.current_rpm) / max(msg.current_rpm, 1.0)
+            if rpm_diff_pct > 0.05:
+                # Compute spindle override as percentage of current RPM
+                spindle_pct = min(100.0, max(80.0, (msg.recommended_rpm / max(msg.current_rpm, 1.0)) * 100.0))
+                override_msg = FeedOverride()
+                override_msg.timestamp = self.get_clock().now().to_msg()
+                override_msg.feed_override_pct = 80.0
+                override_msg.spindle_override_pct = spindle_pct
+                override_msg.reason = (
+                    f"stability_recommendation=HIGH; {msg.recommendation}"
+                )
+                override_msg.confidence = 1.0 - msg.stability_margin
+                override_msg.revert_after_sec = 15.0
+                self._override_pub.publish(override_msg)
+                self.get_logger().warn(
+                    f"Stability HIGH: spindle override {spindle_pct:.0f}% "
+                    f"(current={msg.current_rpm:.0f}, recommended={msg.recommended_rpm:.0f})"
+                )
+            else:
+                self.get_logger().warn(
+                    f"Stability HIGH but RPM diff <5% — no spindle adjustment. "
+                    f"{msg.recommendation}"
+                )
+        elif risk == 'MEDIUM':
+            self._consecutive_medium_count += 1
+            self.get_logger().warning(
+                f"Stability MEDIUM ({self._consecutive_medium_count}/{self._medium_persistence_threshold}): "
+                f"{msg.recommendation}"
+            )
+            if self._consecutive_medium_count >= self._medium_persistence_threshold:
+                rpm_diff_pct = abs(msg.recommended_rpm - msg.current_rpm) / max(msg.current_rpm, 1.0)
+                if rpm_diff_pct > 0.05:
+                    spindle_pct = min(100.0, max(80.0, (msg.recommended_rpm / max(msg.current_rpm, 1.0)) * 100.0))
+                else:
+                    spindle_pct = 97.0
+                override_msg = FeedOverride()
+                override_msg.timestamp = self.get_clock().now().to_msg()
+                override_msg.feed_override_pct = 90.0
+                override_msg.spindle_override_pct = spindle_pct
+                override_msg.reason = (
+                    f"stability_recommendation=MEDIUM (persistent {self._consecutive_medium_count}x); "
+                    f"{msg.recommendation}"
+                )
+                override_msg.confidence = 1.0 - msg.stability_margin
+                override_msg.revert_after_sec = 10.0
+                self._override_pub.publish(override_msg)
+                self.get_logger().warn(
+                    f"Stability MEDIUM persistent: spindle override {spindle_pct:.0f}%"
+                )
+                self._consecutive_medium_count = 0
+        else:
+            # LOW risk — reset counter
+            self._consecutive_medium_count = 0
+
+    def _on_inferred_action(self, msg) -> None:
+        """Handle an inferred action from the cognitive reasoning engine."""
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        action = msg.action_type
+        confidence = msg.confidence
+
+        # Deduplication: skip if same action_type was applied within 30 seconds
+        if action in self._last_inferred_actions and (now_sec - self._last_inferred_actions[action]) < 30.0:
+            self.get_logger().debug(
+                f"Inferred action '{action}' deduplicated (last applied {now_sec - self._last_inferred_actions[action]:.1f}s ago)"
+            )
+            return
+
+        override_msg = FeedOverride()
+        override_msg.timestamp = self.get_clock().now().to_msg()
+        override_msg.reason = f'inferred_action={action}; rule={msg.inference_rule}; {msg.reasoning}'
+        override_msg.confidence = confidence
+        override_msg.revert_after_sec = 15.0
+
+        if action == 'REDUCE_FEED' and confidence > 0.7:
+            override_msg.feed_override_pct = 70.0
+            override_msg.spindle_override_pct = 100.0
+            self._override_pub.publish(override_msg)
+            self._last_inferred_actions[action] = now_sec
+            self.get_logger().info(f"Inferred action REDUCE_FEED: feed override 70% (conf={confidence:.2f})")
+
+        elif action == 'REDUCE_SPEED' and confidence > 0.7:
+            override_msg.feed_override_pct = 100.0
+            override_msg.spindle_override_pct = 85.0
+            self._override_pub.publish(override_msg)
+            self._last_inferred_actions[action] = now_sec
+            self.get_logger().info(f"Inferred action REDUCE_SPEED: spindle override 85% (conf={confidence:.2f})")
+
+        elif action == 'TOOL_CHANGE' and confidence > 0.8:
+            override_msg.feed_override_pct = 50.0
+            override_msg.spindle_override_pct = 100.0
+            self._override_pub.publish(override_msg)
+            self._last_inferred_actions[action] = now_sec
+            self.get_logger().info(f"Inferred action TOOL_CHANGE: protective slowdown 50% (conf={confidence:.2f})")
+
+        elif action == 'COOLANT_INCREASE':
+            self.get_logger().warning(
+                f"Inferred action COOLANT_INCREASE: coolant system adjustment needed "
+                f"(conf={confidence:.2f}, rule={msg.inference_rule})"
+            )
+            self._last_inferred_actions[action] = now_sec
+
+        elif action == 'PAUSE' and confidence > 0.9:
+            override_msg.feed_override_pct = 0.0
+            override_msg.spindle_override_pct = 100.0
+            self._override_pub.publish(override_msg)
+            self._last_inferred_actions[action] = now_sec
+            self.get_logger().warning(f"Inferred action PAUSE: emergency stop 0% (conf={confidence:.2f})")
 
     def _compute_and_publish(self) -> None:
         now_sec = self.get_clock().now().nanoseconds / 1e9

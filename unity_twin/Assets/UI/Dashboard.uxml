@@ -210,6 +210,37 @@
                     <TextField name="gcode-editor" multiline="true" class="gcode-text-field" />
                 </VisualElement>
             </VisualElement>
+
+            <!-- Fleet Overview Panel (toggleable overlay) -->
+            <VisualElement name="fleet-overview-panel" class="fleet-panel">
+                <VisualElement class="fleet-panel-header">
+                    <Label text="Fleet Overview" class="panel-title" />
+                    <Button name="fleet-close-btn" text="X" class="control-btn" />
+                </VisualElement>
+                <VisualElement name="fleet-grid" class="fleet-grid" />
+            </VisualElement>
+
+            <!-- Decision Support Panel (slide-out) -->
+            <VisualElement name="decision-support-panel" class="decision-panel">
+                <VisualElement class="decision-panel-header">
+                    <Label text="Decision Support" class="panel-title" />
+                    <Button name="decision-close-btn" text="X" class="control-btn" />
+                </VisualElement>
+                <Label name="decision-situation" text="" class="decision-situation" />
+                <VisualElement class="decision-section">
+                    <Label text="Root Cause" class="decision-section-title" />
+                    <Label name="decision-root-cause" text="--" class="decision-root-cause" />
+                </VisualElement>
+                <VisualElement class="decision-section">
+                    <Label text="Recommended Actions" class="decision-section-title" />
+                    <VisualElement name="decision-actions-list" class="decision-actions-list" />
+                </VisualElement>
+                <VisualElement class="decision-section">
+                    <Label text="What-If Analysis" class="decision-section-title" />
+                    <Slider name="whatif-slider" label="Feed Override %" low-value="10" high-value="100" value="100" class="whatif-slider" />
+                    <Label name="whatif-result" text="" class="whatif-result" />
+                </VisualElement>
+            </VisualElement>
         </VisualElement>
 
         <!-- Bottom Control Bar -->

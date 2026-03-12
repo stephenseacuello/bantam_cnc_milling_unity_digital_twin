@@ -122,6 +122,25 @@ done
 ok "All node keys generated"
 
 # ---------------------------------------------------------------------------
+# 3b. Generate Ed25519 key pair for G-code signing
+# ---------------------------------------------------------------------------
+info "Generating Ed25519 key pair for G-code signing..."
+
+GCODE_KEY_DIR="$WS_ROOT/security"
+mkdir -p "$GCODE_KEY_DIR"
+
+# Generate Ed25519 key pair using openssl
+openssl genpkey -algorithm Ed25519 -out "$GCODE_KEY_DIR/gcode_signing.key" 2>/dev/null
+openssl pkey -in "$GCODE_KEY_DIR/gcode_signing.key" -pubout -out "$GCODE_KEY_DIR/gcode_signing.pub" 2>/dev/null
+
+chmod 600 "$GCODE_KEY_DIR/gcode_signing.key"
+chmod 644 "$GCODE_KEY_DIR/gcode_signing.pub"
+
+ok "G-code signing key pair generated"
+info "  Private key: $GCODE_KEY_DIR/gcode_signing.key (keep secure!)"
+info "  Public key:  $GCODE_KEY_DIR/gcode_signing.pub (embed in Unity build)"
+
+# ---------------------------------------------------------------------------
 # 4. Set environment variables for DDS security enforcement
 # ---------------------------------------------------------------------------
 info "Writing security environment file to $SECURITY_ENV_FILE ..."
@@ -155,6 +174,43 @@ ok "Security environment file written"
 export ROS_SECURITY_KEYSTORE="$KEYSTORE_DIR"
 export ROS_SECURITY_ENABLE=true
 export ROS_SECURITY_STRATEGY=Enforce
+
+# ---------------------------------------------------------------------------
+# 5. Sign governance and permissions XML for SROS2
+# ---------------------------------------------------------------------------
+info "Signing SROS2 governance and permissions..."
+
+GOVERNANCE_XML="$WS_ROOT/config/sros2_governance.xml"
+PERMISSIONS_XML="$WS_ROOT/config/sros2_permissions.xml"
+
+if [ -f "$GOVERNANCE_XML" ] && [ -f "$PERMISSIONS_XML" ]; then
+    # Sign governance with CA key
+    CA_CERT="$KEYSTORE_DIR/public/ca.cert.pem"
+    CA_KEY="$KEYSTORE_DIR/private/ca.key.pem"
+
+    if [ -f "$CA_CERT" ] && [ -f "$CA_KEY" ]; then
+        for node in "${NODES[@]}"; do
+            ENCLAVE_DIR="$KEYSTORE_DIR/enclaves/$node"
+            if [ -d "$ENCLAVE_DIR" ]; then
+                # Copy governance and permissions, sign with PKCS7
+                openssl smime -sign -text -in "$GOVERNANCE_XML" \
+                    -out "$ENCLAVE_DIR/governance.p7s" \
+                    -signer "$CA_CERT" -inkey "$CA_KEY" 2>/dev/null || true
+
+                openssl smime -sign -text -in "$PERMISSIONS_XML" \
+                    -out "$ENCLAVE_DIR/permissions.p7s" \
+                    -signer "$CA_CERT" -inkey "$CA_KEY" 2>/dev/null || true
+            fi
+        done
+        ok "Governance and permissions signed for all enclaves"
+    else
+        warn "CA cert/key not found — skipping governance signing"
+        warn "  Expected: $CA_CERT and $CA_KEY"
+    fi
+else
+    warn "Governance/permissions XML not found — skipping"
+    warn "  Expected: $GOVERNANCE_XML and $PERMISSIONS_XML"
+fi
 
 # ---------------------------------------------------------------------------
 # Done

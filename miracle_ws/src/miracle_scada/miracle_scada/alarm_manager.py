@@ -16,7 +16,7 @@ from rclpy.lifecycle import TransitionCallbackReturn
 
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
-from miracle_msgs.msg import AnomalyAlert, SecurityAlert
+from miracle_msgs.msg import AnomalyAlert, SecurityAlert, CorrelatedAlert
 
 
 class AlarmState(Enum):
@@ -72,6 +72,8 @@ class AlarmManagerNode(MiracleLifecycleNode):
         self._max_alarms: int = 1000
         self._escalation_timeout: float = 300.0
         self._history_size: int = 10000
+        self._correlated_sub = None
+        self._correlated_suppression: set = set()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure alarm manager."""
@@ -115,6 +117,14 @@ class AlarmManagerNode(MiracleLifecycleNode):
             SecurityAlert,
             '/miracle/security/alerts',
             self._on_security_alert,
+            QoSProfiles.alert(),
+        )
+
+        # Subscribe to correlated alerts
+        self._correlated_sub = self.create_subscription(
+            CorrelatedAlert,
+            '/miracle/scada/correlated_alerts',
+            self._on_correlated_alert,
             QoSProfiles.alert(),
         )
 
@@ -173,6 +183,30 @@ class AlarmManagerNode(MiracleLifecycleNode):
                 self._active_alarms[alarm_id] = alarm
                 self.get_logger().warn(
                     f"Security alarm: [{alarm_id}] {alarm.message}"
+                )
+
+    def _on_correlated_alert(self, msg: CorrelatedAlert) -> None:
+        """Process correlated alert — suppress individual alerts that are part of the group."""
+        # Track which alert IDs are part of this correlation for suppression
+        for alert_ref in msg.contributing_alert_ids:
+            self._correlated_suppression.add(alert_ref)
+
+        # Create a single consolidated alarm for the correlated group
+        alarm_id = msg.correlation_id
+        alarm = Alarm(
+            alarm_id=alarm_id,
+            source=msg.machine_id,
+            severity=msg.severity,
+            message=f"CORRELATED: {msg.root_cause_hypothesis}",
+            timestamp=msg.timestamp.sec + msg.timestamp.nanosec * 1e-9,
+        )
+
+        with self._alarms_lock:
+            if len(self._active_alarms) < self._max_alarms:
+                self._active_alarms[alarm_id] = alarm
+                self.get_logger().info(
+                    f"Correlated alarm: [{alarm_id}] {msg.category} "
+                    f"({len(msg.contributing_alert_ids)} contributing alerts)"
                 )
 
     def _check_escalations(self) -> None:

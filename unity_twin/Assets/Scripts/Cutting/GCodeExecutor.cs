@@ -25,6 +25,17 @@ namespace MiracleTwin.Cutting
         [Tooltip("Speed multiplier for G0 rapid moves relative to programmed feedrate.")]
         [SerializeField] private float rapidSpeedMultiplier = 5f;
 
+        [Header("Security")]
+        [Tooltip("When true, refuse to execute G-code with Invalid signatures.")]
+        [SerializeField] private bool requireSignedGCode = false;
+        [Tooltip("Public key PEM for signature verification (TextAsset).")]
+        [SerializeField] private TextAsset signaturePublicKey;
+
+        [Header("Lookahead")]
+        [SerializeField] private GCodeLookahead lookahead;
+        [SerializeField] private float lookaheadInterval = 0.5f;
+        [SerializeField] private bool pauseOnLookaheadWarning = false;
+
         // Interface reference resolved at runtime
         private ICNCController cncController;
 
@@ -46,6 +57,7 @@ namespace MiracleTwin.Cutting
         public int TotalSegments => segments?.Count ?? 0;
         public float TotalDuration { get; private set; }
         public float ElapsedDuration { get; private set; }
+        private float lastLookaheadTime;
 
         /// <summary>Read-only access to parsed toolpath segments (for preview rendering).</summary>
         public IReadOnlyList<ToolpathSegment> Segments => segments;
@@ -55,6 +67,7 @@ namespace MiracleTwin.Cutting
         public event Action OnExecutionComplete;
         public event Action<int> OnSegmentChanged;
         public event Action<IReadOnlyList<ToolpathSegment>> OnProgramLoaded;
+        public event Action<IReadOnlyList<LookaheadResult>> OnLookaheadUpdated;
 
         void Awake()
         {
@@ -83,6 +96,29 @@ namespace MiracleTwin.Cutting
             {
                 Debug.LogError("[GCodeExecutor] No ICNCController assigned.");
                 return;
+            }
+
+            // Signature verification
+            var sigResult = GCodeSignatureVerifier.Verify(
+                gcodeText,
+                signaturePublicKey != null ? signaturePublicKey.text : null
+            );
+
+            if (sigResult == SignatureResult.Invalid)
+            {
+                Debug.LogError("[GCodeExecutor] G-code signature is INVALID — execution aborted.");
+                return;
+            }
+
+            if (sigResult == SignatureResult.Missing && requireSignedGCode)
+            {
+                Debug.LogError("[GCodeExecutor] G-code is unsigned and requireSignedGCode is enabled — execution aborted.");
+                return;
+            }
+
+            if (sigResult == SignatureResult.Missing)
+            {
+                Debug.LogWarning("[GCodeExecutor] G-code is unsigned. Set requireSignedGCode=true to enforce signing.");
             }
 
             interpreter.Reset();
@@ -206,6 +242,23 @@ namespace MiracleTwin.Cutting
                     cncController.SetTargetPosition(pos);
                     cncController.SetSpindleSpeed(seg.spindleRPM);
                     cncController.SetFeedRate(seg.feedRate);
+                }
+            }
+
+            // Trigger lookahead analysis periodically
+            if (lookahead != null && segments != null && currentSegmentIndex < segments.Count)
+            {
+                if (Time.time - lastLookaheadTime > lookaheadInterval)
+                {
+                    lastLookaheadTime = Time.time;
+                    var results = lookahead.RunLookahead(segments, currentSegmentIndex);
+                    OnLookaheadUpdated?.Invoke(results);
+
+                    if (pauseOnLookaheadWarning && lookahead.HasWarnings)
+                    {
+                        Debug.LogWarning("[GCodeExecutor] Lookahead detected warnings — pausing execution.");
+                        IsPausedByUser = true;
+                    }
                 }
             }
 

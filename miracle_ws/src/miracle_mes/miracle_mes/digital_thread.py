@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import hashlib
 import json
 import threading
+import time
 import uuid
 
 from rclpy.lifecycle import TransitionCallbackReturn
@@ -37,6 +38,13 @@ class DigitalThreadNode(MiracleLifecycleNode):
         ~/entries (DigitalThreadEntry): New thread entries.
     """
 
+    # Material genealogy entry type constants
+    ENTRY_MATERIAL_LOADED = 'MATERIAL_LOADED'
+    ENTRY_TOOL_INSTALLED = 'TOOL_INSTALLED'
+    ENTRY_OPERATION_COMPLETE = 'OPERATION_COMPLETE'
+    ENTRY_PART_COMPLETE = 'PART_COMPLETE'
+    ENTRY_TOOL_REMOVED = 'TOOL_REMOVED'
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(
             'digital_thread',
@@ -50,6 +58,10 @@ class DigitalThreadNode(MiracleLifecycleNode):
         self._job_subs = None
         self._anomaly_subs = None
         self._state_subs = None
+
+        # Material genealogy entries (dict-based, separate from ROS chain)
+        self._entries: List[Dict[str, Any]] = []
+        self._thread_lock = threading.Lock()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure digital thread."""
@@ -202,6 +214,59 @@ class DigitalThreadNode(MiracleLifecycleNode):
             },
             tags=['anomaly', msg.anomaly_type.lower()],
         )
+
+    # ------------------------------------------------------------------
+    # Material genealogy helpers
+    # ------------------------------------------------------------------
+
+    def _record_entry(self, entry: Dict[str, Any]) -> None:
+        """Append an entry to the genealogy log."""
+        with self._thread_lock:
+            self._entries.append(entry)
+
+    def record_genealogy_event(
+        self, entry_type: str, machine_id: str,
+        serial_number: str = '', tool_id: str = '',
+        batch_id: str = '', metadata: Optional[Dict] = None,
+    ) -> None:
+        """Record a material genealogy event in the digital thread."""
+        entry = {
+            'entry_type': entry_type,
+            'machine_id': machine_id,
+            'timestamp': time.time(),
+            'serial_number': serial_number,
+            'tool_id': tool_id,
+            'batch_id': batch_id,
+        }
+        if metadata:
+            entry.update(metadata)
+        self._record_entry(entry)
+
+    def get_part_history(self, serial_number: str) -> List[Dict[str, Any]]:
+        """Get complete manufacturing history for a part by serial number."""
+        with self._thread_lock:
+            return [
+                e for e in self._entries
+                if e.get('serial_number') == serial_number or
+                   e.get('part_serial') == serial_number
+            ]
+
+    def get_tool_history(self, tool_id: str) -> List[Dict[str, Any]]:
+        """Get usage history for a specific tool."""
+        with self._thread_lock:
+            return [
+                e for e in self._entries
+                if e.get('tool_id') == tool_id
+            ]
+
+    def get_batch_traceability(self, batch_id: str) -> List[Dict[str, Any]]:
+        """Get all entries related to a material batch."""
+        with self._thread_lock:
+            return [
+                e for e in self._entries
+                if e.get('batch_id') == batch_id or
+                   e.get('material_batch') == batch_id
+            ]
 
     def verify_chain_integrity(self) -> bool:
         """Verify the integrity of the digital thread chain.

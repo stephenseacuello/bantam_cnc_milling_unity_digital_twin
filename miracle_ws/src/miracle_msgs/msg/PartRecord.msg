@@ -1,0 +1,10 @@
+builtin_interfaces/Time timestamp
+string serial_number
+string job_id
+string machine_id
+string material_batch_id
+string[] tool_ids_used
+float64 cycle_time_sec
+float64 material_removed_mm3
+string quality_result
+string[] digital_thread_entry_ids

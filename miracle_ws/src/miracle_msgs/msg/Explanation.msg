@@ -1,0 +1,11 @@
+builtin_interfaces/Time timestamp
+string anomaly_id
+string machine_id
+string summary
+string detail
+string counterfactual
+string[] contributing_features
+float64[] feature_contributions
+float64 model_confidence
+float64 confidence_interval
+string historical_context

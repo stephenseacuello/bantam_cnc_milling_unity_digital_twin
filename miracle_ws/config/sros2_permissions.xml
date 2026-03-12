@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dds xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:noNamespaceSchemaLocation="http://www.omg.org/spec/DDS-SECURITY/20170901/omg_shared_ca_permissions.xsd">
+  <permissions>
+    <!-- CNC Driver: publishes state, subscribes to commands -->
+    <grant name="/miracle/cnc_driver">
+      <subject_name>CN=/miracle/cnc_driver</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/*/state</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/*/gcode_block</topic><topic>rt/miracle/*/feed_override</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- Anomaly Detector: subscribes to sensor data, publishes anomalies -->
+    <grant name="/miracle/anomaly_detector">
+      <subject_name>CN=/miracle/anomaly_detector</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/*/anomaly</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/*/state</topic><topic>rt/miracle/*/sensor/*</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- PHM Predictor: subscribes to sensor data, publishes predictions -->
+    <grant name="/miracle/phm_predictor">
+      <subject_name>CN=/miracle/phm_predictor</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/*/phm_prediction</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/*/sensor/*</topic><topic>rt/miracle/*/state</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- Alarm Manager: subscribes to anomalies, publishes alarms -->
+    <grant name="/miracle/alarm_manager">
+      <subject_name>CN=/miracle/alarm_manager</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/scada/*</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/*/anomaly</topic><topic>rt/miracle/security/*</topic><topic>rt/miracle/scada/*</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- IDS Node: monitors all traffic -->
+    <grant name="/miracle/ids_node">
+      <subject_name>CN=/miracle/ids_node</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/security/*</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>*</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- Audit Logger: subscribes to all, writes audit trail -->
+    <grant name="/miracle/audit_logger">
+      <subject_name>CN=/miracle/audit_logger</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>*</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- Twin Sync: bidirectional state sync -->
+    <grant name="/miracle/twin_sync">
+      <subject_name>CN=/miracle/twin_sync</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/twin/*</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/*/state</topic><topic>rt/miracle/*/sensor/*</topic><topic>rt/miracle/*/phm_prediction</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- Recovery Orchestrator: lifecycle management -->
+    <grant name="/miracle/recovery_orchestrator">
+      <subject_name>CN=/miracle/recovery_orchestrator</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/resiliency/*</topic><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/resiliency/*</topic><topic>rt/miracle/heartbeat</topic><topic>rt/miracle/*/state</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+
+    <!-- Default grant for other nodes: publish heartbeat, subscribe to relevant topics -->
+    <grant name="default_miracle_node">
+      <subject_name>CN=/miracle/*</subject_name>
+      <validity><not_before>2024-01-01T00:00:00</not_before><not_after>2034-01-01T00:00:00</not_after></validity>
+      <allow_rule>
+        <domains><id>42</id></domains>
+        <publish><topics><topic>rt/miracle/heartbeat</topic></topics></publish>
+        <subscribe><topics><topic>rt/miracle/heartbeat</topic><topic>rt/miracle/*/state</topic></topics></subscribe>
+      </allow_rule>
+      <default>DENY</default>
+    </grant>
+  </permissions>
+</dds>

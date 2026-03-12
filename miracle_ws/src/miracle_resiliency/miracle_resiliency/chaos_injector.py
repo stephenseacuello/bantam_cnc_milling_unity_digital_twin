@@ -15,6 +15,7 @@ from rclpy.lifecycle import TransitionCallbackReturn
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.srv import InjectFault
+from miracle_resiliency.fault_executor import FaultExecutor, FaultSpec, FaultType
 
 
 class ChaosInjectorNode(MiracleLifecycleNode):
@@ -40,6 +41,7 @@ class ChaosInjectorNode(MiracleLifecycleNode):
         self._lock = threading.Lock()
         self._enabled: bool = False
         self._safety_nodes: list = []
+        self._fault_executor: Optional[FaultExecutor] = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         params = self.declare_and_validate_parameters({
@@ -47,9 +49,12 @@ class ChaosInjectorNode(MiracleLifecycleNode):
             'max_concurrent_faults': {
                 'default': 3, 'type': int, 'range': (1, 20),
             },
+            'dry_run': {'default': True, 'type': bool},
         })
 
         self._enabled = params['enabled']
+
+        self._fault_executor = FaultExecutor(dry_run=params['dry_run'])
 
         self._inject_srv = self.create_service(
             InjectFault, 'inject_fault',
@@ -98,6 +103,24 @@ class ChaosInjectorNode(MiracleLifecycleNode):
                 'intensity': request.intensity,
             }
 
+        # Map request fault_type string to FaultType enum
+        fault_type_map = {
+            'network_delay': FaultType.NETWORK_DELAY,
+            'node_kill': FaultType.NODE_KILL,
+            'cpu_stress': FaultType.CPU_STRESS,
+            'memory_stress': FaultType.MEMORY_STRESS,
+            'message_drop': FaultType.MESSAGE_DROP,
+        }
+        ft = fault_type_map.get(request.fault_type)
+        if ft is not None:
+            fault_spec = FaultSpec(
+                fault_type=ft,
+                target=request.target_node,
+                duration_sec=request.duration_sec,
+                parameters={'intensity': request.intensity},
+            )
+            self._fault_executor.inject(fault_id, fault_spec)
+
         self.get_logger().warn(
             f"Fault injected: {fault_id} -> {request.target_node} "
             f"({request.fault_type}, {request.duration_sec}s)"
@@ -118,6 +141,7 @@ class ChaosInjectorNode(MiracleLifecycleNode):
 
     def _remove_fault(self, fault_id: str) -> None:
         """Remove an active fault."""
+        self._fault_executor.cleanup(fault_id)
         with self._lock:
             if fault_id in self._active_faults:
                 del self._active_faults[fault_id]
@@ -125,6 +149,7 @@ class ChaosInjectorNode(MiracleLifecycleNode):
 
     def _clear_all_faults(self) -> None:
         """Clear all active faults."""
+        self._fault_executor.cleanup_all()
         with self._lock:
             count = len(self._active_faults)
             self._active_faults.clear()

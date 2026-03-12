@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -37,6 +38,9 @@ namespace MiracleTwin.UI
 #endif
 
         private readonly Queue<Vector3> forceSamples = new();
+
+        // Predicted force data from lookahead
+        private float[] predictedForces = Array.Empty<float>();
         private float lastSampleTime;
         private VisualElement chartElement;
 
@@ -163,6 +167,13 @@ namespace MiracleTwin.UI
                 DrawTrace(painter, samples, 2, FzColor, chartLeft, chartTop, chartWidth, chartHeight); // Fz
             }
 
+            // 3b. Draw predicted force trace (dashed appearance via short segments)
+            if (predictedForces.Length > 1)
+            {
+                DrawPredictedTrace(painter, predictedForces, new Color(1f, 0.8f, 0.2f, 0.6f),
+                    chartLeft, chartTop, chartWidth, chartHeight);
+            }
+
             // 4. Draw axis border
             painter.strokeColor = new Color(0.5f, 0.5f, 0.5f, 0.8f);
             painter.lineWidth = 1.5f;
@@ -209,6 +220,16 @@ namespace MiracleTwin.UI
             painter.LineTo(new Vector2(legendX + keySpacing * 2 + keySize, legendY));
             painter.LineTo(new Vector2(legendX + keySpacing * 2 + keySize, legendY + keySize));
             painter.LineTo(new Vector2(legendX + keySpacing * 2, legendY + keySize));
+            painter.ClosePath();
+            painter.Fill();
+
+            // Predicted legend key
+            painter.fillColor = new Color(1f, 0.8f, 0.2f, 0.6f);
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(legendX + keySpacing * 3, legendY));
+            painter.LineTo(new Vector2(legendX + keySpacing * 3 + keySize, legendY));
+            painter.LineTo(new Vector2(legendX + keySpacing * 3 + keySize, legendY + keySize));
+            painter.LineTo(new Vector2(legendX + keySpacing * 3, legendY + keySize));
             painter.ClosePath();
             painter.Fill();
 
@@ -264,6 +285,50 @@ namespace MiracleTwin.UI
             }
 
             painter.Stroke();
+        }
+
+        /// <summary>
+        /// Draw predicted force trace with dashed line style.
+        /// </summary>
+        private void DrawPredictedTrace(Painter2D painter, float[] values, Color color,
+            float left, float top, float width, float height)
+        {
+            if (values.Length < 2) return;
+
+            painter.strokeColor = color;
+            painter.lineWidth = lineWidth * 0.8f;
+            painter.lineCap = LineCap.Butt;
+
+            // Draw as short dashed segments (every other pair of points)
+            for (int i = 0; i < values.Length - 1; i += 2)
+            {
+                float x0 = left + width * 0.5f + (i / (float)(values.Length - 1)) * (width * 0.5f);
+                float x1 = left + width * 0.5f + ((i + 1) / (float)(values.Length - 1)) * (width * 0.5f);
+
+                float normalized0 = Mathf.Clamp(values[i] / maxForce, -1f, 1f);
+                float normalized1 = Mathf.Clamp(values[i + 1] / maxForce, -1f, 1f);
+
+                float y0 = top + height * 0.5f - normalized0 * (height * 0.5f);
+                float y1 = top + height * 0.5f - normalized1 * (height * 0.5f);
+
+                painter.BeginPath();
+                painter.MoveTo(new Vector2(x0, y0));
+                painter.LineTo(new Vector2(x1, y1));
+                painter.Stroke();
+            }
+        }
+
+        /// <summary>
+        /// Set predicted force values from lookahead analysis for overlay rendering.
+        /// </summary>
+        public void SetPredictedForces(float[] forces)
+        {
+            predictedForces = forces ?? Array.Empty<float>();
+        }
+
+        public void ClearPredictions()
+        {
+            predictedForces = Array.Empty<float>();
         }
 
         public Vector3[] GetSamples()

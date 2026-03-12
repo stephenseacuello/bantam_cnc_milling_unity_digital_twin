@@ -30,6 +30,23 @@ namespace MiracleTwin.Visualization
         public float CurrentDepth { get; set; }
         public bool IsStable { get; private set; } = true;
 
+        /// <summary>Lookahead operating points to render on the diagram.</summary>
+        private readonly System.Collections.Generic.List<Vector2> lookaheadPoints = new();
+
+        /// <summary>Add a set of lookahead operating points (RPM, depth) to visualize.</summary>
+        public void SetLookaheadPoints(System.Collections.Generic.List<Vector2> points)
+        {
+            lookaheadPoints.Clear();
+            if (points != null)
+                lookaheadPoints.AddRange(points);
+        }
+
+        /// <summary>Clear all lookahead points.</summary>
+        public void ClearLookaheadPoints()
+        {
+            lookaheadPoints.Clear();
+        }
+
         private LineRenderer lobeLine;
 
         void Start()
@@ -115,6 +132,31 @@ namespace MiracleTwin.Visualization
             CurrentDepth = depthMM;
             float limit = CalculateStabilityLimit(rpm);
             IsStable = depthMM < limit;
+        }
+
+        /// <summary>
+        /// Draw lookahead operating points as debug visualization.
+        /// Green = stable, Red = unstable.
+        /// </summary>
+        void OnDrawGizmos()
+        {
+            if (lookaheadPoints.Count == 0) return;
+
+            foreach (var point in lookaheadPoints)
+            {
+                float rpm = point.x;
+                float depth = point.y;
+                float limit = CalculateStabilityLimit(rpm);
+                bool stable = depth < limit;
+
+                // Normalize to chart space
+                float xNorm = Mathf.InverseLerp(minRPM, maxRPM, rpm);
+                float yNorm = depth / maxDepth;
+                Vector3 worldPos = transform.TransformPoint(new Vector3(xNorm - 0.5f, yNorm - 0.5f, 0));
+
+                Gizmos.color = stable ? Color.green : Color.red;
+                Gizmos.DrawSphere(worldPos, 0.005f);
+            }
         }
     }
 }

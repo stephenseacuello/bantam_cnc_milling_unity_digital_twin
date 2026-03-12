@@ -23,6 +23,7 @@ from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import JobStatus, MachineState, TaskAnnouncement
 from miracle_msgs.action import ExecuteJob
 from miracle_msgs.srv import SubmitTask
+from miracle_mes.digital_thread import DigitalThreadNode
 
 
 class Priority(IntEnum):
@@ -45,6 +46,8 @@ class Job:
     status: str = field(compare=False, default='QUEUED')
     task_type: str = field(compare=False, default='MILLING')
     required_capabilities: List[str] = field(compare=False, default_factory=list)
+    material_batch: str = field(compare=False, default='')
+    part_serial: str = field(compare=False, default='')
 
 
 class JobSchedulerNode(MiracleLifecycleNode):
@@ -87,6 +90,7 @@ class JobSchedulerNode(MiracleLifecycleNode):
         self._machine_states: Dict[str, MachineState] = {}
         self._max_queue: int = 1000
         self._enable_auction: bool = False
+        self._digital_thread: Optional[DigitalThreadNode] = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure job scheduler."""
@@ -256,6 +260,15 @@ class JobSchedulerNode(MiracleLifecycleNode):
 
             self._publish_job_status(job)
 
+            if self._digital_thread:
+                self._digital_thread.record_genealogy_event(
+                    DigitalThreadNode.ENTRY_MATERIAL_LOADED,
+                    machine_id=job.machine_id,
+                    batch_id=job.material_batch or '',
+                    serial_number=job.part_serial or '',
+                    metadata={'job_id': job.job_id, 'program': job.program_name},
+                )
+
             if self._enable_auction:
                 self._announce_task(job)
 
@@ -328,6 +341,20 @@ class JobSchedulerNode(MiracleLifecycleNode):
         result.total_time_sec = elapsed_total
         result.oee_achieved = 0.85
         result.quality_metrics = [0.98, 0.95, 0.99]
+
+        if self._digital_thread:
+            job = self._active_jobs.get(request.job_id)
+            self._digital_thread.record_genealogy_event(
+                DigitalThreadNode.ENTRY_PART_COMPLETE,
+                machine_id=request.machine_id,
+                serial_number=job.part_serial if job else '',
+                batch_id=job.material_batch if job else '',
+                metadata={
+                    'job_id': request.job_id,
+                    'total_time_sec': elapsed_total,
+                    'oee_achieved': result.oee_achieved,
+                },
+            )
 
         return result
 

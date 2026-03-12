@@ -1,0 +1,9 @@
+builtin_interfaces/Time timestamp
+string correlation_id
+string category
+string severity
+string root_cause_hypothesis
+float64 confidence
+string[] contributing_alert_ids
+string[] recommended_actions
+string machine_id

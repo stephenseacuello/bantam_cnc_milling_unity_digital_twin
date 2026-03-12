@@ -28,6 +28,7 @@ namespace MiracleTwin.Cutting
         [SerializeField] private CuttingStateEventSO cuttingStateEvent;
         [SerializeField] private ToolDefinition activeTool;
         [SerializeField] private StabilityLobeChart stabilityLobeChart;
+        [SerializeField] private StabilityLobePredictor stabilityLobePredictor;
 
         [Header("Simulation Settings")]
         [SerializeField] private bool autoStartCutting = false;
@@ -62,6 +63,7 @@ namespace MiracleTwin.Cutting
         private Vector3 previousToolPosition;
         private bool wasToolInWorkpiece;
         private float lastStabilityCheckTime;
+        private ChatterRisk lastChatterRisk = ChatterRisk.LOW;
         private bool toolEndOfLifePauseTriggered;
 
         void Awake()
@@ -233,6 +235,27 @@ namespace MiracleTwin.Cutting
             else if (!IsInUnstableZone && wasUnstable)
             {
                 Debug.Log("[CuttingSimulationManager] Operating point returned to stable zone.");
+            }
+
+            // Enhanced chatter prediction using StabilityLobePredictor
+            if (stabilityLobePredictor != null)
+            {
+                var risk = stabilityLobePredictor.EvaluateChatterRisk(rpm, depthMM);
+                if (risk != lastChatterRisk)
+                {
+                    if (risk == ChatterRisk.HIGH)
+                    {
+                        float recommendedRPM = stabilityLobePredictor.RecommendStableRPM(rpm, depthMM);
+                        Debug.LogWarning($"[CuttingSimulationManager] CHATTER RISK HIGH at RPM={rpm:F0}, DOC={depthMM:F2}mm. " +
+                                         $"Recommended stable RPM: {recommendedRPM:F0}");
+                    }
+                    else if (risk == ChatterRisk.MEDIUM)
+                    {
+                        Debug.LogWarning($"[CuttingSimulationManager] CHATTER RISK MEDIUM at RPM={rpm:F0}, DOC={depthMM:F2}mm. " +
+                                         $"Stability limit: {stabilityLobePredictor.LastStabilityLimit:F2}mm");
+                    }
+                    lastChatterRisk = risk;
+                }
             }
         }
 

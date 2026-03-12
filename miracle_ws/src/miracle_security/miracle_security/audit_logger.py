@@ -11,6 +11,11 @@ import hashlib
 import os
 import threading
 
+try:
+    from miracle_security.secure_storage import SecureStorage
+except ImportError:
+    SecureStorage = None  # cryptography package not installed
+
 from rclpy.lifecycle import TransitionCallbackReturn
 
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
@@ -44,12 +49,29 @@ class AuditLoggerNode(MiracleLifecycleNode):
         self._last_hash: str = '0' * 64
         self._max_per_file: int = 10000
         self._lock = threading.Lock()
+        self._secure_storage: SecureStorage | None = None
+
+    @staticmethod
+    def _resolve_audit_dir(requested: str) -> str:
+        """Return *requested* if writable, else fall back to /tmp/miracle_audit."""
+        try:
+            os.makedirs(requested, exist_ok=True)
+            # Quick writability check
+            probe = os.path.join(requested, '.probe')
+            with open(probe, 'w') as f:
+                f.write('')
+            os.remove(probe)
+            return requested
+        except OSError:
+            fallback = '/tmp/miracle_audit'
+            os.makedirs(fallback, exist_ok=True)
+            return fallback
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure audit logger."""
         params = self.declare_and_validate_parameters({
             'log_directory': {
-                'default': '/tmp/miracle_audit',
+                'default': '/var/miracle/audit',
                 'type': str,
             },
             'max_entries_per_file': {
@@ -63,9 +85,18 @@ class AuditLoggerNode(MiracleLifecycleNode):
             },
         })
 
-        self._log_dir = params['log_directory']
+        self._log_dir = self._resolve_audit_dir(params['log_directory'])
         self._max_per_file = params['max_entries_per_file']
-        os.makedirs(self._log_dir, exist_ok=True)
+
+        # Initialize encrypted secure storage
+        try:
+            self._secure_storage = SecureStorage(self._log_dir)
+            self.get_logger().info("Encrypted audit storage initialised")
+        except Exception as exc:
+            self._secure_storage = None
+            self.get_logger().warn(
+                f"SecureStorage unavailable, falling back to plaintext: {exc}"
+            )
 
         self._alert_sub = self.create_subscription(
             SecurityAlert,
@@ -113,8 +144,18 @@ class AuditLoggerNode(MiracleLifecycleNode):
         self._write_entry(entry)
 
     def _write_entry(self, entry: Dict) -> None:
-        """Write entry to audit log."""
+        """Write entry to audit log using SecureStorage if available."""
         with self._lock:
+            if self._secure_storage is not None:
+                try:
+                    self._secure_storage.write_entry(entry)
+                    return
+                except Exception as exc:
+                    self.get_logger().error(
+                        f"SecureStorage write failed, falling back to plaintext: {exc}"
+                    )
+
+            # Plaintext fallback
             if self._current_file is None:
                 self._rotate_file()
 

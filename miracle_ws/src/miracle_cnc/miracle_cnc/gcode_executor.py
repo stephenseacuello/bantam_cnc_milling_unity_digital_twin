@@ -17,9 +17,10 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
 from miracle_core.qos_profiles import QoSProfiles
 from miracle_core.exceptions import GCodeError
-from miracle_msgs.msg import GCodeBlock, MachineState
+from miracle_msgs.msg import GCodeBlock, MachineState, FeedOverride
 from miracle_msgs.action import ExecuteProgram
 from miracle_msgs.srv import ValidateGCode
+from miracle_security.gcode_signer import GCodeSigner, SignatureResult
 
 
 class GCodeExecutorNode(MiracleLifecycleNode):
@@ -58,6 +59,9 @@ class GCodeExecutorNode(MiracleLifecycleNode):
         self._max_spindle: float = 24000.0
         self._dry_run: bool = False
         self._executing: bool = False
+        self._feed_override_pct: float = 100.0
+        self._spindle_override_pct: float = 100.0
+        self._override_sub = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure G-code executor."""
@@ -84,12 +88,20 @@ class GCodeExecutorNode(MiracleLifecycleNode):
                 'type': bool,
                 'description': 'Validate without executing',
             },
+            'require_signed_gcode': {
+                'default': False,
+                'type': bool,
+                'description': 'Refuse to execute unsigned G-code programs',
+            },
         })
 
         self._machine_id = params['machine_id']
         self._max_feed = params['max_feed_rate']
         self._max_spindle = params['max_spindle_speed']
         self._dry_run = params['dry_run']
+        self._require_signed = params['require_signed_gcode']
+        self._gcode_signer = GCodeSigner()
+        self._public_key_pem = self._load_public_key()
 
         # G-code block publisher
         self._block_pub = self.create_publisher(
@@ -117,6 +129,14 @@ class GCodeExecutorNode(MiracleLifecycleNode):
             callback_group=ReentrantCallbackGroup(),
         )
 
+        # Feed override subscription
+        self._override_sub = self.create_subscription(
+            FeedOverride,
+            f'/miracle/{self._machine_id}/feed_override',
+            self._on_feed_override,
+            QoSProfiles.command(),
+        )
+
         self.get_logger().info(
             f"G-code executor configured for '{self._machine_id}'"
         )
@@ -131,6 +151,29 @@ class GCodeExecutorNode(MiracleLifecycleNode):
         """Deactivate executor."""
         self._executing = False
         return TransitionCallbackReturn.SUCCESS
+
+    def _load_public_key(self) -> bytes:
+        """Load the signing public key from the security directory."""
+        import os
+        key_paths = [
+            os.path.join(os.path.dirname(__file__), '..', '..', 'security', 'gcode_signing.pub'),
+            '/miracle_ws/security/gcode_signing.pub',
+            os.environ.get('MIRACLE_GCODE_PUBLIC_KEY', ''),
+        ]
+        for path in key_paths:
+            if path and os.path.isfile(path):
+                with open(path, 'rb') as f:
+                    return f.read()
+        return b''
+
+    def _on_feed_override(self, msg: FeedOverride) -> None:
+        """Apply adaptive feed override."""
+        self._feed_override_pct = max(10.0, min(100.0, msg.feed_override_pct))
+        self._spindle_override_pct = max(80.0, min(100.0, msg.spindle_override_pct))
+        self.get_logger().info(
+            f"Feed override applied: feed={self._feed_override_pct:.0f}%, "
+            f"spindle={self._spindle_override_pct:.0f}% ({msg.reason})"
+        )
 
     def _goal_callback(self, goal_request) -> GoalResponse:
         """Accept or reject new execution goals."""
@@ -158,6 +201,31 @@ class GCodeExecutorNode(MiracleLifecycleNode):
 
         try:
             lines = request.program_content.strip().split('\n')
+
+            # Signature verification
+            if self._public_key_pem:
+                sig_result = self._gcode_signer.verify_text(
+                    request.program_content, self._public_key_pem
+                )
+                if sig_result == SignatureResult.INVALID:
+                    self.get_logger().error("G-code signature is INVALID — aborting")
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = 'G-code signature verification failed'
+                    self._executing = False
+                    return result
+                elif sig_result == SignatureResult.MISSING and self._require_signed:
+                    self.get_logger().error("Unsigned G-code rejected (require_signed_gcode=true)")
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = 'Unsigned G-code not allowed'
+                    self._executing = False
+                    return result
+                elif sig_result == SignatureResult.MISSING:
+                    self.get_logger().warn("G-code is unsigned")
+                else:
+                    self.get_logger().info("G-code signature verified")
+
             total_lines = len(lines)
             start_time = self.get_clock().now()
             executed_count = 0
@@ -269,9 +337,10 @@ class GCodeExecutorNode(MiracleLifecycleNode):
 
     def _validate_block(self, block: GCodeBlock) -> None:
         """Validate a G-code block against machine limits."""
-        if block.feed_rate > self._max_feed:
+        effective_feed = block.feed_rate * (self._feed_override_pct / 100.0)
+        if effective_feed > self._max_feed:
             raise GCodeError(
-                f"Feed rate {block.feed_rate} exceeds maximum {self._max_feed}"
+                f"Feed rate {effective_feed:.1f} (override {self._feed_override_pct:.0f}%) exceeds maximum {self._max_feed}"
             )
         if block.spindle_speed > self._max_spindle:
             raise GCodeError(
@@ -287,6 +356,18 @@ class GCodeExecutorNode(MiracleLifecycleNode):
         errors: List[str] = []
         warnings: List[str] = []
         line_count = 0
+
+        # Check signature
+        if self._public_key_pem:
+            sig_result = self._gcode_signer.verify_text(
+                request.program_content, self._public_key_pem
+            )
+            if sig_result == SignatureResult.INVALID:
+                response.is_valid = False
+                response.errors = ['G-code signature is invalid']
+                return response
+            elif sig_result == SignatureResult.MISSING:
+                warnings.append('G-code is not signed')
 
         lines = request.program_content.strip().split('\n')
         for i, line in enumerate(lines):

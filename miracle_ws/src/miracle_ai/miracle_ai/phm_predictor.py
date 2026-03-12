@@ -185,6 +185,34 @@ class PHMPredictorNode(MiracleLifecycleNode):
 
         return rul, confidence
 
+    def accept_lookahead_data(
+        self,
+        predicted_forces: List[float],
+        predicted_wear: List[float],
+    ) -> None:
+        """Accept lookahead force/wear data from CuttingSimProxy for improved RUL.
+
+        When the prediction runner provides lookahead data, incorporate it
+        into the health index computation for better RUL estimates.
+        """
+        if not predicted_forces or not predicted_wear:
+            return
+
+        with self._lock:
+            # Use predicted wear trend to adjust health index
+            if predicted_wear:
+                vbmax = 0.30  # mm
+                predicted_health = [
+                    max(0.0, 1.0 - w / vbmax) for w in predicted_wear
+                ]
+                for h in predicted_health:
+                    self._health_history.append(h)
+
+        self.get_logger().debug(
+            f"PHM: Accepted {len(predicted_forces)} lookahead force points, "
+            f"{len(predicted_wear)} wear predictions"
+        )
+
     def _run_prediction(self) -> None:
         """Execute periodic prediction."""
         health = self._compute_health_index()

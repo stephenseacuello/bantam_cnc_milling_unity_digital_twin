@@ -37,6 +37,11 @@ set(msg_files
   "msg/DigitalThreadEntry.msg"
   "msg/TwinSyncStatus.msg"
   "msg/RobotJointState.msg"
+  "msg/CorrelatedAlert.msg"
+  "msg/FeedOverride.msg"
+  "msg/Explanation.msg"
+  "msg/MaterialBatch.msg"
+  "msg/PartRecord.msg"
 )
 
 set(srv_files

@@ -29,12 +29,18 @@ services:
       - ROS_DOMAIN_ID=42
       - ROS_LOG_DIR=/miracle_ws/log
       - FASTRTPS_DEFAULT_PROFILES_FILE=/miracle_ws/docker/fastdds_profile.xml
+      # SROS2 DDS Security (set MIRACLE_SROS2_ENABLED=true for production)
+      - MIRACLE_SROS2_ENABLED=${MIRACLE_SROS2_ENABLED:-false}
+      - ROS_SECURITY_KEYSTORE=/miracle_ws/security/keystore
+      - ROS_SECURITY_ENABLE=${MIRACLE_SROS2_ENABLED:-false}
+      - ROS_SECURITY_STRATEGY=${MIRACLE_SROS2_STRATEGY:-Enforce}
     ports:
       - "10000:10000"   # Unity ROS-TCP-Endpoint bridge
       - "9091:9090"     # HMI WebSocket bridge (host 9091 -> container 9090)
     volumes:
       - miracle_data:/miracle_ws/data
       - miracle_logs:/miracle_ws/log
+      - miracle_keystore:/miracle_ws/security/keystore:ro
     networks:
       - miracle_net
     depends_on:
@@ -259,6 +265,23 @@ services:
           memory: 2G
 
   # ---------------------------------------------------------------------------
+  # TLS Bridge -- stunnel sidecar for mutual TLS on ROS-TCP-Endpoint
+  # ---------------------------------------------------------------------------
+  tls_bridge:
+    image: alpine/stunnel:latest
+    container_name: miracle_tls_bridge
+    depends_on:
+      - ros_tcp_endpoint
+    ports:
+      - "10001:10001"
+    volumes:
+      - ./security/certs:/etc/stunnel/certs:ro
+      - ./docker/stunnel.conf:/etc/stunnel/stunnel.conf:ro
+    profiles:
+      - tls
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Prometheus -- Metrics collection
   # ---------------------------------------------------------------------------
   prometheus:
@@ -389,3 +412,5 @@ volumes:
     name: miracle_grafana_data
   loki_data:
     name: miracle_loki_data
+  miracle_keystore:
+    name: miracle_keystore

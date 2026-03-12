@@ -1,0 +1,7 @@
+builtin_interfaces/Time timestamp
+string machine_id
+float64 feed_override_pct
+float64 spindle_override_pct
+string reason
+float64 confidence
+float64 revert_after_sec

@@ -29,6 +29,14 @@ namespace MiracleTwin.Core
         [Tooltip("Enable ROS service registration (E-Stop, ValidateGCode, FleetStatus). Disable if no ROS2 service servers are running.")]
         [SerializeField] private bool enableServiceRegistration = false;
 
+        [Header("TLS Settings")]
+        [Tooltip("Require TLS for ROS bridge connection. Falls back to plaintext with warning if disabled.")]
+        [SerializeField] private bool requireTLS = false;
+        [Tooltip("Path to CA certificate for TLS verification (PEM format).")]
+        [SerializeField] private string caCertPath = "";
+        [Tooltip("Path to client certificate for mutual TLS (PEM format).")]
+        [SerializeField] private string clientCertPath = "";
+
         [Header("Event Channels")]
         [SerializeField] private MachineStateEventSO onMachineState;
         [SerializeField] private AnomalyAlertEventSO onAnomalyAlert;
@@ -40,6 +48,7 @@ namespace MiracleTwin.Core
         [SerializeField] private SecurityAlertEventSO onSecurityAlert;
         [SerializeField] private CuttingStateEventSO onCuttingState;
         [SerializeField] private RobotJointStateEventSO onRobotJointState;
+        [SerializeField] private FeedOverrideEventSO onFeedOverride;
 
         /// <summary>True when the ROS TCP bridge connection is established and healthy.</summary>
         public bool IsConnected { get; private set; }
@@ -50,6 +59,11 @@ namespace MiracleTwin.Core
         /// Parameter: true = connected, false = disconnected.
         /// </summary>
         public event Action<bool> ConnectionStatusChanged;
+
+        /// <summary>
+        /// Fired when a feed override message is received from the adaptive controller.
+        /// </summary>
+        public event Action<float, float, string> FeedOverrideReceived;
 
         private ROSConnection ros;
         private float lastHeartbeatTime;
@@ -101,6 +115,21 @@ namespace MiracleTwin.Core
             {
                 ros = ROSConnection.GetOrCreateInstance();
                 ros.Connect(rosBridgeIP, rosBridgePort);
+
+                // TLS note: When requireTLS is enabled, connect to stunnel port (10001)
+                // instead of direct ros_tcp_endpoint port (10000).
+                // Stunnel handles TLS termination transparently — no SslStream needed
+                // in Unity since ROS-TCP-Connector uses its own TCP layer.
+                if (requireTLS)
+                {
+                    // Stunnel port for TLS-terminated connections
+                    if (rosBridgePort == 10000)
+                    {
+                        Debug.LogWarning("[MiracleBridge] requireTLS is enabled but port is 10000. " +
+                            "Set port to 10001 to use TLS bridge (stunnel).");
+                    }
+                    Debug.Log($"[MiracleBridge] TLS mode: connecting via stunnel on port {rosBridgePort}");
+                }
 
                 // Only register once — ROSConnection persists subscriptions across reconnects
                 if (!registered)
@@ -196,6 +225,8 @@ namespace MiracleTwin.Core
                 $"/miracle/{targetMachineId}/tool_wear", OnToolWear);
             ros.Subscribe<JobStatusMsg>(
                 $"/miracle/{targetMachineId}/job_status", OnJobStatus);
+            ros.Subscribe<FeedOverrideMsg>(
+                $"/miracle/{targetMachineId}/feed_override", OnFeedOverride);
         }
 
         private void RegisterPublishers()
@@ -263,6 +294,16 @@ namespace MiracleTwin.Core
                 velocities = msg.velocities ?? new double[6],
                 gripperState = msg.gripper_state ?? "OPEN"
             });
+        }
+
+        private void OnFeedOverride(FeedOverrideMsg msg)
+        {
+            TryRecord($"/miracle/{machineId}/feed_override", msg);
+            onFeedOverride?.Raise(msg);
+            FeedOverrideReceived?.Invoke(
+                (float)msg.feed_override_pct,
+                (float)msg.spindle_override_pct,
+                msg.reason ?? "");
         }
 
         // --- Publishers ---
@@ -351,6 +392,9 @@ namespace MiracleTwin.Core
             if (onSecurityAlert == null) Debug.LogWarning("[MiracleBridge] onSecurityAlert event channel not assigned.", this);
             if (onCuttingState == null) Debug.LogWarning("[MiracleBridge] onCuttingState event channel not assigned.", this);
             if (onRobotJointState == null) Debug.LogWarning("[MiracleBridge] onRobotJointState event channel not assigned.", this);
+            if (onFeedOverride == null) Debug.LogWarning("[MiracleBridge] onFeedOverride event channel not assigned.", this);
+            if (requireTLS && rosBridgePort == 10000)
+                Debug.LogWarning("[MiracleBridge] TLS enabled but port is 10000 (plaintext). Use 10001 for TLS.", this);
         }
 #endif
 

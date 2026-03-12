@@ -1,0 +1,78 @@
+# MIRACLE Alert Correlation Rules
+# Each rule defines a set of alert types that, when seen together
+# within the time_window_sec for a given machine_id, are correlated
+# into a single CorrelatedAlert with root cause hypothesis.
+
+rules:
+  - name: tool_degradation_chain
+    required_types:
+      - vibration_anomaly
+      - force_anomaly
+    time_window_sec: 30.0
+    root_cause: "Progressive tool wear causing vibration increase and cutting force rise"
+    recommended_actions:
+      - "Inspect tool wear (VB measurement)"
+      - "Reduce feed rate by 20%"
+      - "Schedule tool change if VB > 0.25mm"
+    min_confidence: 0.7
+
+  - name: thermal_cascade
+    required_types:
+      - thermal_anomaly
+      - dimensional_drift
+    time_window_sec: 60.0
+    root_cause: "Thermal expansion of machine structure causing dimensional accuracy loss"
+    recommended_actions:
+      - "Activate or increase coolant flow"
+      - "Reduce cutting speed by 15%"
+      - "Allow 10min thermal equilibrium period"
+    min_confidence: 0.6
+
+  - name: chatter_onset
+    required_types:
+      - vibration_anomaly
+      - surface_quality_anomaly
+    time_window_sec: 20.0
+    root_cause: "Regenerative chatter developing at current spindle speed and depth"
+    recommended_actions:
+      - "Shift spindle RPM to nearest stable lobe pocket"
+      - "Reduce axial depth of cut"
+      - "Check tool runout"
+    min_confidence: 0.7
+
+  - name: coolant_failure_cascade
+    required_types:
+      - thermal_anomaly
+      - tool_wear_anomaly
+    time_window_sec: 45.0
+    root_cause: "Coolant system malfunction causing thermal damage and accelerated wear"
+    recommended_actions:
+      - "Check coolant level and flow rate"
+      - "Inspect coolant nozzle alignment"
+      - "Reduce feed and speed until coolant restored"
+    min_confidence: 0.65
+
+  - name: security_breach_chain
+    required_types:
+      - unauthorized_access
+      - parameter_tampering
+    time_window_sec: 10.0
+    root_cause: "Coordinated security breach — unauthorized access followed by parameter changes"
+    recommended_actions:
+      - "Isolate machine from network immediately"
+      - "Notify security team"
+      - "Audit all parameter changes in last 24h"
+      - "Verify G-code integrity"
+    min_confidence: 0.9
+
+  - name: power_quality_cascade
+    required_types:
+      - power_anomaly
+      - spindle_anomaly
+    time_window_sec: 15.0
+    root_cause: "Power supply instability affecting spindle motor performance"
+    recommended_actions:
+      - "Check mains voltage and frequency"
+      - "Inspect spindle drive VFD parameters"
+      - "Reduce spindle load"
+    min_confidence: 0.7

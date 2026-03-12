@@ -10,6 +10,8 @@ import hashlib
 import secrets
 import threading
 
+from miracle_security.tpm_interface import TPMInterface, AttestationTier
+
 from rclpy.lifecycle import TransitionCallbackReturn
 
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
@@ -47,6 +49,7 @@ class AttestationVerifierNode(MiracleLifecycleNode):
         self._lock = threading.Lock()
         self._decay_rate: float = 0.01
         self._min_trust: float = 0.3
+        self._tpm: Optional[TPMInterface] = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure attestation verifier."""
@@ -70,6 +73,12 @@ class AttestationVerifierNode(MiracleLifecycleNode):
 
         self._decay_rate = params['trust_decay_rate']
         self._min_trust = params['min_trust_threshold']
+
+        # Initialize TPM interface (software fallback by default)
+        self._tpm = TPMInterface(
+            tier=AttestationTier.SOFTWARE,
+            known_good_hashes=dict(self._device_hashes),
+        )
 
         self._attest_srv = self.create_service(
             RequestAttestation,
@@ -119,31 +128,39 @@ class AttestationVerifierNode(MiracleLifecycleNode):
         report.device_id = device_id
 
         with self._lock:
-            # Verify against known good hashes
+            # Get real attestation quote via TPMInterface
+            quote = self._tpm.get_quote(nonce=challenge)
+            is_valid, trust_score = self._tpm.verify_quote(quote)
+
+            report.firmware_hash = quote.firmware_hash
+            report.config_hash = hashlib.sha256(
+                f"{device_id}:config:{quote.nonce}".encode()
+            ).hexdigest()
+
             if device_id in self._device_hashes:
+                # Verify against known-good hash
                 expected = self._device_hashes[device_id]
-                # Simulate verification
-                report.firmware_hash = hashlib.sha256(
-                    f"{device_id}:{challenge}".encode()
-                ).hexdigest()
-                report.config_hash = hashlib.sha256(
-                    f"{device_id}:config".encode()
-                ).hexdigest()
-                report.integrity_verified = True
-                report.violations = []
-                report.trust_score = min(1.0, self._device_trust.get(device_id, 0.5) + 0.1)
+                if quote.firmware_hash == expected:
+                    report.integrity_verified = is_valid
+                    report.trust_score = min(1.0, trust_score)
+                    report.violations = []
+                else:
+                    report.integrity_verified = False
+                    report.trust_score = 0.0
+                    report.violations = ['firmware_hash_mismatch']
             else:
-                # First attestation - establish baseline
-                report.firmware_hash = hashlib.sha256(
-                    f"{device_id}:{challenge}".encode()
-                ).hexdigest()
-                report.config_hash = hashlib.sha256(
-                    f"{device_id}:config".encode()
-                ).hexdigest()
-                report.integrity_verified = True
+                # First attestation — establish baseline
+                report.integrity_verified = is_valid
+                report.trust_score = trust_score
                 report.violations = []
-                report.trust_score = 0.5
-                self._device_hashes[device_id] = report.firmware_hash
+                self._device_hashes[device_id] = quote.firmware_hash
+                self._tpm.store_known_good(device_id, quote.firmware_hash)
+
+            # Quarantine if trust below threshold
+            if report.trust_score < self._min_trust:
+                report.integrity_verified = False
+                if 'trust_below_threshold' not in report.violations:
+                    report.violations.append('trust_below_threshold')
 
             self._device_trust[device_id] = report.trust_score
             report.report_signature = hashlib.sha256(

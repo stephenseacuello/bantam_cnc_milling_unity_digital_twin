@@ -19,6 +19,7 @@ from miracle_core.qos_profiles import QoSProfiles
 from miracle_msgs.msg import MachineState, PHMPrediction
 from miracle_msgs.action import RunPrediction
 from miracle_msgs.srv import RunPrediction as RunPredictionSrv
+from miracle_twin.cutting_sim_proxy import CuttingSimProxy, GCodeBlock
 
 
 @dataclass
@@ -151,17 +152,27 @@ class PredictionRunnerNode(MiracleLifecycleNode):
                 goal_handle.publish_feedback(feedback)
                 await asyncio.sleep(0.5)
 
-            # Generate prediction result
+            # Run real simulation via CuttingSimProxy
+            proxy = CuttingSimProxy()
+            sample_blocks = [
+                GCodeBlock(
+                    feed_rate_mmpm=500.0, spindle_rpm=8000.0,
+                    axial_depth_mm=1.5, radial_depth_mm=3.175, length_mm=50.0,
+                )
+                for _ in range(10)
+            ]
+            sim_result = proxy.simulate_program(sample_blocks)
+
             prediction = PHMPrediction()
             prediction.timestamp = self.get_clock().now().to_msg()
             prediction.machine_id = request.machine_id
             prediction.component = 'spindle'
             prediction.prediction_type = request.prediction_type
-            prediction.remaining_useful_life_hours = 450.0
-            prediction.confidence = 0.87
-            prediction.health_index = 0.78
-            prediction.recommended_action = 'Schedule maintenance within 2 weeks'
-            prediction.trend_data = [0.85, 0.82, 0.79, 0.76, 0.73]
+            prediction.remaining_useful_life_hours = sim_result.remaining_useful_life_hours
+            prediction.confidence = sim_result.confidence
+            prediction.health_index = sim_result.health_index
+            prediction.recommended_action = sim_result.recommended_action
+            prediction.trend_data = sim_result.trend_data
 
             self._prediction_pub.publish(prediction)
 
@@ -195,16 +206,27 @@ class PredictionRunnerNode(MiracleLifecycleNode):
             f"{request.scenario_type}"
         )
 
+        # Run real simulation via CuttingSimProxy
+        proxy = CuttingSimProxy()
+        sample_blocks = [
+            GCodeBlock(
+                feed_rate_mmpm=500.0, spindle_rpm=8000.0,
+                axial_depth_mm=1.5, radial_depth_mm=3.175, length_mm=50.0,
+            )
+            for _ in range(10)
+        ]
+        sim_result = proxy.simulate_program(sample_blocks)
+
         prediction = PHMPrediction()
         prediction.timestamp = self.get_clock().now().to_msg()
         prediction.machine_id = request.machine_id
         prediction.component = 'spindle'
         prediction.prediction_type = request.scenario_type
-        prediction.remaining_useful_life_hours = 450.0
-        prediction.confidence = 0.87
-        prediction.health_index = 0.78
-        prediction.recommended_action = 'Schedule maintenance within 2 weeks'
-        prediction.trend_data = [0.85, 0.82, 0.79, 0.76, 0.73]
+        prediction.remaining_useful_life_hours = sim_result.remaining_useful_life_hours
+        prediction.confidence = sim_result.confidence
+        prediction.health_index = sim_result.health_index
+        prediction.recommended_action = sim_result.recommended_action
+        prediction.trend_data = sim_result.trend_data
 
         self._prediction_pub.publish(prediction)
 

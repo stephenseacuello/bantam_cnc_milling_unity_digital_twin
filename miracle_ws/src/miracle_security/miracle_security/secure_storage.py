@@ -8,9 +8,10 @@ Hash chain: sign(prev_hash || entry_hash || seq_number)
 import hashlib
 import json
 import os
+import shutil
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +39,18 @@ class AuditEntry:
     entry_hash: bytes
     prev_hash: bytes
     signature: bytes
+
+
+@dataclass
+class TamperReport:
+    """Result of a detailed chain verification."""
+    is_valid: bool
+    broken_link_index: Optional[int]
+    expected_hash: Optional[str]
+    actual_hash: Optional[str]
+    total_entries: int
+    verified_entries: int
+    verification_time_ms: float
 
 
 class SecureStorage:
@@ -238,3 +251,192 @@ class SecureStorage:
     @property
     def entry_count(self) -> int:
         return len(self._entries)
+
+    # ------------------------------------------------------------------
+    # Chain verification & tamper detection
+    # ------------------------------------------------------------------
+
+    def verify_chain_detailed(self) -> TamperReport:
+        """Walk the full hash chain and return a detailed tamper report.
+
+        Returns a :class:`TamperReport` describing whether the chain is intact.
+        If a broken link is found the report includes the index of the first
+        broken entry along with the expected and actual ``prev_hash`` values.
+        """
+        start = time.monotonic()
+
+        if not self._entries:
+            elapsed = (time.monotonic() - start) * 1000.0
+            return TamperReport(
+                is_valid=True,
+                broken_link_index=None,
+                expected_hash=None,
+                actual_hash=None,
+                total_entries=0,
+                verified_entries=0,
+                verification_time_ms=elapsed,
+            )
+
+        expected_prev = self.CHAIN_GENESIS
+        verified = 0
+        for idx, entry in enumerate(self._entries):
+            # Check chain link
+            if entry.prev_hash != expected_prev:
+                elapsed = (time.monotonic() - start) * 1000.0
+                return TamperReport(
+                    is_valid=False,
+                    broken_link_index=idx,
+                    expected_hash=expected_prev.hex(),
+                    actual_hash=entry.prev_hash.hex(),
+                    total_entries=len(self._entries),
+                    verified_entries=verified,
+                    verification_time_ms=elapsed,
+                )
+            # Check signature
+            if not self._verify_signature(
+                entry.signature, entry.entry_hash, entry.sequence, entry.prev_hash
+            ):
+                elapsed = (time.monotonic() - start) * 1000.0
+                return TamperReport(
+                    is_valid=False,
+                    broken_link_index=idx,
+                    expected_hash=expected_prev.hex(),
+                    actual_hash=entry.prev_hash.hex(),
+                    total_entries=len(self._entries),
+                    verified_entries=verified,
+                    verification_time_ms=elapsed,
+                )
+            verified += 1
+            expected_prev = entry.entry_hash
+
+        elapsed = (time.monotonic() - start) * 1000.0
+        return TamperReport(
+            is_valid=True,
+            broken_link_index=None,
+            expected_hash=None,
+            actual_hash=None,
+            total_entries=len(self._entries),
+            verified_entries=verified,
+            verification_time_ms=elapsed,
+        )
+
+    # ------------------------------------------------------------------
+    # Export / compliance
+    # ------------------------------------------------------------------
+
+    def export_audit_range(self, start_seq: int, end_seq: int) -> List[Dict[str, Any]]:
+        """Return decrypted entry data for *start_seq* <= seq <= *end_seq*.
+
+        Useful for compliance reporting where a specific sequence range is needed.
+        """
+        return [
+            e.data for e in self._entries
+            if start_seq <= e.sequence <= end_seq
+        ]
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+
+    def get_chain_statistics(self) -> Dict[str, Any]:
+        """Return summary statistics about the current chain.
+
+        Keys: ``total_entries``, ``chain_length``, ``first_entry_time``,
+        ``last_entry_time``, ``size_bytes``.
+        """
+        total = len(self._entries)
+        first_ts: Optional[float] = None
+        last_ts: Optional[float] = None
+        if total > 0:
+            first_ts = self._entries[0].timestamp
+            last_ts = self._entries[-1].timestamp
+
+        size = 0
+        for f in self._dir.glob('entry_*.bin'):
+            size += f.stat().st_size
+
+        return {
+            'total_entries': total,
+            'chain_length': total,
+            'first_entry_time': first_ts,
+            'last_entry_time': last_ts,
+            'size_bytes': size,
+        }
+
+    # ------------------------------------------------------------------
+    # Compaction
+    # ------------------------------------------------------------------
+
+    def compact_chain(self, keep_last_n: int) -> int:
+        """Archive old entries, keeping only the last *keep_last_n* entries.
+
+        Archived entries are moved to an ``archive/`` sub-directory.  The
+        remaining in-memory chain is updated so that the oldest kept entry's
+        ``prev_hash`` becomes the new effective genesis (no rewrite needed —
+        the raw files already contain the correct ``prev_hash``).
+
+        Returns the number of entries archived.
+        """
+        if keep_last_n < 0:
+            raise ValueError("keep_last_n must be non-negative")
+
+        total = len(self._entries)
+        if keep_last_n >= total:
+            return 0  # nothing to archive
+
+        archive_dir = self._dir / 'archive'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        to_archive = total - keep_last_n
+        archived = 0
+        for entry in self._entries[:to_archive]:
+            src = self._dir / f'entry_{entry.sequence:08d}.bin'
+            if src.exists():
+                shutil.move(str(src), str(archive_dir / src.name))
+            archived += 1
+
+        # Trim in-memory list
+        self._entries = self._entries[to_archive:]
+
+        return archived
+
+    # ------------------------------------------------------------------
+    # Key rotation
+    # ------------------------------------------------------------------
+
+    def rotate_encryption_key(self, new_key: bytes) -> None:
+        """Re-encrypt every entry with *new_key* while preserving the hash chain.
+
+        The hash chain and signatures are unaffected because they operate on
+        the plaintext data, not the ciphertext.  Only the encrypted payload
+        portion of each record is replaced.
+        """
+        if len(new_key) not in (16, 24, 32):
+            raise ValueError("new_key must be 16, 24, or 32 bytes (AES key)")
+
+        new_aesgcm = AESGCM(new_key)
+
+        for entry in self._entries:
+            entry_file = self._dir / f'entry_{entry.sequence:08d}.bin'
+            raw = entry_file.read_bytes()
+
+            # Decrypt with current key
+            encrypted_old = raw[136:]
+            data_bytes = self._decrypt(encrypted_old)
+
+            # Re-encrypt with new key
+            nonce = os.urandom(self.NONCE_SIZE)
+            encrypted_new = nonce + new_aesgcm.encrypt(nonce, data_bytes, None)
+
+            # Rewrite record keeping header intact
+            header = raw[:136]
+            entry_file.write_bytes(header + encrypted_new)
+
+        # Swap key in memory
+        self._aes_key = new_key
+        self._aesgcm = new_aesgcm
+
+        # Persist new key
+        key_path = self._dir / '.aes_key'
+        key_path.write_bytes(new_key)
+        os.chmod(key_path, 0o600)

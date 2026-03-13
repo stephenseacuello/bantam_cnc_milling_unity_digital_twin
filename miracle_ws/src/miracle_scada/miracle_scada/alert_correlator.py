@@ -14,6 +14,7 @@ import json
 import threading
 import time
 import os
+import uuid
 import yaml
 
 from rclpy.lifecycle import TransitionCallbackReturn
@@ -80,6 +81,331 @@ class FleetCorrelationRule:
     min_confidence: float = 0.8
 
 
+@dataclass
+class AnomalyPattern:
+    """A learned anomaly pattern from historical correlated alerts."""
+    pattern_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ''
+    description: str = ''
+    signature: dict = field(default_factory=lambda: {
+        'alert_types': [],
+        'temporal_order': [],
+        'time_window_sec': 0.0,
+        'min_count': 1,
+    })
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    occurrence_count: int = 0
+    associated_root_cause: str = ''
+    recommended_action: str = ''
+    confidence: float = 0.0
+    machine_ids: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Serialize to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'AnomalyPattern':
+        """Deserialize from a dictionary."""
+        return cls(**d)
+
+
+class AnomalyPatternLibrary:
+    """Library of learned anomaly patterns with JSONL persistence.
+
+    Stores anomaly signatures extracted from correlated alerts and matches
+    incoming alert sequences against known patterns.
+    """
+
+    SIMILARITY_THRESHOLD = 0.70
+
+    def __init__(self, persistence_path: Optional[str] = None) -> None:
+        self._patterns: List[AnomalyPattern] = []
+        self._persistence_path = persistence_path
+        if persistence_path and os.path.isfile(persistence_path):
+            self.load()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def record_pattern(self, correlated_alert: Any) -> AnomalyPattern:
+        """Extract a signature from a correlated alert and record it.
+
+        If a sufficiently similar pattern already exists (>70 % overlap),
+        the existing pattern is updated; otherwise a new one is created.
+
+        Args:
+            correlated_alert: An object (or dict) with attributes
+                ``category``, ``contributing_alert_ids``,
+                ``root_cause_hypothesis``, ``recommended_actions``,
+                ``machine_id``, ``confidence``.
+
+        Returns:
+            The created or updated ``AnomalyPattern``.
+        """
+        sig = self._extract_signature(correlated_alert)
+        now = time.time()
+
+        # Try to find an existing similar pattern
+        best_match: Optional[AnomalyPattern] = None
+        best_score = 0.0
+        for pattern in self._patterns:
+            score = self._compute_signature_similarity(sig, pattern.signature)
+            if score > best_score:
+                best_score = score
+                best_match = pattern
+
+        machine_id = self._get_attr(correlated_alert, 'machine_id', '')
+
+        if best_match is not None and best_score >= self.SIMILARITY_THRESHOLD:
+            # Update existing pattern
+            best_match.last_seen = now
+            best_match.occurrence_count += 1
+            best_match.confidence = min(
+                1.0, 0.5 + 0.05 * best_match.occurrence_count
+            )
+            if machine_id and machine_id not in best_match.machine_ids:
+                best_match.machine_ids.append(machine_id)
+            self._auto_save()
+            return best_match
+
+        # Create new pattern
+        root_cause = self._get_attr(correlated_alert, 'root_cause_hypothesis', '')
+        actions = self._get_attr(correlated_alert, 'recommended_actions', [])
+        category = self._get_attr(correlated_alert, 'category', '')
+
+        pattern = AnomalyPattern(
+            name=category,
+            description=f"Auto-learned pattern from {category}",
+            signature=sig,
+            first_seen=now,
+            last_seen=now,
+            occurrence_count=1,
+            associated_root_cause=root_cause,
+            recommended_action=actions[0] if actions else '',
+            confidence=0.5,
+            machine_ids=[machine_id] if machine_id else [],
+        )
+        self._patterns.append(pattern)
+        self._auto_save()
+        return pattern
+
+    def match_pattern(
+        self, alert_sequence: List[Any]
+    ) -> List[Tuple[AnomalyPattern, float]]:
+        """Match an alert sequence against the pattern library.
+
+        Args:
+            alert_sequence: List of ``AlertEntry``-like objects with
+                ``alert_type`` and ``timestamp`` attributes.
+
+        Returns:
+            List of ``(AnomalyPattern, match_score)`` tuples sorted
+            descending by score.  Only patterns with score > 0 are
+            returned.
+        """
+        if not alert_sequence or not self._patterns:
+            return []
+
+        query_sig = self._build_signature_from_alerts(alert_sequence)
+        results: List[Tuple[AnomalyPattern, float]] = []
+        for pattern in self._patterns:
+            score = self._compute_signature_similarity(query_sig, pattern.signature)
+            if score > 0.0:
+                results.append((pattern, score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    def get_top_patterns(self, n: int = 10) -> List[AnomalyPattern]:
+        """Return the *n* most frequently occurring patterns."""
+        return sorted(
+            self._patterns, key=lambda p: p.occurrence_count, reverse=True
+        )[:n]
+
+    def get_pattern_for_machine(self, machine_id: str) -> List[AnomalyPattern]:
+        """Return patterns that have been seen on *machine_id*."""
+        return [p for p in self._patterns if machine_id in p.machine_ids]
+
+    def merge_patterns(self, pattern_id_1: str, pattern_id_2: str) -> Optional[AnomalyPattern]:
+        """Merge two patterns into one, removing the second.
+
+        The merged pattern retains the id of the first pattern.
+
+        Returns:
+            The merged ``AnomalyPattern``, or ``None`` if either id is
+            not found.
+        """
+        p1 = self._find_by_id(pattern_id_1)
+        p2 = self._find_by_id(pattern_id_2)
+        if p1 is None or p2 is None:
+            return None
+
+        # Merge fields
+        p1.occurrence_count += p2.occurrence_count
+        p1.first_seen = min(p1.first_seen, p2.first_seen)
+        p1.last_seen = max(p1.last_seen, p2.last_seen)
+        p1.confidence = min(1.0, 0.5 + 0.05 * p1.occurrence_count)
+        for mid in p2.machine_ids:
+            if mid not in p1.machine_ids:
+                p1.machine_ids.append(mid)
+
+        # Merge signature alert_types (union)
+        merged_types = list(dict.fromkeys(
+            p1.signature.get('alert_types', []) + p2.signature.get('alert_types', [])
+        ))
+        p1.signature['alert_types'] = merged_types
+
+        # Remove p2
+        self._patterns = [p for p in self._patterns if p.pattern_id != pattern_id_2]
+        self._auto_save()
+        return p1
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self) -> None:
+        """Persist patterns to JSONL file."""
+        if not self._persistence_path:
+            return
+        with open(self._persistence_path, 'w') as fh:
+            for pattern in self._patterns:
+                fh.write(json.dumps(pattern.to_dict()) + '\n')
+
+    def load(self) -> None:
+        """Load patterns from JSONL file."""
+        if not self._persistence_path or not os.path.isfile(self._persistence_path):
+            return
+        loaded: List[AnomalyPattern] = []
+        with open(self._persistence_path, 'r') as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    loaded.append(AnomalyPattern.from_dict(json.loads(line)))
+        self._patterns = loaded
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def patterns(self) -> List[AnomalyPattern]:
+        """Read-only access to the pattern list."""
+        return list(self._patterns)
+
+    def _auto_save(self) -> None:
+        """Persist if a persistence path is configured."""
+        if self._persistence_path:
+            self.save()
+
+    def _find_by_id(self, pattern_id: str) -> Optional[AnomalyPattern]:
+        for p in self._patterns:
+            if p.pattern_id == pattern_id:
+                return p
+        return None
+
+    @staticmethod
+    def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
+        """Get attribute from object or dict."""
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    def _extract_signature(self, correlated_alert: Any) -> dict:
+        """Build a signature dict from a correlated alert."""
+        contributing = self._get_attr(correlated_alert, 'contributing_alert_ids', [])
+        alert_types: List[str] = []
+        for cid in contributing:
+            if '@' in cid:
+                alert_types.append(cid.split('@')[0])
+            else:
+                alert_types.append(cid)
+
+        # Deduplicate while preserving order
+        seen: set = set()
+        unique_types: List[str] = []
+        for t in alert_types:
+            if t not in seen:
+                seen.add(t)
+                unique_types.append(t)
+
+        return {
+            'alert_types': unique_types,
+            'temporal_order': unique_types,  # preserved insertion order
+            'time_window_sec': 30.0,
+            'min_count': len(unique_types),
+        }
+
+    @staticmethod
+    def _build_signature_from_alerts(alerts: List[Any]) -> dict:
+        """Build a query signature from a list of AlertEntry-like objects."""
+        sorted_alerts = sorted(alerts, key=lambda a: getattr(a, 'timestamp', 0))
+        seen: set = set()
+        types: List[str] = []
+        for a in sorted_alerts:
+            t = getattr(a, 'alert_type', '')
+            if t and t not in seen:
+                seen.add(t)
+                types.append(t)
+
+        if len(sorted_alerts) >= 2:
+            window = (
+                getattr(sorted_alerts[-1], 'timestamp', 0)
+                - getattr(sorted_alerts[0], 'timestamp', 0)
+            )
+        else:
+            window = 0.0
+
+        return {
+            'alert_types': types,
+            'temporal_order': types,
+            'time_window_sec': window,
+            'min_count': len(types),
+        }
+
+    @staticmethod
+    def _compute_signature_similarity(sig1: dict, sig2: dict) -> float:
+        """Compute similarity between two signatures (0-1).
+
+        Components:
+        - alert_type overlap (Jaccard) — weight 0.5
+        - temporal_order match — weight 0.3
+        - time_window proximity — weight 0.2
+        """
+        types1 = set(sig1.get('alert_types', []))
+        types2 = set(sig2.get('alert_types', []))
+        if not types1 and not types2:
+            type_score = 1.0
+        elif not types1 or not types2:
+            type_score = 0.0
+        else:
+            type_score = len(types1 & types2) / len(types1 | types2)
+
+        # Temporal order: ratio of matching prefix
+        order1 = sig1.get('temporal_order', [])
+        order2 = sig2.get('temporal_order', [])
+        if not order1 and not order2:
+            order_score = 1.0
+        elif not order1 or not order2:
+            order_score = 0.0
+        else:
+            matches = sum(
+                1 for a, b in zip(order1, order2) if a == b
+            )
+            order_score = matches / max(len(order1), len(order2))
+
+        # Time window proximity
+        w1 = sig1.get('time_window_sec', 0.0)
+        w2 = sig2.get('time_window_sec', 0.0)
+        max_w = max(abs(w1), abs(w2), 1.0)
+        window_score = 1.0 - min(abs(w1 - w2) / max_w, 1.0)
+
+        return 0.5 * type_score + 0.3 * order_score + 0.2 * window_score
+
+
 class AlertCorrelatorNode(MiracleLifecycleNode):
     """Correlates related alerts from anomaly and security topics.
 
@@ -127,6 +453,9 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
         # Block anomaly history: machine_id -> block_index -> count
         self._block_anomaly_history: Dict[str, Dict[int, int]] = {}
         self._block_anomaly_history_cap: int = 1000
+
+        # Learned anomaly pattern library
+        self._pattern_library = AnomalyPatternLibrary()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure alert correlator."""
@@ -565,6 +894,11 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
             None, machine_id, confidence,
         )
 
+        # Check pattern library for known signatures and boost confidence
+        pattern_matches = self._pattern_library.match_pattern(matching)
+        if pattern_matches and pattern_matches[0][1] >= AnomalyPatternLibrary.SIMILARITY_THRESHOLD:
+            confidence = min(1.0, confidence + 0.1)
+
         # Publish correlated alert
         self._correlation_counter += 1
         msg = CorrelatedAlert()
@@ -585,6 +919,10 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
             msg.blocks_until_predicted_issue = blocks_until
 
         self._correlated_pub.publish(msg)
+
+        # Record pattern in anomaly pattern library
+        self._pattern_library.record_pattern(msg)
+
         boost_info = f", causal_boost={causal_boost:.3f}" if causal_boost > 0 else ""
         gcode_info = f", gcode_block={self._machine_gcode_context[machine_id].block_index}" if machine_id in self._machine_gcode_context else ""
         self.get_logger().info(

@@ -6,6 +6,84 @@ using MiracleTwin.CNC;
 namespace MiracleTwin.Cutting
 {
     /// <summary>
+    /// Describes fixture geometry using an axis-aligned bounding box,
+    /// a list of clamp zones, and a safe retract height for collision avoidance.
+    /// Used by CheckFixtureCollisions to test toolpath blocks against fixture bounds.
+    /// </summary>
+    [Serializable]
+    public class FixtureCollisionProfile
+    {
+        /// <summary>Minimum corner of the fixture AABB (mm).</summary>
+        public Vector3 boundsMin;
+        /// <summary>Maximum corner of the fixture AABB (mm).</summary>
+        public Vector3 boundsMax;
+        /// <summary>Individual clamp zone AABBs within the fixture.</summary>
+        public List<Bounds> clampZones = new();
+        /// <summary>Safe Z height (mm) to retract to when avoiding collisions.</summary>
+        public float safeRetractHeight = 50f;
+
+        /// <summary>Returns the fixture AABB as a Unity Bounds.</summary>
+        public Bounds GetBounds()
+        {
+            var center = (boundsMin + boundsMax) * 0.5f;
+            var size = boundsMax - boundsMin;
+            return new Bounds(center, size);
+        }
+
+        /// <summary>
+        /// Tests whether a point lies inside the fixture AABB (with optional margin).
+        /// </summary>
+        public bool ContainsPoint(Vector3 point, float margin = 0f)
+        {
+            return point.x >= boundsMin.x - margin && point.x <= boundsMax.x + margin
+                && point.y >= boundsMin.y - margin && point.y <= boundsMax.y + margin
+                && point.z >= boundsMin.z - margin && point.z <= boundsMax.z + margin;
+        }
+
+        /// <summary>
+        /// Computes minimum distance from a point to the surface of the fixture AABB.
+        /// Returns negative values when the point is inside the AABB.
+        /// </summary>
+        public float DistanceToSurface(Vector3 point)
+        {
+            // Compute signed distance to each face, take the minimum absolute
+            float dx = Mathf.Max(boundsMin.x - point.x, point.x - boundsMax.x);
+            float dy = Mathf.Max(boundsMin.y - point.y, point.y - boundsMax.y);
+            float dz = Mathf.Max(boundsMin.z - point.z, point.z - boundsMax.z);
+
+            // If all components are negative, point is inside — return the max (least negative)
+            if (dx < 0 && dy < 0 && dz < 0)
+                return Mathf.Max(dx, Mathf.Max(dy, dz));
+
+            // Outside: Euclidean distance from clamped components
+            float cx = Mathf.Max(dx, 0f);
+            float cy = Mathf.Max(dy, 0f);
+            float cz = Mathf.Max(dz, 0f);
+            return Mathf.Sqrt(cx * cx + cy * cy + cz * cz);
+        }
+    }
+
+    /// <summary>
+    /// Result of a batch fixture-collision check across multiple lookahead blocks.
+    /// Reports the first detected collision with its block index, contact point,
+    /// minimum clearance distance, and a human-readable recommendation.
+    /// </summary>
+    [Serializable]
+    public class CollisionCheckResult
+    {
+        /// <summary>True if any block intersects the fixture AABB.</summary>
+        public bool hasCollision;
+        /// <summary>Index into the LookaheadResult array of the first colliding block (-1 if none).</summary>
+        public int collisionBlockIndex = -1;
+        /// <summary>World-space point of the first detected collision.</summary>
+        public Vector3 collisionPoint;
+        /// <summary>Minimum clearance distance (mm) across all checked blocks. Negative means penetration.</summary>
+        public float clearanceDistance = float.MaxValue;
+        /// <summary>Human-readable recommendation for resolving the collision.</summary>
+        public string recommendation = "";
+    }
+
+    /// <summary>
     /// Result of lookahead analysis for a single upcoming toolpath segment.
     /// </summary>
     [Serializable]
@@ -349,6 +427,200 @@ namespace MiracleTwin.Cutting
             }
 
             return riskSegments;
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        //  Batch fixture-collision detection (FixtureCollisionProfile)
+        // ────────────────────────────────────────────────────────────────────
+
+        /// <summary>Safety margin (mm) added to AABB checks for rapid (G00) moves.</summary>
+        private const float RapidSafetyMargin = 2f;
+
+        /// <summary>Number of sample points when checking arc segments (G02/G03).</summary>
+        private const int ArcCollisionSamples = 8;
+
+        /// <summary>
+        /// Check a batch of lookahead results against a <see cref="FixtureCollisionProfile"/>.
+        /// <para>
+        /// For each block the method inspects the toolpath segment positions:
+        /// <list type="bullet">
+        ///   <item>Rapid moves (G00) use a 2 mm safety margin around the fixture AABB.</item>
+        ///   <item>Arc moves (G02/G03) are sampled at 8 evenly-spaced points along the arc.</item>
+        ///   <item>Linear cutting moves check start and end positions.</item>
+        /// </list>
+        /// Returns on the first collision found (earliest block index).
+        /// </para>
+        /// </summary>
+        /// <param name="results">Lookahead blocks to check. May be null or empty.</param>
+        /// <param name="fixture">Fixture geometry. May be null (returns no-collision).</param>
+        /// <param name="segments">Original toolpath segments aligned with <paramref name="results"/>.</param>
+        public CollisionCheckResult CheckFixtureCollisions(
+            LookaheadResult[] results,
+            FixtureCollisionProfile fixture,
+            IReadOnlyList<ToolpathSegment> segments = null)
+        {
+            var output = new CollisionCheckResult();
+
+            if (results == null || results.Length == 0 || fixture == null)
+                return output;
+
+            for (int i = 0; i < results.Length; i++)
+            {
+                var r = results[i];
+                ToolpathSegment seg = default;
+                bool hasSeg = segments != null && r.segmentIndex >= 0 && r.segmentIndex < segments.Count;
+                if (hasSeg) seg = segments[r.segmentIndex];
+
+                // Determine move type from the segment (default to Linear if unavailable)
+                SegmentType moveType = hasSeg ? seg.type : SegmentType.Linear;
+                float margin = moveType == SegmentType.Rapid ? RapidSafetyMargin : 0f;
+
+                // Gather candidate points to test
+                var points = new List<Vector3>();
+
+                if (hasSeg)
+                {
+                    points.Add(seg.startPos);
+                    points.Add(seg.endPos);
+
+                    // Arc moves: sample intermediate points along the arc
+                    if (moveType == SegmentType.CWArc || moveType == SegmentType.CCWArc)
+                    {
+                        AddArcSamplePoints(seg, points);
+                    }
+                }
+                else
+                {
+                    // Fallback: no segment data, skip geometric check
+                    continue;
+                }
+
+                // Evaluate each candidate point
+                foreach (var pt in points)
+                {
+                    float dist = fixture.DistanceToSurface(pt);
+                    float effectiveClearance = dist - margin;
+
+                    // Track global minimum clearance
+                    if (effectiveClearance < output.clearanceDistance)
+                        output.clearanceDistance = effectiveClearance;
+
+                    // Collision when the point (with margin) is inside the fixture
+                    if (fixture.ContainsPoint(pt, margin))
+                    {
+                        output.hasCollision = true;
+                        output.collisionBlockIndex = i;
+                        output.collisionPoint = pt;
+
+                        string moveLabel = moveType == SegmentType.Rapid ? "rapid move (G00)"
+                            : (moveType == SegmentType.CWArc || moveType == SegmentType.CCWArc) ? "arc move"
+                            : "cutting move";
+                        output.recommendation =
+                            $"Collision detected at block {i} during {moveLabel}. " +
+                            $"Retract to safe height Z={fixture.safeRetractHeight:F1} mm before traversing fixture zone.";
+
+                        return output; // Report first collision only
+                    }
+                }
+            }
+
+            return output;
+        }
+
+        /// <summary>
+        /// Samples <see cref="ArcCollisionSamples"/> evenly-spaced points along an arc segment
+        /// and appends them to <paramref name="points"/>.
+        /// The arc is defined by <c>startPos</c>, <c>endPos</c>, and <c>arcCenter</c> on the XY plane.
+        /// </summary>
+        private void AddArcSamplePoints(ToolpathSegment seg, List<Vector3> points)
+        {
+            Vector3 center = seg.arcCenter;
+            Vector3 startOffset = seg.startPos - center;
+            Vector3 endOffset = seg.endPos - center;
+
+            float startAngle = Mathf.Atan2(startOffset.z, startOffset.x);
+            float endAngle = Mathf.Atan2(endOffset.z, endOffset.x);
+            float radius = startOffset.magnitude;
+
+            // Determine sweep direction
+            float sweep;
+            if (seg.type == SegmentType.CWArc)
+            {
+                sweep = startAngle - endAngle;
+                if (sweep <= 0f) sweep += Mathf.PI * 2f;
+                sweep = -sweep; // CW is negative sweep
+            }
+            else
+            {
+                sweep = endAngle - startAngle;
+                if (sweep <= 0f) sweep += Mathf.PI * 2f;
+            }
+
+            // Linearly interpolate Z between start and end
+            float zStart = seg.startPos.y; // Unity Y is vertical
+            float zEnd = seg.endPos.y;
+
+            for (int s = 1; s <= ArcCollisionSamples; s++)
+            {
+                float t = (float)s / (ArcCollisionSamples + 1);
+                float angle = startAngle + sweep * t;
+                float y = Mathf.Lerp(zStart, zEnd, t);
+                var samplePt = new Vector3(
+                    center.x + radius * Mathf.Cos(angle),
+                    y,
+                    center.z + radius * Mathf.Sin(angle)
+                );
+                points.Add(samplePt);
+            }
+        }
+
+        /// <summary>
+        /// Given a collision at <paramref name="collisionBlock"/>, generate a safe
+        /// retract-traverse-plunge alternative path that avoids the fixture.
+        /// Returns a list of waypoints: retract straight up to safe Z, traverse
+        /// horizontally to the target XZ, then plunge back down.
+        /// </summary>
+        /// <param name="collisionBlock">Index into the lookahead results where the collision occurs.</param>
+        /// <param name="fixture">Fixture profile supplying the safe retract height.</param>
+        /// <param name="segments">Original toolpath segments (optional; used to derive start/end positions).</param>
+        public List<Vector3> GenerateCollisionAvoidancePath(
+            int collisionBlock,
+            FixtureCollisionProfile fixture,
+            IReadOnlyList<ToolpathSegment> segments = null)
+        {
+            var waypoints = new List<Vector3>();
+
+            if (fixture == null || collisionBlock < 0)
+                return waypoints;
+
+            // Determine start and end positions from segment data
+            Vector3 startPos = Vector3.zero;
+            Vector3 endPos = Vector3.zero;
+
+            if (segments != null && cachedResults.Count > collisionBlock)
+            {
+                int segIdx = cachedResults[collisionBlock].segmentIndex;
+                if (segIdx >= 0 && segIdx < segments.Count)
+                {
+                    startPos = segments[segIdx].startPos;
+                    endPos = segments[segIdx].endPos;
+                }
+            }
+
+            float safeZ = fixture.safeRetractHeight;
+
+            // 1. Retract: move straight up from current position to safe height
+            var retractPoint = new Vector3(startPos.x, safeZ, startPos.z);
+            waypoints.Add(retractPoint);
+
+            // 2. Traverse: move horizontally at safe height to above the target XZ
+            var traversePoint = new Vector3(endPos.x, safeZ, endPos.z);
+            waypoints.Add(traversePoint);
+
+            // 3. Plunge: descend to the target position
+            waypoints.Add(endPos);
+
+            return waypoints;
         }
     }
 }

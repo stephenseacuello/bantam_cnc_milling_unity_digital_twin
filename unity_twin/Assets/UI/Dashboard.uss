@@ -1098,3 +1098,89 @@
     background-color: rgba(50, 120, 210, 0.55);
     color: rgb(180, 220, 255);
 }
+
+/* ── Force Axis Toggle Controls ──────────────────────────────── */
+
+.force-axis-toggle {
+    flex-direction: row;
+    align-items: center;
+    padding: 2px 6px;
+    margin: 1px 2px;
+    background-color: rgba(40, 40, 60, 0.7);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: rgba(60, 60, 80, 0.5);
+    min-height: 22px;
+}
+
+.force-axis-toggle:hover {
+    background-color: rgba(55, 55, 80, 0.85);
+    border-color: rgba(100, 170, 255, 0.4);
+}
+
+.force-axis-toggle .unity-toggle__checkmark {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    margin-right: 4px;
+}
+
+.force-axis-toggle Label {
+    font-size: 10px;
+    color: rgb(180, 190, 210);
+    -unity-font-style: bold;
+}
+
+/* ── Force Polar View Container ──────────────────────────────── */
+
+.force-polar-view {
+    width: 180px;
+    height: 180px;
+    min-width: 140px;
+    min-height: 140px;
+    background-color: rgba(10, 10, 18, 0.9);
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: rgba(60, 60, 80, 0.5);
+    margin-top: 4px;
+    padding: 4px;
+    align-self: center;
+}
+
+.force-polar-view:hover {
+    border-color: rgba(100, 170, 255, 0.4);
+}
+
+/* ── Force Statistics Overlay ────────────────────────────────── */
+
+.force-stats-overlay {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 6px;
+    margin-top: 2px;
+    background-color: rgba(25, 28, 45, 0.75);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: rgba(60, 80, 120, 0.4);
+    min-height: 20px;
+}
+
+.force-stats-overlay Label {
+    font-size: 10px;
+    color: rgb(160, 180, 210);
+}
+
+.force-stats-overlay .stats-value {
+    font-size: 10px;
+    color: rgb(100, 200, 255);
+    -unity-font-style: bold;
+}
+
+.force-stats-overlay .stats-peak {
+    color: rgb(255, 120, 100);
+}
+
+.force-stats-overlay .stats-stddev {
+    color: rgb(180, 200, 230);
+}

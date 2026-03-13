@@ -26,6 +26,57 @@ namespace MiracleTwin.UI
     }
 
     /// <summary>
+    /// Multi-axis force breakdown data containing tangential, radial, and axial
+    /// force components along with derived torque, power, and specific cutting force.
+    /// </summary>
+    [System.Serializable]
+    public class ForceBreakdown
+    {
+        public float tangentialN;
+        public float radialN;
+        public float axialN;
+        public float resultantN;
+        public float torqueNm;
+        public float powerW;
+        public float specificCuttingForce;
+        public float timestamp;
+
+        /// <summary>
+        /// Compute the resultant force magnitude from the three components.
+        /// </summary>
+        public void ComputeResultant()
+        {
+            resultantN = Mathf.Sqrt(tangentialN * tangentialN + radialN * radialN + axialN * axialN);
+        }
+    }
+
+    /// <summary>
+    /// Per-axis configuration for force chart visualization, controlling
+    /// color, visibility, line thickness, and auto-scale range.
+    /// </summary>
+    [System.Serializable]
+    public class ForceAxisConfig
+    {
+        public string axisName;
+        public Color color;
+        public bool isVisible = true;
+        public float lineThickness = 2f;
+        public float maxValue = 200f;
+    }
+
+    /// <summary>
+    /// Display modes for the force chart controlling which traces are rendered.
+    /// </summary>
+    public enum ForceDisplayMode
+    {
+        Resultant,
+        Components,
+        Torque,
+        Power,
+        All
+    }
+
+    /// <summary>
     /// Scrolling line chart for Fx, Fy, Fz forces over time.
     /// Uses UI Toolkit custom drawing via generateVisualContent/Painter2D
     /// for efficient rendering of color-coded force traces with grid lines,
@@ -70,6 +121,16 @@ namespace MiracleTwin.UI
         private static readonly Color SeverityMediumColor = new(1f, 0.6f, 0.15f, 0.9f);       // Orange
         private static readonly Color SeverityHighColor = new(1f, 0.15f, 0.1f, 0.9f);         // Red
 
+        // Multi-axis force breakdown trace colors
+        private static readonly Color TangentialColor = new(0.3f, 0.5f, 1f, 1f);    // Blue
+        private static readonly Color RadialColor = new(0.2f, 0.85f, 0.3f, 1f);     // Green
+        private static readonly Color AxialColor = new(1f, 0.6f, 0.15f, 1f);        // Orange
+        private static readonly Color ResultantColor = new(1f, 1f, 1f, 1f);          // White
+        private static readonly Color TorqueColor = new(1f, 0.95f, 0.2f, 1f);       // Yellow
+        private static readonly Color PowerColor = new(1f, 0.2f, 1f, 1f);           // Magenta
+        private static readonly Color StatsOverlayColor = new(0.6f, 0.8f, 1f, 0.5f);
+        private static readonly Color PolarRefColor = new(0.5f, 0.5f, 0.5f, 0.4f);
+
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
         private static readonly ProfilerMarker s_GenerateVisualContentMarker = new("ForceChart.OnGenerateVisualContent");
 #endif
@@ -91,6 +152,29 @@ namespace MiracleTwin.UI
         private List<AnomalyAnnotation> _anomalyAnnotations = new();
         private int _maxAnnotations = 20;
         private bool _showAnnotations = true;
+
+        // Multi-axis force breakdown data
+        private readonly Queue<ForceBreakdown> _forceBreakdowns = new();
+        private ForceDisplayMode _displayMode = ForceDisplayMode.Resultant;
+        private const int RollingAverageWindow = 10;
+        private const float AutoScaleHeadroom = 1.1f; // 10% headroom
+
+        [Header("Force Axis Configuration")]
+        [SerializeField] private ForceAxisConfig tangentialAxis = new()
+            { axisName = "Tangential", color = new Color(0.3f, 0.5f, 1f, 1f), isVisible = true, lineThickness = 2f, maxValue = 200f };
+        [SerializeField] private ForceAxisConfig radialAxis = new()
+            { axisName = "Radial", color = new Color(0.2f, 0.85f, 0.3f, 1f), isVisible = true, lineThickness = 2f, maxValue = 200f };
+        [SerializeField] private ForceAxisConfig axialAxis = new()
+            { axisName = "Axial", color = new Color(1f, 0.6f, 0.15f, 1f), isVisible = true, lineThickness = 2f, maxValue = 200f };
+        [SerializeField] private ForceAxisConfig resultantAxis = new()
+            { axisName = "Resultant", color = new Color(1f, 1f, 1f, 1f), isVisible = true, lineThickness = 3f, maxValue = 300f };
+        [SerializeField] private ForceAxisConfig torqueAxis = new()
+            { axisName = "Torque", color = new Color(1f, 0.95f, 0.2f, 1f), isVisible = true, lineThickness = 2f, maxValue = 50f };
+        [SerializeField] private ForceAxisConfig powerAxis = new()
+            { axisName = "Power", color = new Color(1f, 0.2f, 1f, 1f), isVisible = true, lineThickness = 2f, maxValue = 1000f };
+
+        [Header("Polar Plot")]
+        [SerializeField] private float maxAllowableForce = 200f;
 
         void OnEnable()
         {
@@ -233,6 +317,18 @@ namespace MiracleTwin.UI
                 DrawTrace(painter, samples, 0, FxColor, chartLeft, chartTop, chartWidth, chartHeight); // Fx
                 DrawTrace(painter, samples, 1, FyColor, chartLeft, chartTop, chartWidth, chartHeight); // Fy
                 DrawTrace(painter, samples, 2, FzColor, chartLeft, chartTop, chartWidth, chartHeight); // Fz
+            }
+
+            // 3a-2. Draw multi-axis force breakdown traces (if data available)
+            if (_forceBreakdowns.Count > 1)
+            {
+                DrawForceBreakdownTraces(painter, chartLeft, chartTop, chartWidth, chartHeight);
+
+                // Draw statistics overlay when in Components or All mode
+                if (_displayMode == ForceDisplayMode.Components || _displayMode == ForceDisplayMode.All)
+                {
+                    DrawForceStatistics(painter, chartLeft, chartTop, chartWidth, chartHeight);
+                }
             }
 
             // 3b. Draw predicted force trace (dashed appearance via short segments)
@@ -856,6 +952,371 @@ namespace MiracleTwin.UI
             if (severity >= 0.5f)
                 return SeverityMediumColor;  // Orange
             return SeverityLowColor;         // Yellow
+        }
+
+        // ── Multi-Axis Force Breakdown API ────────────────────────────────
+
+        /// <summary>Current display mode for the force chart.</summary>
+        public ForceDisplayMode DisplayMode => _displayMode;
+
+        /// <summary>Current force breakdown samples (read-only access for testing).</summary>
+        public IReadOnlyCollection<ForceBreakdown> ForceBreakdowns => _forceBreakdowns;
+
+        /// <summary>Per-axis configuration accessors.</summary>
+        public ForceAxisConfig TangentialAxis => tangentialAxis;
+        public ForceAxisConfig RadialAxis => radialAxis;
+        public ForceAxisConfig AxialAxis => axialAxis;
+        public ForceAxisConfig ResultantAxis => resultantAxis;
+        public ForceAxisConfig TorqueAxis => torqueAxis;
+        public ForceAxisConfig PowerAxis => powerAxis;
+
+        /// <summary>
+        /// Switch between different force display modes to control which
+        /// traces are rendered on the chart.
+        /// </summary>
+        public void SetDisplayMode(ForceDisplayMode mode)
+        {
+            _displayMode = mode;
+        }
+
+        /// <summary>
+        /// Add a new multi-axis force breakdown sample. Automatically computes
+        /// the resultant if it is zero, and trims the queue to maxSamples.
+        /// </summary>
+        public void AddForceBreakdown(ForceBreakdown breakdown)
+        {
+            if (breakdown == null) return;
+
+            // Auto-compute resultant if not already set
+            if (breakdown.resultantN <= 0f)
+                breakdown.ComputeResultant();
+
+            _forceBreakdowns.Enqueue(breakdown);
+            while (_forceBreakdowns.Count > maxSamples)
+                _forceBreakdowns.Dequeue();
+
+            // Update auto-scaling per axis with 10% headroom
+            UpdateAutoScale(breakdown);
+        }
+
+        /// <summary>
+        /// Update per-axis max values for auto-scaling with headroom.
+        /// </summary>
+        private void UpdateAutoScale(ForceBreakdown breakdown)
+        {
+            float absT = Mathf.Abs(breakdown.tangentialN);
+            float absR = Mathf.Abs(breakdown.radialN);
+            float absA = Mathf.Abs(breakdown.axialN);
+            float absRes = Mathf.Abs(breakdown.resultantN);
+            float absTq = Mathf.Abs(breakdown.torqueNm);
+            float absPw = Mathf.Abs(breakdown.powerW);
+
+            if (absT * AutoScaleHeadroom > tangentialAxis.maxValue)
+                tangentialAxis.maxValue = absT * AutoScaleHeadroom;
+            if (absR * AutoScaleHeadroom > radialAxis.maxValue)
+                radialAxis.maxValue = absR * AutoScaleHeadroom;
+            if (absA * AutoScaleHeadroom > axialAxis.maxValue)
+                axialAxis.maxValue = absA * AutoScaleHeadroom;
+            if (absRes * AutoScaleHeadroom > resultantAxis.maxValue)
+                resultantAxis.maxValue = absRes * AutoScaleHeadroom;
+            if (absTq * AutoScaleHeadroom > torqueAxis.maxValue)
+                torqueAxis.maxValue = absTq * AutoScaleHeadroom;
+            if (absPw * AutoScaleHeadroom > powerAxis.maxValue)
+                powerAxis.maxValue = absPw * AutoScaleHeadroom;
+        }
+
+        /// <summary>
+        /// Draw multi-axis force breakdown traces based on the current display mode.
+        /// Called from OnGenerateVisualContent when breakdown data is available.
+        /// </summary>
+        private void DrawForceBreakdownTraces(Painter2D painter,
+            float left, float top, float width, float height)
+        {
+            var breakdowns = _forceBreakdowns.ToArray();
+            if (breakdowns.Length < 2) return;
+
+            bool showComponents = _displayMode == ForceDisplayMode.Components || _displayMode == ForceDisplayMode.All;
+            bool showResultant = _displayMode == ForceDisplayMode.Resultant || _displayMode == ForceDisplayMode.All;
+            bool showTorque = _displayMode == ForceDisplayMode.Torque || _displayMode == ForceDisplayMode.All;
+            bool showPower = _displayMode == ForceDisplayMode.Power || _displayMode == ForceDisplayMode.All;
+
+            // Draw component traces on primary Y-axis
+            if (showComponents)
+            {
+                if (tangentialAxis.isVisible)
+                    DrawBreakdownTrace(painter, breakdowns, b => b.tangentialN, tangentialAxis,
+                        left, top, width, height);
+                if (radialAxis.isVisible)
+                    DrawBreakdownTrace(painter, breakdowns, b => b.radialN, radialAxis,
+                        left, top, width, height);
+                if (axialAxis.isVisible)
+                    DrawBreakdownTrace(painter, breakdowns, b => b.axialN, axialAxis,
+                        left, top, width, height);
+            }
+
+            if (showResultant && resultantAxis.isVisible)
+            {
+                DrawBreakdownTrace(painter, breakdowns, b => b.resultantN, resultantAxis,
+                    left, top, width, height);
+            }
+
+            // Torque and power on secondary Y-axis (right side of chart)
+            if (showTorque && torqueAxis.isVisible)
+            {
+                DrawBreakdownTrace(painter, breakdowns, b => b.torqueNm, torqueAxis,
+                    left, top, width, height);
+            }
+
+            if (showPower && powerAxis.isVisible)
+            {
+                DrawBreakdownTrace(painter, breakdowns, b => b.powerW, powerAxis,
+                    left, top, width, height);
+            }
+        }
+
+        /// <summary>
+        /// Draw a single breakdown trace using a value selector and axis config.
+        /// </summary>
+        private void DrawBreakdownTrace(Painter2D painter, ForceBreakdown[] breakdowns,
+            Func<ForceBreakdown, float> valueSelector, ForceAxisConfig axisConfig,
+            float left, float top, float width, float height)
+        {
+            if (breakdowns.Length < 2) return;
+
+            painter.strokeColor = axisConfig.color;
+            painter.lineWidth = axisConfig.lineThickness;
+            painter.lineCap = LineCap.Round;
+            painter.lineJoin = LineJoin.Round;
+
+            float axisMax = Mathf.Max(axisConfig.maxValue, 0.001f);
+
+            painter.BeginPath();
+            for (int i = 0; i < breakdowns.Length; i++)
+            {
+                float x = left + (i / (float)(maxSamples - 1)) * width;
+                float value = valueSelector(breakdowns[i]);
+                float normalized = Mathf.Clamp(value / axisMax, -1f, 1f);
+                float y = top + height * 0.5f - normalized * (height * 0.5f);
+
+                if (i == 0)
+                    painter.MoveTo(new Vector2(x, y));
+                else
+                    painter.LineTo(new Vector2(x, y));
+            }
+            painter.Stroke();
+        }
+
+        // ── Force Polar Plot ──────────────────────────────────────────────
+
+        /// <summary>
+        /// Draw a polar force view showing tangential vs radial force direction
+        /// in the XY plane. Useful for detecting asymmetric cutting and chatter
+        /// patterns. Includes a circle reference for max allowable force.
+        /// </summary>
+        public void DrawPolarForceView(Painter2D painter, float centerX, float centerY, float radius)
+        {
+            var breakdowns = _forceBreakdowns.ToArray();
+
+            // Draw max allowable force reference circle
+            painter.strokeColor = PolarRefColor;
+            painter.lineWidth = 1.5f;
+            painter.BeginPath();
+            painter.Arc(new Vector2(centerX, centerY), radius, 0f, 360f);
+            painter.ClosePath();
+            painter.Stroke();
+
+            // Draw concentric reference rings at 25%, 50%, 75%
+            for (int ring = 1; ring <= 3; ring++)
+            {
+                float ringRadius = radius * (ring / 4f);
+                painter.strokeColor = new Color(PolarRefColor.r, PolarRefColor.g, PolarRefColor.b, 0.2f);
+                painter.lineWidth = 1f;
+                painter.BeginPath();
+                painter.Arc(new Vector2(centerX, centerY), ringRadius, 0f, 360f);
+                painter.ClosePath();
+                painter.Stroke();
+            }
+
+            // Draw crosshair axes
+            painter.strokeColor = new Color(0.4f, 0.4f, 0.4f, 0.5f);
+            painter.lineWidth = 1f;
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(centerX - radius, centerY));
+            painter.LineTo(new Vector2(centerX + radius, centerY));
+            painter.Stroke();
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(centerX, centerY - radius));
+            painter.LineTo(new Vector2(centerX, centerY + radius));
+            painter.Stroke();
+
+            if (breakdowns.Length < 1) return;
+
+            float forceScale = maxAllowableForce > 0f ? radius / maxAllowableForce : 1f;
+
+            // Draw force trajectory (connecting successive points)
+            painter.strokeColor = new Color(TangentialColor.r, TangentialColor.g, TangentialColor.b, 0.6f);
+            painter.lineWidth = 1.5f;
+            painter.lineCap = LineCap.Round;
+            painter.lineJoin = LineJoin.Round;
+
+            painter.BeginPath();
+            for (int i = 0; i < breakdowns.Length; i++)
+            {
+                float px = centerX + breakdowns[i].radialN * forceScale;
+                float py = centerY - breakdowns[i].tangentialN * forceScale;
+
+                if (i == 0)
+                    painter.MoveTo(new Vector2(px, py));
+                else
+                    painter.LineTo(new Vector2(px, py));
+            }
+            painter.Stroke();
+
+            // Draw the most recent point as a filled circle
+            if (breakdowns.Length > 0)
+            {
+                var latest = breakdowns[breakdowns.Length - 1];
+                float latestX = centerX + latest.radialN * forceScale;
+                float latestY = centerY - latest.tangentialN * forceScale;
+
+                painter.fillColor = new Color(1f, 1f, 1f, 0.9f);
+                painter.BeginPath();
+                painter.Arc(new Vector2(latestX, latestY), 4f, 0f, 360f);
+                painter.ClosePath();
+                painter.Fill();
+
+                // Draw line from center to current point for direction indicator
+                painter.strokeColor = new Color(1f, 1f, 1f, 0.4f);
+                painter.lineWidth = 1f;
+                painter.BeginPath();
+                painter.MoveTo(new Vector2(centerX, centerY));
+                painter.LineTo(new Vector2(latestX, latestY));
+                painter.Stroke();
+            }
+        }
+
+        // ── Force Statistics Overlay ──────────────────────────────────────
+
+        /// <summary>
+        /// Draw statistical reference lines (mean, peak, std dev) and a rolling
+        /// average overlay on the force chart. Shows mean as a solid line, peak
+        /// as a dashed line, and +/- 1 standard deviation as shaded band.
+        /// The rolling average (10-sample window) is drawn as a smooth overlay.
+        /// </summary>
+        public void DrawForceStatistics(Painter2D painter,
+            float left, float top, float width, float height)
+        {
+            var breakdowns = _forceBreakdowns.ToArray();
+            if (breakdowns.Length < 2) return;
+
+            // Compute statistics on the resultant force
+            float sum = 0f;
+            float peak = 0f;
+            float sumSq = 0f;
+            for (int i = 0; i < breakdowns.Length; i++)
+            {
+                float v = breakdowns[i].resultantN;
+                sum += v;
+                sumSq += v * v;
+                if (v > peak) peak = v;
+            }
+
+            float mean = sum / breakdowns.Length;
+            float variance = (sumSq / breakdowns.Length) - (mean * mean);
+            float stdDev = Mathf.Sqrt(Mathf.Max(variance, 0f));
+
+            float axisMax = Mathf.Max(resultantAxis.maxValue, 0.001f);
+
+            // Draw mean reference line (solid, semi-transparent)
+            float meanY = top + height * 0.5f - (mean / axisMax) * (height * 0.5f);
+            painter.strokeColor = new Color(StatsOverlayColor.r, StatsOverlayColor.g, StatsOverlayColor.b, 0.7f);
+            painter.lineWidth = 1.5f;
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(left, meanY));
+            painter.LineTo(new Vector2(left + width, meanY));
+            painter.Stroke();
+
+            // Draw peak reference line (dashed)
+            float peakY = top + height * 0.5f - (peak / axisMax) * (height * 0.5f);
+            painter.strokeColor = new Color(1f, 0.4f, 0.4f, 0.5f);
+            painter.lineWidth = 1f;
+            float dashX = left;
+            while (dashX < left + width)
+            {
+                float dashEnd = Mathf.Min(dashX + 8f, left + width);
+                painter.BeginPath();
+                painter.MoveTo(new Vector2(dashX, peakY));
+                painter.LineTo(new Vector2(dashEnd, peakY));
+                painter.Stroke();
+                dashX = dashEnd + 4f;
+            }
+
+            // Draw standard deviation band (shaded region around mean)
+            float stdHighY = top + height * 0.5f - ((mean + stdDev) / axisMax) * (height * 0.5f);
+            float stdLowY = top + height * 0.5f - ((mean - stdDev) / axisMax) * (height * 0.5f);
+            stdHighY = Mathf.Clamp(stdHighY, top, top + height);
+            stdLowY = Mathf.Clamp(stdLowY, top, top + height);
+            DrawRect(painter, new Color(StatsOverlayColor.r, StatsOverlayColor.g, StatsOverlayColor.b, 0.1f),
+                left, stdHighY, width, stdLowY - stdHighY);
+
+            // Draw rolling average line (10-sample window)
+            DrawRollingAverage(painter, breakdowns, left, top, width, height, axisMax);
+
+            // Draw small indicator rectangles on the right edge for mean and peak
+            float indicatorW = 8f;
+            float indicatorH = 4f;
+            float indicatorX = left + width + 2f;
+            DrawRect(painter, new Color(StatsOverlayColor.r, StatsOverlayColor.g, StatsOverlayColor.b, 0.7f),
+                indicatorX, meanY - indicatorH * 0.5f, indicatorW, indicatorH);
+            DrawRect(painter, new Color(1f, 0.4f, 0.4f, 0.5f),
+                indicatorX, peakY - indicatorH * 0.5f, indicatorW, indicatorH);
+        }
+
+        /// <summary>
+        /// Draw a rolling average line over the resultant force using a sliding window.
+        /// </summary>
+        private void DrawRollingAverage(Painter2D painter, ForceBreakdown[] breakdowns,
+            float left, float top, float width, float height, float axisMax)
+        {
+            if (breakdowns.Length < RollingAverageWindow) return;
+
+            painter.strokeColor = new Color(0.4f, 0.9f, 1f, 0.6f);
+            painter.lineWidth = 2f;
+            painter.lineCap = LineCap.Round;
+            painter.lineJoin = LineJoin.Round;
+
+            // Compute initial window sum
+            float windowSum = 0f;
+            for (int i = 0; i < RollingAverageWindow; i++)
+                windowSum += breakdowns[i].resultantN;
+
+            painter.BeginPath();
+            bool first = true;
+
+            for (int i = RollingAverageWindow - 1; i < breakdowns.Length; i++)
+            {
+                if (i >= RollingAverageWindow)
+                {
+                    windowSum += breakdowns[i].resultantN;
+                    windowSum -= breakdowns[i - RollingAverageWindow].resultantN;
+                }
+
+                float avg = windowSum / RollingAverageWindow;
+                float x = left + (i / (float)(maxSamples - 1)) * width;
+                float normalized = Mathf.Clamp(avg / axisMax, -1f, 1f);
+                float y = top + height * 0.5f - normalized * (height * 0.5f);
+
+                if (first)
+                {
+                    painter.MoveTo(new Vector2(x, y));
+                    first = false;
+                }
+                else
+                {
+                    painter.LineTo(new Vector2(x, y));
+                }
+            }
+            painter.Stroke();
         }
     }
 }

@@ -82,6 +82,9 @@ def _make_node() -> AlertCorrelatorNode:
     node._machine_gcode_context = {}
     node._block_anomaly_history = {}
     node._block_anomaly_history_cap = 1000
+    # Pattern library added in Round 8
+    from miracle_scada.alert_correlator import AnomalyPatternLibrary
+    node._pattern_library = AnomalyPatternLibrary()
     # Provide a logger and clock mock
     node.get_logger = lambda: MagicMock()
     node.get_clock = lambda: MagicMock(now=lambda: MagicMock(to_msg=lambda: MagicMock()))

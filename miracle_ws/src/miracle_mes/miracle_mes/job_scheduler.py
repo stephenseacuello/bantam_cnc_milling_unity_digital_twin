@@ -9,10 +9,11 @@ Alarm escalation integration: subscribes to alarm escalation events and
 automatically pauses or reassigns jobs on affected machines.
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import IntEnum
 import threading
+import time
 import uuid
 import heapq
 
@@ -59,6 +60,323 @@ class Job:
     tool_id: str = field(compare=False, default='')
 
 
+@dataclass
+class MaintenanceWindow:
+    """A scheduled maintenance window for a machine."""
+    window_id: str
+    machine_id: str
+    maintenance_type: str  # TOOL_CHANGE, CALIBRATION, COOLANT_REFILL, SPINDLE_SERVICE, PREVENTIVE
+    scheduled_start: float  # timestamp
+    estimated_duration_min: float
+    priority: int  # 1=critical, 5=routine
+    triggered_by: str  # prediction, schedule, operator
+    tool_id: str = ''
+    rul_at_scheduling: float = 0.0  # minutes remaining
+    status: str = 'PENDING'  # PENDING, IN_PROGRESS, COMPLETED, CANCELLED
+
+
+class MaintenanceScheduler:
+    """Predictive maintenance scheduler integrated with the job scheduler.
+
+    Manages a priority queue of maintenance windows sorted by (priority, scheduled_start).
+    Automatically schedules maintenance based on tool RUL predictions and calibration drift.
+    """
+
+    # Thresholds
+    RUL_THRESHOLD_MIN: float = 30.0  # auto-schedule tool change below this
+    CALIBRATION_DRIFT_THRESHOLD_PCT: float = 8.0  # auto-schedule calibration above this
+    URGENT_INTERRUPT_THRESHOLD_MIN: float = 10.0  # interrupt current job if below this
+
+    VALID_MAINTENANCE_TYPES = {
+        'TOOL_CHANGE', 'CALIBRATION', 'COOLANT_REFILL',
+        'SPINDLE_SERVICE', 'PREVENTIVE',
+    }
+
+    # Default durations by type (minutes)
+    DEFAULT_DURATIONS = {
+        'TOOL_CHANGE': 15.0,
+        'CALIBRATION': 30.0,
+        'COOLANT_REFILL': 10.0,
+        'SPINDLE_SERVICE': 60.0,
+        'PREVENTIVE': 45.0,
+    }
+
+    def __init__(self) -> None:
+        self._queue: List[Tuple[int, float, str, MaintenanceWindow]] = []  # heapq: (priority, time, id, window)
+        self._windows: Dict[str, MaintenanceWindow] = {}
+        self._completed: List[MaintenanceWindow] = []
+        self._lock = threading.Lock()
+        self._wear_rates: Dict[str, Dict[str, float]] = {}  # machine_id -> {tool_id: wear_rate_per_min}
+        self._last_rul: Dict[str, Dict[str, float]] = {}  # machine_id -> {tool_id: rul_minutes}
+        self._last_drift: Dict[str, float] = {}  # machine_id -> drift_pct
+        self._scheduled_keys: Set[str] = set()  # dedup key: "machine_id:type:tool_id"
+        # Reference to parent scheduler node (set after construction)
+        self._node: Any = None
+
+    def schedule_maintenance(
+        self,
+        machine_id: str,
+        maintenance_type: str,
+        urgency_minutes: float = 60.0,
+        **kwargs: Any,
+    ) -> MaintenanceWindow:
+        """Schedule a maintenance window for a machine.
+
+        Args:
+            machine_id: Target machine.
+            maintenance_type: One of TOOL_CHANGE, CALIBRATION, COOLANT_REFILL, SPINDLE_SERVICE, PREVENTIVE.
+            urgency_minutes: How soon maintenance is needed (minutes from now).
+            **kwargs: Optional overrides - priority, triggered_by, tool_id, rul_at_scheduling,
+                      estimated_duration_min.
+
+        Returns:
+            The created MaintenanceWindow.
+        """
+        now = time.time()
+        priority = kwargs.get('priority', 5 if urgency_minutes > 60 else (1 if urgency_minutes < 10 else 3))
+        triggered_by = kwargs.get('triggered_by', 'schedule')
+        tool_id = kwargs.get('tool_id', '')
+        rul_at_scheduling = kwargs.get('rul_at_scheduling', 0.0)
+        duration = kwargs.get(
+            'estimated_duration_min',
+            self.DEFAULT_DURATIONS.get(maintenance_type, 30.0),
+        )
+
+        window = MaintenanceWindow(
+            window_id=str(uuid.uuid4())[:12],
+            machine_id=machine_id,
+            maintenance_type=maintenance_type,
+            scheduled_start=now + urgency_minutes * 60,
+            estimated_duration_min=duration,
+            priority=priority,
+            triggered_by=triggered_by,
+            tool_id=tool_id,
+            rul_at_scheduling=rul_at_scheduling,
+        )
+
+        dedup_key = f"{machine_id}:{maintenance_type}:{tool_id}"
+
+        with self._lock:
+            # Prevent duplicate scheduling for the same machine/type/tool
+            if dedup_key in self._scheduled_keys:
+                # Return existing window
+                for _, _, _, w in self._queue:
+                    if (w.machine_id == machine_id
+                            and w.maintenance_type == maintenance_type
+                            and w.tool_id == tool_id
+                            and w.status == 'PENDING'):
+                        return w
+
+            self._scheduled_keys.add(dedup_key)
+            self._windows[window.window_id] = window
+            heapq.heappush(self._queue, (window.priority, window.scheduled_start, window.window_id, window))
+
+        # Handle urgent maintenance: interrupt current job if needed
+        if urgency_minutes < self.URGENT_INTERRUPT_THRESHOLD_MIN and self._node:
+            job = self._node._find_active_job_on_machine(machine_id)
+            if job and job.status in ('ASSIGNED', 'RUNNING'):
+                self._node.pause_job(job.job_id)
+                window.status = 'IN_PROGRESS'
+
+        return window
+
+    def check_tool_rul(self, machine_id: str, tool_id: str, rul_minutes: float) -> Optional[MaintenanceWindow]:
+        """Check tool remaining useful life and auto-schedule TOOL_CHANGE if needed.
+
+        Args:
+            machine_id: The machine running the tool.
+            tool_id: The tool identifier.
+            rul_minutes: Remaining useful life in minutes.
+
+        Returns:
+            A MaintenanceWindow if one was created, else None.
+        """
+        # Track for wear rate estimation
+        if machine_id not in self._last_rul:
+            self._last_rul[machine_id] = {}
+        prev = self._last_rul[machine_id].get(tool_id)
+        self._last_rul[machine_id][tool_id] = rul_minutes
+
+        # Estimate wear rate
+        if prev is not None and prev > rul_minutes:
+            if machine_id not in self._wear_rates:
+                self._wear_rates[machine_id] = {}
+            self._wear_rates[machine_id][tool_id] = prev - rul_minutes  # per check interval
+
+        if rul_minutes < self.RUL_THRESHOLD_MIN:
+            return self.schedule_maintenance(
+                machine_id=machine_id,
+                maintenance_type='TOOL_CHANGE',
+                urgency_minutes=max(rul_minutes, 1.0),
+                priority=1 if rul_minutes < 10 else 2,
+                triggered_by='prediction',
+                tool_id=tool_id,
+                rul_at_scheduling=rul_minutes,
+            )
+        return None
+
+    def check_calibration_drift(self, machine_id: str, drift_pct: float) -> Optional[MaintenanceWindow]:
+        """Check calibration drift and auto-schedule CALIBRATION if needed.
+
+        Args:
+            machine_id: The machine to check.
+            drift_pct: Current calibration drift percentage.
+
+        Returns:
+            A MaintenanceWindow if one was created, else None.
+        """
+        self._last_drift[machine_id] = drift_pct
+
+        if drift_pct > self.CALIBRATION_DRIFT_THRESHOLD_PCT:
+            urgency = max(5.0, 60.0 - (drift_pct - self.CALIBRATION_DRIFT_THRESHOLD_PCT) * 5)
+            return self.schedule_maintenance(
+                machine_id=machine_id,
+                maintenance_type='CALIBRATION',
+                urgency_minutes=urgency,
+                priority=2 if drift_pct > 15 else 3,
+                triggered_by='prediction',
+            )
+        return None
+
+    def get_maintenance_queue(self, machine_id: Optional[str] = None) -> List[MaintenanceWindow]:
+        """Get sorted list of pending maintenance windows.
+
+        Args:
+            machine_id: Filter by machine. If None, returns all.
+
+        Returns:
+            List of MaintenanceWindow sorted by priority then scheduled_start.
+        """
+        with self._lock:
+            pending = [
+                w for _, _, _, w in sorted(self._queue)
+                if w.status == 'PENDING'
+                and (machine_id is None or w.machine_id == machine_id)
+            ]
+        return pending
+
+    def complete_maintenance(self, window_id: str) -> bool:
+        """Mark a maintenance window as completed.
+
+        Args:
+            window_id: The window to complete.
+
+        Returns:
+            True if the window was found and completed.
+        """
+        with self._lock:
+            window = self._windows.get(window_id)
+            if not window or window.status in ('COMPLETED', 'CANCELLED'):
+                return False
+            window.status = 'COMPLETED'
+            dedup_key = f"{window.machine_id}:{window.maintenance_type}:{window.tool_id}"
+            self._scheduled_keys.discard(dedup_key)
+            self._completed.append(window)
+
+        # Record in digital thread if available
+        if self._node and self._node._digital_thread:
+            self._node._digital_thread.record_genealogy_event(
+                'MAINTENANCE_COMPLETE',
+                machine_id=window.machine_id,
+                tool_id=window.tool_id,
+                metadata={
+                    'window_id': window.window_id,
+                    'maintenance_type': window.maintenance_type,
+                    'triggered_by': window.triggered_by,
+                    'duration_min': window.estimated_duration_min,
+                },
+            )
+
+        # Resume paused job if the node interrupted one
+        if self._node:
+            job = self._node._find_active_job_on_machine(window.machine_id)
+            if job and job.status == 'PAUSED':
+                self._node.resume_job(job.job_id)
+
+        return True
+
+    def cancel_maintenance(self, window_id: str) -> bool:
+        """Cancel a pending maintenance window.
+
+        Args:
+            window_id: The window to cancel.
+
+        Returns:
+            True if the window was found and cancelled.
+        """
+        with self._lock:
+            window = self._windows.get(window_id)
+            if not window or window.status != 'PENDING':
+                return False
+            window.status = 'CANCELLED'
+            dedup_key = f"{window.machine_id}:{window.maintenance_type}:{window.tool_id}"
+            self._scheduled_keys.discard(dedup_key)
+        return True
+
+    def get_maintenance_forecast(self, hours_ahead: float = 24.0) -> List[Dict[str, Any]]:
+        """Predict maintenance needs based on current wear rates and drift.
+
+        Args:
+            hours_ahead: How far ahead to forecast (hours).
+
+        Returns:
+            List of dicts with predicted maintenance needs.
+        """
+        forecasts: List[Dict[str, Any]] = []
+        minutes_ahead = hours_ahead * 60.0
+
+        # Tool wear forecasts
+        for machine_id, tools in self._last_rul.items():
+            rates = self._wear_rates.get(machine_id, {})
+            for tool_id, rul in tools.items():
+                if rul <= 0:
+                    continue
+                rate = rates.get(tool_id, 0)
+                if rate > 0:
+                    time_to_failure = rul  # already in minutes
+                    if time_to_failure < minutes_ahead:
+                        forecasts.append({
+                            'machine_id': machine_id,
+                            'maintenance_type': 'TOOL_CHANGE',
+                            'tool_id': tool_id,
+                            'predicted_minutes_until_needed': time_to_failure,
+                            'confidence': min(0.95, 0.5 + rate * 0.1),
+                            'source': 'wear_rate_model',
+                        })
+                elif rul < minutes_ahead:
+                    # No rate data but RUL is within window
+                    forecasts.append({
+                        'machine_id': machine_id,
+                        'maintenance_type': 'TOOL_CHANGE',
+                        'tool_id': tool_id,
+                        'predicted_minutes_until_needed': rul,
+                        'confidence': 0.5,
+                        'source': 'rul_estimate',
+                    })
+
+        # Calibration drift forecasts
+        for machine_id, drift in self._last_drift.items():
+            if drift > self.CALIBRATION_DRIFT_THRESHOLD_PCT * 0.7:
+                # Extrapolate drift growth
+                time_to_threshold = max(
+                    0,
+                    (self.CALIBRATION_DRIFT_THRESHOLD_PCT - drift) / max(drift * 0.01, 0.001),
+                )
+                if time_to_threshold < minutes_ahead or drift > self.CALIBRATION_DRIFT_THRESHOLD_PCT:
+                    forecasts.append({
+                        'machine_id': machine_id,
+                        'maintenance_type': 'CALIBRATION',
+                        'drift_pct': drift,
+                        'predicted_minutes_until_needed': time_to_threshold if drift <= self.CALIBRATION_DRIFT_THRESHOLD_PCT else 0,
+                        'confidence': 0.7,
+                        'source': 'drift_extrapolation',
+                    })
+
+        # Sort by urgency
+        forecasts.sort(key=lambda f: f.get('predicted_minutes_until_needed', float('inf')))
+        return forecasts
+
+
 class JobSchedulerNode(MiracleLifecycleNode):
     """Priority-based job scheduler with machine assignment.
 
@@ -103,6 +421,10 @@ class JobSchedulerNode(MiracleLifecycleNode):
         self._blocked_machines: Set[str] = set()
         self._alarm_escalation_sub = None
         self._job_history: List[Dict[str, Any]] = []
+
+        # Predictive maintenance scheduler
+        self.maintenance_scheduler = MaintenanceScheduler()
+        self.maintenance_scheduler._node = self
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure job scheduler."""
@@ -561,6 +883,34 @@ class JobSchedulerNode(MiracleLifecycleNode):
                 metadata=meta,
             )
         return True
+
+    # ------------------------------------------------------------------
+    # Predictive maintenance trigger checks
+    # ------------------------------------------------------------------
+
+    def _check_maintenance_triggers(self) -> None:
+        """Check maintenance triggers based on current machine states and predictions.
+
+        Call this periodically (e.g., from _scheduling_cycle) or when
+        prediction data is updated.
+        """
+        for machine_id, state in self._machine_states.items():
+            # Check tool RUL if available on the state message
+            tool_id = getattr(state, 'tool_id', '') or ''
+            rul = getattr(state, 'tool_rul_minutes', None)
+            if tool_id and rul is not None and rul != '':
+                try:
+                    self.maintenance_scheduler.check_tool_rul(machine_id, tool_id, float(rul))
+                except (ValueError, TypeError):
+                    pass
+
+            # Check calibration drift if available
+            drift = getattr(state, 'calibration_drift_pct', None)
+            if drift is not None and drift != '':
+                try:
+                    self.maintenance_scheduler.check_calibration_drift(machine_id, float(drift))
+                except (ValueError, TypeError):
+                    pass
 
     # ------------------------------------------------------------------
     # Alarm escalation handling

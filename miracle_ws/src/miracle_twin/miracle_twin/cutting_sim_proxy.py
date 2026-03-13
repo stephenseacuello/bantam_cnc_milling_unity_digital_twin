@@ -264,6 +264,255 @@ class ProgramOptimizationResult:
     risk_assessment: str = 'low'  # "low", "medium", "high"
 
 
+@dataclass
+class CoolantRecommendation:
+    """Advisory recommendation for coolant strategy."""
+    recommended_type: str  # 'dry', 'mist', 'flood', 'high_pressure', 'cryogenic'
+    current_type: str
+    reason: str
+    thermal_improvement_pct: float
+    wear_improvement_pct: float
+    cost_factor: float  # 1.0 = baseline (dry)
+    environmental_score: float  # 0-1, higher = greener
+
+
+class CoolantOptimizer:
+    """Recommends optimal coolant strategies based on cutting conditions and material."""
+
+    COOLANT_TYPES = ('dry', 'mist', 'flood', 'high_pressure', 'cryogenic')
+
+    # Relative cost model (dry = 1.0 baseline)
+    COST_MODEL: Dict[str, float] = {
+        'dry': 1.0,
+        'mist': 1.8,
+        'flood': 3.5,
+        'high_pressure': 6.0,
+        'cryogenic': 9.0,
+    }
+
+    # Environmental score (higher = greener)
+    ENV_SCORE: Dict[str, float] = {
+        'dry': 1.0,
+        'mist': 0.85,
+        'flood': 0.45,
+        'high_pressure': 0.35,
+        'cryogenic': 0.55,  # CO2/LN2 — no oil waste, but energy-intensive
+    }
+
+    # Material-specific coolant effectiveness tables
+    # Each entry: {coolant_type: (thermal_reduction_pct, wear_reduction_pct)}
+    MATERIAL_TABLES: Dict[str, Dict[str, tuple]] = {
+        '6061-T6': {
+            'dry':           (0.0,  0.0),
+            'mist':          (25.0, 15.0),
+            'flood':         (55.0, 35.0),
+            'high_pressure': (70.0, 50.0),
+            'cryogenic':     (85.0, 60.0),
+        },
+        '304-stainless': {
+            'dry':           (0.0,  0.0),
+            'mist':          (20.0, 10.0),
+            'flood':         (50.0, 30.0),
+            'high_pressure': (72.0, 55.0),
+            'cryogenic':     (88.0, 65.0),
+        },
+        'Ti-6Al-4V': {
+            'dry':           (0.0,  0.0),
+            'mist':          (15.0, 8.0),
+            'flood':         (40.0, 25.0),
+            'high_pressure': (75.0, 60.0),
+            'cryogenic':     (90.0, 70.0),
+        },
+        'Inconel-718': {
+            'dry':           (0.0,  0.0),
+            'mist':          (12.0, 6.0),
+            'flood':         (35.0, 20.0),
+            'high_pressure': (78.0, 65.0),
+            'cryogenic':     (92.0, 75.0),
+        },
+    }
+
+    # Materials that always require aggressive cooling
+    HARD_MATERIALS = {'Ti-6Al-4V', 'Inconel-718'}
+
+    # Thermal limit (degrees C) — above this, upgrade coolant
+    THERMAL_LIMIT = 250.0
+
+    # Wear rate threshold (mm/min) — above this, upgrade coolant to extend tool life
+    WEAR_RATE_LIMIT = 0.02
+
+    def __init__(self, material: str = '6061-T6'):
+        self.material = material
+        if material not in self.MATERIAL_TABLES:
+            self._effectiveness = self.MATERIAL_TABLES['6061-T6']
+        else:
+            self._effectiveness = self.MATERIAL_TABLES[material]
+
+    def get_coolant_cost_model(self) -> Dict[str, float]:
+        """Return relative cost factors for all coolant types."""
+        return dict(self.COST_MODEL)
+
+    def recommend_coolant(
+        self,
+        operation_type: str,
+        cutting_speed: float,
+        depth: float,
+        current_temp: float,
+        current_wear_rate: float,
+        current_coolant: str,
+    ) -> CoolantRecommendation:
+        """Recommend the best coolant for the given cutting conditions.
+
+        Args:
+            operation_type: 'roughing', 'finishing', 'slotting', etc.
+            cutting_speed: surface speed in m/min
+            depth: axial depth of cut in mm
+            current_temp: current tool/workpiece temperature in degrees C
+            current_wear_rate: current flank wear rate in mm/min
+            current_coolant: currently active coolant type
+
+        Returns:
+            CoolantRecommendation with the best option.
+        """
+        # Guard: zero/negative speed or depth → dry (machine is idle)
+        if cutting_speed <= 0 or depth <= 0:
+            eff = self._effectiveness['dry']
+            return CoolantRecommendation(
+                recommended_type='dry',
+                current_type=current_coolant,
+                reason='Machine idle or no cutting — coolant unnecessary',
+                thermal_improvement_pct=eff[0],
+                wear_improvement_pct=eff[1],
+                cost_factor=self.COST_MODEL['dry'],
+                environmental_score=self.ENV_SCORE['dry'],
+            )
+
+        recommended = self._select_coolant(
+            operation_type, cutting_speed, depth, current_temp, current_wear_rate,
+        )
+
+        eff = self._effectiveness[recommended]
+        current_eff = self._effectiveness.get(current_coolant, (0.0, 0.0))
+        thermal_imp = eff[0] - current_eff[0]
+        wear_imp = eff[1] - current_eff[1]
+
+        reason = self._build_reason(
+            recommended, operation_type, cutting_speed, depth,
+            current_temp, current_wear_rate,
+        )
+
+        return CoolantRecommendation(
+            recommended_type=recommended,
+            current_type=current_coolant,
+            reason=reason,
+            thermal_improvement_pct=round(thermal_imp, 2),
+            wear_improvement_pct=round(wear_imp, 2),
+            cost_factor=self.COST_MODEL[recommended],
+            environmental_score=self.ENV_SCORE[recommended],
+        )
+
+    def evaluate_all_coolants(
+        self,
+        operation_type: str,
+        cutting_speed: float,
+        depth: float,
+    ) -> List[CoolantRecommendation]:
+        """Evaluate all coolant options and return sorted by net benefit.
+
+        Net benefit = (thermal_improvement + wear_improvement) / cost_factor.
+        """
+        results: List[CoolantRecommendation] = []
+        for ct in self.COOLANT_TYPES:
+            eff = self._effectiveness[ct]
+            results.append(CoolantRecommendation(
+                recommended_type=ct,
+                current_type='dry',  # baseline comparison
+                reason=f'{ct} evaluation for {operation_type}',
+                thermal_improvement_pct=eff[0],
+                wear_improvement_pct=eff[1],
+                cost_factor=self.COST_MODEL[ct],
+                environmental_score=self.ENV_SCORE[ct],
+            ))
+
+        # Sort by net benefit descending
+        def net_benefit(rec: CoolantRecommendation) -> float:
+            return (rec.thermal_improvement_pct + rec.wear_improvement_pct) / max(rec.cost_factor, 0.01)
+
+        results.sort(key=net_benefit, reverse=True)
+        return results
+
+    # ------------------------------------------------------------------
+    # Internal decision logic
+    # ------------------------------------------------------------------
+
+    def _select_coolant(
+        self,
+        operation_type: str,
+        cutting_speed: float,
+        depth: float,
+        current_temp: float,
+        current_wear_rate: float,
+    ) -> str:
+        """Core decision logic for coolant selection."""
+        # Rule 1: Hard materials always need aggressive cooling
+        if self.material in self.HARD_MATERIALS:
+            if current_temp > self.THERMAL_LIMIT:
+                return 'cryogenic'
+            return 'high_pressure'
+
+        # Rule 2: Near thermal limit → upgrade
+        if current_temp > self.THERMAL_LIMIT:
+            if cutting_speed > 150:
+                return 'high_pressure'
+            return 'flood'
+
+        # Rule 3: High wear rate → upgrade to extend tool life
+        if current_wear_rate > self.WEAR_RATE_LIMIT:
+            if cutting_speed > 150:
+                return 'high_pressure'
+            return 'flood'
+
+        # Rule 4: High speed + deep cut → flood or high_pressure
+        if cutting_speed > 200 and depth > 3.0:
+            return 'high_pressure'
+        if cutting_speed > 100 and depth > 2.0:
+            return 'flood'
+
+        # Rule 5: Low speed + shallow cut → dry or mist (save cost)
+        if cutting_speed <= 60 and depth <= 1.0:
+            return 'dry'
+        if cutting_speed <= 100 and depth <= 1.5:
+            return 'mist'
+
+        # Default: flood for moderate conditions
+        return 'flood'
+
+    def _build_reason(
+        self,
+        recommended: str,
+        operation_type: str,
+        cutting_speed: float,
+        depth: float,
+        current_temp: float,
+        current_wear_rate: float,
+    ) -> str:
+        """Build a human-readable reason string."""
+        parts = []
+        if self.material in self.HARD_MATERIALS:
+            parts.append(f'{self.material} requires aggressive cooling')
+        if current_temp > self.THERMAL_LIMIT:
+            parts.append(f'temperature {current_temp:.0f}C exceeds limit')
+        if current_wear_rate > self.WEAR_RATE_LIMIT:
+            parts.append(f'wear rate {current_wear_rate:.4f} mm/min is high')
+        if cutting_speed > 200 and depth > 3.0:
+            parts.append('high speed + deep cut')
+        elif cutting_speed <= 60 and depth <= 1.0:
+            parts.append('low speed + shallow cut — coolant savings possible')
+        if not parts:
+            parts.append(f'{operation_type} at {cutting_speed:.0f} m/min, {depth:.1f}mm depth')
+        return f'{recommended}: ' + '; '.join(parts)
+
+
 class CuttingSimProxy:
     """Python proxy for cutting force + wear simulation.
 
@@ -310,6 +559,73 @@ class CuttingSimProxy:
     def set_coolant(self, config: 'CoolantConfig') -> None:
         """Set coolant/lubrication configuration."""
         self._coolant = config
+
+    def get_coolant_recommendation(
+        self,
+        block: 'GCodeBlock',
+        tool_state: 'ToolState',
+        material: str = '6061-T6',
+    ) -> 'CoolantRecommendation':
+        """Get a coolant recommendation for the given block and tool state.
+
+        Uses CoolantOptimizer to analyze cutting conditions and recommend
+        the optimal coolant strategy.
+
+        Args:
+            block: The G-code block describing the current cut.
+            tool_state: Current tool wear/geometry state.
+            material: Workpiece material identifier.
+
+        Returns:
+            CoolantRecommendation with the best coolant option.
+        """
+        optimizer = CoolantOptimizer(material=material)
+
+        # Derive cutting speed (m/min) from spindle RPM and tool diameter
+        cutting_speed = (math.pi * tool_state.diameter_mm * block.spindle_rpm) / 1000.0
+
+        # Estimate temperature via force calculation + thermal model
+        current_temp = 0.0
+        if block.spindle_rpm > 0 and block.feed_rate_mmpm > 0:
+            fz = block.feed_rate_mmpm / (block.spindle_rpm * tool_state.flute_count)
+            forces = self.calculate_forces(
+                spindle_rpm=block.spindle_rpm,
+                feed_per_tooth=fz,
+                axial_depth=block.axial_depth_mm,
+                radial_depth=block.radial_depth_mm,
+                tool_diameter=tool_state.diameter_mm,
+                flute_count=tool_state.flute_count,
+                helix_angle_rad=math.radians(tool_state.helix_angle_deg),
+                flank_wear_vb=tool_state.flank_wear_vb,
+            )
+            current_temp = forces['power_w'] * 0.05 * self._coolant.thermal_factor
+
+        # Estimate wear rate from tool state
+        if tool_state.cutting_time_min > 0:
+            wear_rate = tool_state.flank_wear_vb / tool_state.cutting_time_min
+        else:
+            wear_rate = 0.0
+
+        # Determine operation type from depth ratio
+        if tool_state.diameter_mm > 0:
+            depth_ratio = block.axial_depth_mm / tool_state.diameter_mm
+        else:
+            depth_ratio = 0.0
+        if depth_ratio > 0.5:
+            operation_type = 'roughing'
+        elif depth_ratio < 0.15:
+            operation_type = 'finishing'
+        else:
+            operation_type = 'general'
+
+        return optimizer.recommend_coolant(
+            operation_type=operation_type,
+            cutting_speed=cutting_speed,
+            depth=block.axial_depth_mm,
+            current_temp=current_temp,
+            current_wear_rate=wear_rate,
+            current_coolant=self._coolant.coolant_type,
+        )
 
     # ------------------------------------------------------------------
     # Calibration support

@@ -5,8 +5,32 @@ cost/benefit score, presenting operators with the top solutions
 alongside a do-nothing risk assessment.
 """
 
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Coolant hierarchy (lowest → highest capability)
+# ---------------------------------------------------------------------------
+_COOLANT_HIERARCHY = ["dry", "mist", "flood", "high_pressure", "cryogenic"]
+
+
+@dataclass
+class MachineContext:
+    """Live machine state for informed action ranking."""
+
+    machine_id: str = ""
+    current_feed_pct: float = 100.0      # current feed override %
+    current_speed_pct: float = 100.0     # current spindle override %
+    tool_rul_minutes: float = 30.0       # remaining useful life
+    tool_wear_vb_mm: float = 0.0         # current flank wear
+    spindle_load_pct: float = 50.0       # current spindle load
+    temperature_c: float = 25.0          # current cutting temperature
+    coolant_type: str = "flood"          # "dry", "flood", "mist", "high_pressure", "cryogenic"
+    program_progress_pct: float = 0.0    # 0-100
+    recent_anomaly_count: int = 0        # anomalies in last 5 minutes
+    active_overrides: list = field(default_factory=list)  # currently active overrides
 
 
 @dataclass
@@ -224,6 +248,8 @@ class ActionRanker:
         anomaly_type: str,
         severity: float,
         current_state: Optional[Dict] = None,
+        machine_context: Optional[MachineContext] = None,
+        causal_interventions: Optional[List[Dict]] = None,
     ) -> RankedActions:
         """Generate and rank candidate actions for a given anomaly.
 
@@ -235,6 +261,12 @@ class ActionRanker:
             0.0 – 1.0 severity of the detected anomaly.
         current_state : dict, optional
             ``feed_pct``, ``speed_pct``, ``rul_remaining_min`` from machine.
+        machine_context : MachineContext, optional
+            Live machine state for context-aware ranking.
+        causal_interventions : list of dict, optional
+            Forward-simulation results from causal inference engine.
+            Each dict: ``{"action_type", "predicted_force_reduction_pct",
+            "predicted_rul_extension_min", "confidence", "reasoning"}``.
 
         Returns
         -------
@@ -244,6 +276,16 @@ class ActionRanker:
             current_state = {}
 
         candidates = self._generate_candidates(anomaly_type, severity, current_state)
+
+        # Refine estimates with live machine context
+        if machine_context is not None:
+            for c in candidates:
+                self._adjust_estimates_from_context(c, machine_context)
+            candidates = self._filter_infeasible_actions(candidates, machine_context)
+
+        # Override template estimates with causal inference results
+        if causal_interventions:
+            self._incorporate_causal_results(candidates, causal_interventions)
 
         # Score and sort
         for c in candidates:
@@ -263,6 +305,205 @@ class ActionRanker:
             recommended_index=0,
             do_nothing_risk=do_nothing_risk,
         )
+
+    def rank_with_history(
+        self,
+        anomaly_type: str,
+        severity: float,
+        current_state: Optional[Dict] = None,
+        past_actions: Optional[List[Dict]] = None,
+        machine_context: Optional[MachineContext] = None,
+        causal_interventions: Optional[List[Dict]] = None,
+    ) -> RankedActions:
+        """Rank actions considering what was tried before.
+
+        Parameters
+        ----------
+        past_actions : list of dict, optional
+            History entries with ``{"action_type", "outcome", "effectiveness"}``.
+            ``outcome`` is ``"success"`` or ``"failure"``.
+            ``effectiveness`` is 0.0–1.0.
+        """
+        result = self.rank_actions(
+            anomaly_type, severity, current_state,
+            machine_context=machine_context,
+            causal_interventions=causal_interventions,
+        )
+
+        if not past_actions:
+            return result
+
+        for candidate in result.ranked_actions:
+            for past in past_actions:
+                if past.get("action_type") != candidate.action_type:
+                    continue
+                outcome = past.get("outcome", "")
+                effectiveness = past.get("effectiveness", 0.5)
+                if outcome == "failure":
+                    # Penalise: reduce score by 30-70% depending on how
+                    # ineffective it was (lower effectiveness = bigger penalty)
+                    penalty = 0.3 + 0.4 * (1.0 - effectiveness)
+                    candidate.score *= (1.0 - penalty)
+                    candidate.reasoning += (
+                        f" [Penalised: previously tried with {outcome}, "
+                        f"effectiveness={effectiveness:.0%}]"
+                    )
+                elif outcome == "success":
+                    boost = 0.1 + 0.2 * effectiveness
+                    candidate.score *= (1.0 + boost)
+                    candidate.reasoning += (
+                        f" [Boosted: previously succeeded, "
+                        f"effectiveness={effectiveness:.0%}]"
+                    )
+
+        # Re-sort after adjustments
+        result.ranked_actions.sort(key=lambda c: c.score, reverse=True)
+        return result
+
+    # ------------------------------------------------------------------
+    # Live-data adjustments
+    # ------------------------------------------------------------------
+
+    def _adjust_estimates_from_context(
+        self, candidate: ActionCandidate, context: MachineContext
+    ) -> None:
+        """Refine action estimates using real machine state.
+
+        Mutates *candidate* in place.
+
+        - If tool_rul < 10 min, boost tool_change action score
+        - If already at reduced feed, reduce further feed reduction benefit
+        - If coolant already at max, remove coolant increase option
+        - If program nearly done (>90%), prefer conservative "ride it out" actions
+        - Scale force reduction by actual spindle load (not theoretical)
+        """
+        # --- Low RUL boosts TOOL_CHANGE ---
+        if context.tool_rul_minutes < 10.0 and candidate.action_type == "TOOL_CHANGE":
+            urgency = max(0.0, 1.0 - context.tool_rul_minutes / 10.0)
+            candidate.risk_reduction = min(
+                candidate.risk_reduction + 0.2 * urgency, 1.0
+            )
+            candidate.reasoning += (
+                f" [RUL={context.tool_rul_minutes:.1f}min — tool change urgency boosted]"
+            )
+
+        # --- Already-reduced feed diminishes further feed reduction benefit ---
+        if candidate.action_type == "REDUCE_FEED" and context.current_feed_pct < 95.0:
+            # How much room is left?  Less room → less benefit.
+            room_factor = context.current_feed_pct / 100.0
+            candidate.predicted_force_reduction_pct *= room_factor
+            candidate.predicted_rul_extension_min *= room_factor
+            candidate.reasoning += (
+                f" [Feed already at {context.current_feed_pct:.0f}% — diminished benefit]"
+            )
+
+        # --- Program near completion (>90%) → favour conservative actions ---
+        if context.program_progress_pct > 90.0:
+            conservative_types = {"ACCEPT_MONITOR", "ACCEPT_DEVIATION", "REDUCE_FEED"}
+            aggressive_types = {"TOOL_CHANGE", "PAUSE", "SKIP_BLOCK"}
+            if candidate.action_type in conservative_types:
+                candidate.risk_reduction = min(candidate.risk_reduction + 0.1, 1.0)
+                candidate.reasoning += " [Program >90% — conservative approach favoured]"
+            elif candidate.action_type in aggressive_types:
+                candidate.risk_reduction = max(candidate.risk_reduction - 0.15, 0.0)
+                candidate.reasoning += " [Program >90% — aggressive action penalised]"
+
+        # --- Scale force reduction by actual spindle load ---
+        if context.spindle_load_pct > 0 and candidate.action_type in (
+            "REDUCE_FEED", "REDUCE_SPEED", "SKIP_BLOCK",
+        ):
+            load_factor = context.spindle_load_pct / 50.0  # 50% is nominal
+            candidate.predicted_force_reduction_pct *= min(load_factor, 2.0)
+
+    def _incorporate_causal_results(
+        self,
+        candidates: List[ActionCandidate],
+        causal_interventions: List[Dict],
+    ) -> None:
+        """Use causal inference forward simulation to refine action predictions.
+
+        Replace template estimates with physics-based predictions when a
+        matching causal intervention is available.
+        """
+        causal_by_type: Dict[str, Dict] = {}
+        for ci in causal_interventions:
+            atype = ci.get("action_type")
+            if atype:
+                causal_by_type[atype] = ci
+
+        for candidate in candidates:
+            ci = causal_by_type.get(candidate.action_type)
+            if ci is None:
+                continue
+
+            # Override force reduction if causal provides it
+            if "predicted_force_reduction_pct" in ci:
+                candidate.predicted_force_reduction_pct = ci[
+                    "predicted_force_reduction_pct"
+                ]
+            # Override RUL extension
+            if "predicted_rul_extension_min" in ci:
+                candidate.predicted_rul_extension_min = ci[
+                    "predicted_rul_extension_min"
+                ]
+            # Adjust confidence: blend template confidence with causal confidence
+            if "confidence" in ci:
+                causal_conf = ci["confidence"]
+                candidate.confidence = (
+                    0.3 * candidate.confidence + 0.7 * causal_conf
+                )
+            # Append causal reasoning
+            if "reasoning" in ci:
+                candidate.reasoning += f" [Causal: {ci['reasoning']}]"
+
+    def _filter_infeasible_actions(
+        self,
+        candidates: List[ActionCandidate],
+        context: MachineContext,
+    ) -> List[ActionCandidate]:
+        """Remove actions that can't be executed given current state.
+
+        - Can't increase coolant if already at max ("cryogenic")
+        - Can't reduce feed below safety minimum (20%)
+        - Can't change tool if no replacement available
+        - Can't pause if program is in critical section (indicated by
+          ``"critical_section"`` in ``active_overrides``)
+        """
+        feasible: List[ActionCandidate] = []
+        coolant_idx = _COOLANT_HIERARCHY.index(context.coolant_type) \
+            if context.coolant_type in _COOLANT_HIERARCHY else -1
+        max_coolant_idx = len(_COOLANT_HIERARCHY) - 1
+
+        for c in candidates:
+            # Coolant already at maximum
+            if c.action_type == "COOLANT_INCREASE" and coolant_idx >= max_coolant_idx:
+                continue
+
+            # Feed would go below 20% safety minimum
+            if c.action_type == "REDUCE_FEED":
+                effective_feed = (
+                    context.current_feed_pct * c.feed_override_pct / 100.0
+                )
+                if effective_feed < 20.0:
+                    continue
+
+            # Can't pause during critical section
+            if (
+                c.action_type == "PAUSE"
+                and "critical_section" in context.active_overrides
+            ):
+                continue
+
+            # Can't change tool if no replacement flagged
+            if (
+                c.action_type == "TOOL_CHANGE"
+                and "no_replacement_tool" in context.active_overrides
+            ):
+                continue
+
+            feasible.append(c)
+
+        return feasible
 
     # ------------------------------------------------------------------
     # Candidate generation

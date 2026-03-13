@@ -119,6 +119,142 @@ class MachineMetrics:
     completed_job_ids: set = field(default_factory=set)
 
 
+@dataclass
+class PredictiveQualityMetrics:
+    """Quality metrics enhanced with prediction data."""
+    current_quality_pct: float       # existing quality score
+    predicted_quality_pct: float     # predicted quality for remaining program
+    anomaly_risk_count: int          # number of predicted anomalies
+    force_exceedance_blocks: int     # blocks predicted to exceed force limit
+    thermal_risk_blocks: int         # blocks with thermal warnings
+    surface_quality_risk_blocks: int # blocks with predicted Ra > spec
+    predicted_scrap_probability: float  # 0-1 probability of producing scrap
+    quality_trend: str               # "improving", "stable", "degrading"
+    recommended_action: str          # "none", "adjust_parameters", "tool_change", "abort"
+
+
+@dataclass
+class PredictiveOEE:
+    """OEE with forward-looking adjustments."""
+    current_oee: float
+    predicted_oee: float  # what OEE will be if current trends continue
+    availability_risk: float  # risk of unplanned downtime (from tool RUL, anomaly predictions)
+    performance_risk: float  # risk of speed loss (from adaptive overrides)
+    quality_risk: float  # risk of quality loss (from predicted anomalies)
+    time_to_next_intervention_min: float  # predicted time until operator must act
+
+
+# ---------------------------------------------------------------------------
+# Predictive KPI pure functions (testable without ROS2)
+# ---------------------------------------------------------------------------
+
+def compute_predictive_quality(anomaly_markers: list,
+                               total_blocks: int,
+                               current_quality: float) -> PredictiveQualityMetrics:
+    """Compute quality prediction from anomaly markers.
+
+    Each marker is a dict with at least a 'type' key:
+      - 'force_exceedance' reduces quality by 2% per block
+      - 'thermal_warning' reduces quality by 1% per block
+      - 'surface_quality_risk' reduces quality by 3% per block
+
+    Scrap probability = 1 - predicted_quality/100 if quality < 90%, else 0.
+    Predicted quality is capped at [0, current_quality] (can only degrade).
+    """
+    force_blocks = sum(1 for m in anomaly_markers if m.get('type') == 'force_exceedance')
+    thermal_blocks = sum(1 for m in anomaly_markers if m.get('type') == 'thermal_warning')
+    surface_blocks = sum(1 for m in anomaly_markers if m.get('type') == 'surface_quality_risk')
+
+    penalty = (force_blocks * 2.0) + (thermal_blocks * 1.0) + (surface_blocks * 3.0)
+    predicted_quality = max(0.0, min(current_quality, current_quality - penalty))
+
+    scrap_prob = max(0.0, 1.0 - predicted_quality / 100.0) if predicted_quality < 90.0 else 0.0
+
+    trend = _classify_quality_trend(current_quality, predicted_quality)
+    anomaly_count = force_blocks + thermal_blocks + surface_blocks
+
+    metrics = PredictiveQualityMetrics(
+        current_quality_pct=current_quality,
+        predicted_quality_pct=predicted_quality,
+        anomaly_risk_count=anomaly_count,
+        force_exceedance_blocks=force_blocks,
+        thermal_risk_blocks=thermal_blocks,
+        surface_quality_risk_blocks=surface_blocks,
+        predicted_scrap_probability=scrap_prob,
+        quality_trend=trend,
+        recommended_action='',  # placeholder
+    )
+    metrics.recommended_action = _recommend_quality_action(metrics)
+    return metrics
+
+
+def compute_predictive_oee(current_oee: float,
+                           tool_rul_min: float,
+                           anomaly_markers: list,
+                           feed_override_pct: float) -> PredictiveOEE:
+    """Forward-looking OEE prediction.
+
+    - availability_risk increases as tool RUL approaches 0
+      (risk = 1 - min(tool_rul/60, 1.0), i.e. risk=1 when RUL=0)
+    - performance_risk increases when feed overrides are active
+      (risk = max(0, 1 - feed_override_pct/100))
+    - quality_risk from predictive quality anomaly count
+    - time_to_intervention = min(tool_rul, time_to_first_critical_anomaly)
+    """
+    # Availability risk: inversely proportional to tool remaining life
+    availability_risk = max(0.0, min(1.0, 1.0 - min(tool_rul_min / 60.0, 1.0)))
+
+    # Performance risk: how much feed is being reduced
+    performance_risk = max(0.0, min(1.0, 1.0 - feed_override_pct / 100.0))
+
+    # Quality risk: based on anomaly density
+    total_anomalies = len(anomaly_markers)
+    quality_risk = max(0.0, min(1.0, total_anomalies * 0.1))
+
+    # Predicted OEE: current OEE adjusted down by risk factors
+    risk_factor = (1.0 - availability_risk * 0.3) * (1.0 - performance_risk * 0.3) * (1.0 - quality_risk * 0.4)
+    predicted_oee = max(0.0, current_oee * risk_factor)
+
+    # Time to intervention: minimum of tool RUL and first critical anomaly time
+    critical_times = [
+        m.get('time_from_now_min', float('inf'))
+        for m in anomaly_markers
+        if m.get('severity') == 'critical'
+    ]
+    time_to_critical = min(critical_times) if critical_times else float('inf')
+    time_to_intervention = min(tool_rul_min, time_to_critical)
+
+    return PredictiveOEE(
+        current_oee=current_oee,
+        predicted_oee=predicted_oee,
+        availability_risk=availability_risk,
+        performance_risk=performance_risk,
+        quality_risk=quality_risk,
+        time_to_next_intervention_min=time_to_intervention,
+    )
+
+
+def _classify_quality_trend(current: float, predicted: float) -> str:
+    """Classify quality trend based on current vs predicted."""
+    diff = predicted - current
+    if diff > 1.0:
+        return 'improving'
+    elif diff < -1.0:
+        return 'degrading'
+    return 'stable'
+
+
+def _recommend_quality_action(metrics: PredictiveQualityMetrics) -> str:
+    """Recommend action based on quality risk level."""
+    if metrics.predicted_scrap_probability > 0.5:
+        return 'abort'
+    if metrics.predicted_scrap_probability > 0.2:
+        return 'tool_change'
+    if metrics.anomaly_risk_count > 0:
+        return 'adjust_parameters'
+    return 'none'
+
+
 class KPICalculatorNode(MiracleLifecycleNode):
     """Calculates OEE and publishes SystemKPIs for the manufacturing cell.
 

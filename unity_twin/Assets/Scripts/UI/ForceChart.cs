@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.UIElements;
 using Unity.Profiling;
@@ -9,10 +10,27 @@ using MiracleTwin.Cutting;
 namespace MiracleTwin.UI
 {
     /// <summary>
+    /// Data model for an anomaly annotation displayed on the force chart.
+    /// Each annotation marks a predicted anomaly at a specific G-code block.
+    /// </summary>
+    [System.Serializable]
+    public class AnomalyAnnotation
+    {
+        public int blockIndex;
+        public string markerType;       // "FORCE_CRITICAL", "THERMAL_WARNING", etc.
+        public float severity;          // 0-1
+        public float predictedValue;
+        public float threshold;
+        public string recommendation;
+        public float chartX;            // X position on chart (set during rendering)
+    }
+
+    /// <summary>
     /// Scrolling line chart for Fx, Fy, Fz forces over time.
     /// Uses UI Toolkit custom drawing via generateVisualContent/Painter2D
     /// for efficient rendering of color-coded force traces with grid lines,
-    /// axis labels, and a legend.
+    /// axis labels, and a legend. Supports block-level anomaly marker
+    /// annotations from the prediction engine.
     /// </summary>
     public class ForceChart : MonoBehaviour
     {
@@ -47,6 +65,11 @@ namespace MiracleTwin.UI
         private static readonly Color WarningLineColor = new(0.95f, 0.85f, 0.1f, 0.9f);
         private static readonly Color CriticalLineColor = new(1f, 0.2f, 0.15f, 0.9f);
 
+        // Anomaly annotation colors by severity
+        private static readonly Color SeverityLowColor = new(0.95f, 0.9f, 0.2f, 0.9f);       // Yellow
+        private static readonly Color SeverityMediumColor = new(1f, 0.6f, 0.15f, 0.9f);       // Orange
+        private static readonly Color SeverityHighColor = new(1f, 0.15f, 0.1f, 0.9f);         // Red
+
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
         private static readonly ProfilerMarker s_GenerateVisualContentMarker = new("ForceChart.OnGenerateVisualContent");
 #endif
@@ -63,6 +86,11 @@ namespace MiracleTwin.UI
         private int criticalExceedanceCount;
         private bool wasInWarningZone;
         private bool wasInCriticalZone;
+
+        // Anomaly annotations from prediction engine
+        private List<AnomalyAnnotation> _anomalyAnnotations = new();
+        private int _maxAnnotations = 20;
+        private bool _showAnnotations = true;
 
         void OnEnable()
         {
@@ -220,6 +248,13 @@ namespace MiracleTwin.UI
             // 3d. Track exceedance zone transitions
             TrackExceedance(samples);
 
+            // 3e. Draw anomaly annotation markers
+            if (_showAnnotations && _anomalyAnnotations.Count > 0)
+            {
+                var chartArea = new Rect(chartLeft, chartTop, chartWidth, chartHeight);
+                DrawAnomalyMarkers(painter, chartArea);
+            }
+
             // 4. Draw axis border
             painter.strokeColor = new Color(0.5f, 0.5f, 0.5f, 0.8f);
             painter.lineWidth = 1.5f;
@@ -278,6 +313,41 @@ namespace MiracleTwin.UI
             painter.LineTo(new Vector2(legendX + keySpacing * 3, legendY + keySize));
             painter.ClosePath();
             painter.Fill();
+
+            // 6. Draw anomaly annotation count badge in chart header
+            if (_showAnnotations && _anomalyAnnotations.Count > 0)
+            {
+                float badgeX = legendX + keySpacing * 4 + 10f;
+                float badgeW = 20f;
+                float badgeH = 14f;
+                float badgeY = legendY - 1f;
+                float maxSev = 0f;
+                foreach (var ann in _anomalyAnnotations)
+                    if (ann.severity > maxSev) maxSev = ann.severity;
+                Color badgeColor = GetSeverityColor(maxSev);
+                // Badge background
+                DrawRect(painter, new Color(badgeColor.r, badgeColor.g, badgeColor.b, 0.3f),
+                    badgeX, badgeY, badgeW, badgeH);
+                // Badge border
+                painter.strokeColor = badgeColor;
+                painter.lineWidth = 1f;
+                painter.BeginPath();
+                painter.MoveTo(new Vector2(badgeX, badgeY));
+                painter.LineTo(new Vector2(badgeX + badgeW, badgeY));
+                painter.LineTo(new Vector2(badgeX + badgeW, badgeY + badgeH));
+                painter.LineTo(new Vector2(badgeX, badgeY + badgeH));
+                painter.ClosePath();
+                painter.Stroke();
+                // Badge count indicator (small filled circle, since Painter2D can't render text)
+                float dotR = 3f;
+                float dotCX = badgeX + badgeW * 0.5f;
+                float dotCY = badgeY + badgeH * 0.5f;
+                painter.fillColor = badgeColor;
+                painter.BeginPath();
+                painter.Arc(new Vector2(dotCX, dotCY), dotR, 0f, 360f);
+                painter.ClosePath();
+                painter.Fill();
+            }
 
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
             }
@@ -531,6 +601,261 @@ namespace MiracleTwin.UI
         public void Clear()
         {
             forceSamples.Clear();
+        }
+
+        // ── Anomaly Annotation API ──────────────────────────────────────
+
+        /// <summary>
+        /// Add anomaly markers from prediction engine. Caps at _maxAnnotations,
+        /// keeping only the highest-severity annotations when over the limit.
+        /// </summary>
+        public void SetAnomalyAnnotations(List<AnomalyAnnotation> annotations)
+        {
+            if (annotations == null)
+            {
+                _anomalyAnnotations.Clear();
+                return;
+            }
+
+            if (annotations.Count > _maxAnnotations)
+            {
+                // Keep only the top N by severity (descending)
+                _anomalyAnnotations = annotations
+                    .OrderByDescending(a => a.severity)
+                    .Take(_maxAnnotations)
+                    .ToList();
+            }
+            else
+            {
+                _anomalyAnnotations = new List<AnomalyAnnotation>(annotations);
+            }
+        }
+
+        /// <summary>Toggle annotation visibility on the chart.</summary>
+        public void ToggleAnnotations(bool show)
+        {
+            _showAnnotations = show;
+        }
+
+        /// <summary>Current anomaly annotations (read-only access for testing).</summary>
+        public IReadOnlyList<AnomalyAnnotation> AnomalyAnnotations => _anomalyAnnotations;
+
+        /// <summary>Whether annotations are currently visible.</summary>
+        public bool ShowAnnotations => _showAnnotations;
+
+        /// <summary>Maximum number of annotations allowed.</summary>
+        public int MaxAnnotations => _maxAnnotations;
+
+        /// <summary>
+        /// Draw anomaly markers on the chart. For each annotation, draws:
+        /// - A vertical dashed line at the predicted block position
+        /// - A small marker symbol at the top of the line
+        /// - Color coded by severity (yellow/orange/red)
+        /// </summary>
+        private void DrawAnomalyMarkers(Painter2D painter, Rect chartArea)
+        {
+            if (_anomalyAnnotations == null || _anomalyAnnotations.Count == 0) return;
+
+            foreach (var annotation in _anomalyAnnotations)
+            {
+                // Map blockIndex to X position within chart area
+                float normalizedX = maxSamples > 1
+                    ? Mathf.Clamp01(annotation.blockIndex / (float)(maxSamples - 1))
+                    : 0.5f;
+                float x = chartArea.x + normalizedX * chartArea.width;
+                annotation.chartX = x;
+
+                Color markerColor = GetSeverityColor(annotation.severity);
+
+                // Draw vertical dashed line
+                painter.strokeColor = new Color(markerColor.r, markerColor.g, markerColor.b, 0.6f);
+                painter.lineWidth = 1.5f;
+                painter.lineCap = LineCap.Butt;
+
+                float dashLength = 6f;
+                float gapLength = 4f;
+                float yPos = chartArea.y;
+                while (yPos < chartArea.y + chartArea.height)
+                {
+                    float dashEnd = Mathf.Min(yPos + dashLength, chartArea.y + chartArea.height);
+                    painter.BeginPath();
+                    painter.MoveTo(new Vector2(x, yPos));
+                    painter.LineTo(new Vector2(x, dashEnd));
+                    painter.Stroke();
+                    yPos = dashEnd + gapLength;
+                }
+
+                // Draw marker symbol at top of the line
+                float symbolSize = 8f;
+                float symbolY = chartArea.y - symbolSize - 2f;
+                painter.fillColor = markerColor;
+
+                string symbol = GetMarkerSymbol(annotation.markerType);
+                switch (symbol)
+                {
+                    case "\u25B2": // ▲ FORCE - triangle pointing up
+                        painter.BeginPath();
+                        painter.MoveTo(new Vector2(x, symbolY));
+                        painter.LineTo(new Vector2(x + symbolSize * 0.5f, symbolY + symbolSize));
+                        painter.LineTo(new Vector2(x - symbolSize * 0.5f, symbolY + symbolSize));
+                        painter.ClosePath();
+                        painter.Fill();
+                        break;
+
+                    case "\u25CF": // ● THERMAL - filled circle
+                        painter.BeginPath();
+                        painter.Arc(new Vector2(x, symbolY + symbolSize * 0.5f), symbolSize * 0.4f, 0f, 360f);
+                        painter.ClosePath();
+                        painter.Fill();
+                        break;
+
+                    case "\u25C6": // ◆ WEAR - diamond
+                        float half = symbolSize * 0.5f;
+                        float cy = symbolY + half;
+                        painter.BeginPath();
+                        painter.MoveTo(new Vector2(x, cy - half));
+                        painter.LineTo(new Vector2(x + half, cy));
+                        painter.LineTo(new Vector2(x, cy + half));
+                        painter.LineTo(new Vector2(x - half, cy));
+                        painter.ClosePath();
+                        painter.Fill();
+                        break;
+
+                    case "\u2605": // ★ CHATTER - 4-pointed star approximated as rotated square
+                        float starR = symbolSize * 0.45f;
+                        float starCY = symbolY + symbolSize * 0.5f;
+                        painter.BeginPath();
+                        painter.MoveTo(new Vector2(x, starCY - starR));
+                        painter.LineTo(new Vector2(x + starR * 0.35f, starCY - starR * 0.35f));
+                        painter.LineTo(new Vector2(x + starR, starCY));
+                        painter.LineTo(new Vector2(x + starR * 0.35f, starCY + starR * 0.35f));
+                        painter.MoveTo(new Vector2(x, starCY + starR));
+                        painter.LineTo(new Vector2(x - starR * 0.35f, starCY + starR * 0.35f));
+                        painter.LineTo(new Vector2(x - starR, starCY));
+                        painter.LineTo(new Vector2(x - starR * 0.35f, starCY - starR * 0.35f));
+                        painter.ClosePath();
+                        painter.Fill();
+                        break;
+
+                    case "\u25A0": // ■ SURFACE - filled square
+                        float sqHalf = symbolSize * 0.4f;
+                        float sqCY = symbolY + symbolSize * 0.5f;
+                        DrawRect(painter, markerColor, x - sqHalf, sqCY - sqHalf, sqHalf * 2f, sqHalf * 2f);
+                        break;
+
+                    default: // ⚠ TOOL or unknown - triangle with exclamation (just triangle outline)
+                        painter.strokeColor = markerColor;
+                        painter.lineWidth = 2f;
+                        painter.BeginPath();
+                        painter.MoveTo(new Vector2(x, symbolY));
+                        painter.LineTo(new Vector2(x + symbolSize * 0.5f, symbolY + symbolSize));
+                        painter.LineTo(new Vector2(x - symbolSize * 0.5f, symbolY + symbolSize));
+                        painter.ClosePath();
+                        painter.Stroke();
+                        break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Draw annotation tooltip when hovering near a marker. Shows a
+        /// background rect with marker type, predicted value vs threshold,
+        /// and the recommended action.
+        /// </summary>
+        private void DrawAnnotationTooltip(Painter2D painter, AnomalyAnnotation annotation, Rect chartArea)
+        {
+            if (annotation == null) return;
+
+            float tooltipW = 160f;
+            float tooltipH = 48f;
+            float tooltipX = Mathf.Clamp(annotation.chartX - tooltipW * 0.5f,
+                chartArea.x, chartArea.x + chartArea.width - tooltipW);
+            float tooltipY = chartArea.y - tooltipH - 14f;
+
+            // Background rect with rounded corners (approximated as rect + border)
+            Color bgColor = new(0.12f, 0.12f, 0.18f, 0.92f);
+            DrawRect(painter, bgColor, tooltipX, tooltipY, tooltipW, tooltipH);
+
+            // Border
+            Color borderColor = GetSeverityColor(annotation.severity);
+            painter.strokeColor = new Color(borderColor.r, borderColor.g, borderColor.b, 0.7f);
+            painter.lineWidth = 1.5f;
+            painter.BeginPath();
+            painter.MoveTo(new Vector2(tooltipX, tooltipY));
+            painter.LineTo(new Vector2(tooltipX + tooltipW, tooltipY));
+            painter.LineTo(new Vector2(tooltipX + tooltipW, tooltipY + tooltipH));
+            painter.LineTo(new Vector2(tooltipX, tooltipY + tooltipH));
+            painter.ClosePath();
+            painter.Stroke();
+
+            // Severity indicator bar on the left side
+            float barW = 3f;
+            DrawRect(painter, borderColor, tooltipX, tooltipY, barW, tooltipH);
+
+            // Small colored dot to indicate the marker type (text cannot be drawn by Painter2D)
+            float dotR = 3f;
+            painter.fillColor = borderColor;
+            painter.BeginPath();
+            painter.Arc(new Vector2(tooltipX + 12f, tooltipY + 10f), dotR, 0f, 360f);
+            painter.ClosePath();
+            painter.Fill();
+
+            // Value indicator bar (predicted vs threshold)
+            float barAreaX = tooltipX + 8f;
+            float barAreaY = tooltipY + 22f;
+            float barAreaW = tooltipW - 16f;
+            float barH = 6f;
+            // Background bar (threshold)
+            DrawRect(painter, new Color(0.3f, 0.3f, 0.3f, 0.5f), barAreaX, barAreaY, barAreaW, barH);
+            // Fill bar (predicted value relative to threshold)
+            float fillRatio = annotation.threshold > 0f
+                ? Mathf.Clamp01(annotation.predictedValue / annotation.threshold)
+                : 1f;
+            DrawRect(painter, borderColor, barAreaX, barAreaY, barAreaW * fillRatio, barH);
+
+            // Recommendation indicator (small colored rectangle)
+            if (!string.IsNullOrEmpty(annotation.recommendation))
+            {
+                float recY = tooltipY + 34f;
+                DrawRect(painter, new Color(0.5f, 0.7f, 1f, 0.4f), barAreaX, recY, barAreaW, 8f);
+            }
+        }
+
+        /// <summary>
+        /// Get the marker symbol for each anomaly type.
+        /// FORCE -> triangle, THERMAL -> circle, WEAR -> diamond,
+        /// CHATTER -> star, SURFACE -> square, TOOL -> warning triangle.
+        /// </summary>
+        public static string GetMarkerSymbol(string markerType)
+        {
+            if (string.IsNullOrEmpty(markerType)) return "\u26A0"; // ⚠
+
+            // Extract the primary category from marker types like "FORCE_CRITICAL"
+            string upper = markerType.ToUpperInvariant();
+
+            if (upper.StartsWith("FORCE"))   return "\u25B2"; // ▲
+            if (upper.StartsWith("THERMAL")) return "\u25CF"; // ●
+            if (upper.StartsWith("WEAR"))    return "\u25C6"; // ◆
+            if (upper.StartsWith("CHATTER")) return "\u2605"; // ★
+            if (upper.StartsWith("SURFACE")) return "\u25A0"; // ■
+            if (upper.StartsWith("TOOL"))    return "\u26A0"; // ⚠
+
+            return "\u26A0"; // ⚠ default
+        }
+
+        /// <summary>
+        /// Get color for severity level.
+        /// Less than 0.5 -> yellow (warning), >= 0.5 -> orange, >= 0.8 -> red (critical).
+        /// </summary>
+        public static Color GetSeverityColor(float severity)
+        {
+            severity = Mathf.Clamp01(severity);
+
+            if (severity >= 0.8f)
+                return SeverityHighColor;    // Red
+            if (severity >= 0.5f)
+                return SeverityMediumColor;  // Orange
+            return SeverityLowColor;         // Yellow
         }
     }
 }

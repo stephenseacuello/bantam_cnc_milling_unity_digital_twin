@@ -938,3 +938,100 @@
     background-color: rgba(59, 130, 246, 0.5);
     color: rgb(200, 220, 255);
 }
+
+/* ── Force Chart Anomaly Annotations ─────────────────────────── */
+
+.anomaly-marker {
+    position: absolute;
+    width: 2px;
+    border-left-width: 1px;
+    border-left-color: rgba(255, 200, 50, 0.6);
+    /* Dashed line effect via repeating gradient */
+    background-image: none;
+    background-color: transparent;
+}
+
+.anomaly-marker-warning {
+    border-left-color: rgba(240, 210, 40, 0.7);
+}
+
+.anomaly-marker-critical {
+    border-left-color: rgba(255, 60, 40, 0.8);
+}
+
+.anomaly-tooltip {
+    position: absolute;
+    padding: 6px 10px;
+    background-color: rgba(18, 18, 28, 0.94);
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: rgba(255, 200, 50, 0.5);
+    min-width: 160px;
+    max-width: 220px;
+}
+
+.anomaly-tooltip-title {
+    font-size: 11px;
+    color: rgb(220, 225, 235);
+    -unity-font-style: bold;
+    margin-bottom: 3px;
+}
+
+.anomaly-tooltip-detail {
+    font-size: 10px;
+    color: rgba(200, 210, 225, 0.75);
+    white-space: normal;
+    margin-bottom: 2px;
+}
+
+.anomaly-tooltip-action {
+    font-size: 10px;
+    color: rgb(100, 200, 150);
+    -unity-font-style: italic;
+    white-space: normal;
+}
+
+.anomaly-badge {
+    flex-direction: row;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 8px;
+    border-width: 1px;
+    min-width: 20px;
+    -unity-text-align: middle-center;
+}
+
+.anomaly-badge-count {
+    font-size: 10px;
+    -unity-font-style: bold;
+}
+
+.anomaly-badge-warning {
+    background-color: rgba(240, 210, 40, 0.2);
+    border-color: rgba(240, 210, 40, 0.5);
+}
+
+.anomaly-badge-warning .anomaly-badge-count {
+    color: rgb(240, 210, 40);
+}
+
+.anomaly-badge-critical {
+    background-color: rgba(255, 60, 40, 0.25);
+    border-color: rgba(255, 60, 40, 0.6);
+}
+
+.anomaly-badge-critical .anomaly-badge-count {
+    color: rgb(255, 100, 100);
+}
+
+.severity-low {
+    color: rgb(240, 210, 40);
+}
+
+.severity-medium {
+    color: rgb(255, 150, 40);
+}
+
+.severity-high {
+    color: rgb(255, 60, 40);
+}

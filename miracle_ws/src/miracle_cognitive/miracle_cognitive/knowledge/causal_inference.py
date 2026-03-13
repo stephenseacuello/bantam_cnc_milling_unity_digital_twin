@@ -33,6 +33,25 @@ class CausalLink:
     stale: bool = False
 
 
+@dataclass
+class InterventionResult:
+    """Result of simulating a causal intervention."""
+    intervention: str          # what was changed, e.g. "feed_rate"
+    intervention_value: float  # new value or change percentage
+    affected_effects: dict     # {effect_name: predicted_change_pct}
+    confidence: float          # 0-1
+    reasoning: str             # human-readable explanation
+    side_effects: list         # unintended consequences
+
+
+@dataclass
+class CausalPath:
+    """A causal path from cause to effect with strength."""
+    nodes: list    # [cause, intermediate1, ..., effect]
+    strength: float  # product of link strengths along path
+    decay_factor: float  # temporal decay applied
+
+
 class CausalInferenceNode(MiracleLifecycleNode):
     """Causal analysis for manufacturing root cause determination.
 
@@ -48,7 +67,7 @@ class CausalInferenceNode(MiracleLifecycleNode):
         self._anomaly_subs = []
         self._inference_pub = None
         self._analysis_timer = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._decay_half_life_sec: float = 3600.0
 
     def _do_configure(self) -> TransitionCallbackReturn:
@@ -258,6 +277,233 @@ class CausalInferenceNode(MiracleLifecycleNode):
                             candidates.append((link.cause, eff))
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates
+
+    # ------------------------------------------------------------------
+    # Physics transfer functions
+    # ------------------------------------------------------------------
+
+    # Maps (cause, effect) -> exponent/multiplier for physics-based transfer.
+    # The transfer function is: effect_change_pct = input_change_pct * multiplier
+    PHYSICS_TRANSFER_MAP: Dict[Tuple[str, str], float] = {
+        ('feed_rate', 'cutting_force'): 0.8,       # F ∝ f^0.8
+        ('feed_rate', 'surface_roughness'): 2.0,    # Ra ∝ f²
+        ('feed_rate', 'tool_life'): -2.0,           # Taylor inverse: life ∝ 1/f²
+        ('feed_rate', 'cycle_time'): -1.0,          # inversely proportional
+        ('spindle_speed', 'temperature'): 0.5,      # T ∝ V^0.5
+        ('spindle_speed', 'surface_finish'): -0.3,  # higher speed → better finish
+        ('depth_of_cut', 'cutting_force'): 1.0,     # linear
+        ('depth_of_cut', 'tool_life'): -0.15,       # Taylor exponent
+        ('coolant_flow', 'temperature'): -0.6,      # cooling effect
+        ('tool_wear', 'surface_roughness'): 0.5,    # worn tool → rougher
+        ('tool_wear', 'cutting_force'): 0.3,        # edge buildup
+    }
+
+    def _get_physics_transfer_function(self, cause: str, effect: str):
+        """Get the physics-based transfer function for a causal link.
+
+        Returns a function f(change_pct) -> effect_change_pct.
+        Falls back to link strength as a linear multiplier if no physics
+        model is available.
+        """
+        multiplier = self.PHYSICS_TRANSFER_MAP.get((cause, effect))
+        if multiplier is not None:
+            return lambda change_pct: change_pct * multiplier
+
+        # Fallback: use causal graph link strength as linear multiplier
+        with self._lock:
+            if cause in self._causal_graph:
+                for link in self._causal_graph[cause]:
+                    if link.effect == effect:
+                        s = link.strength
+                        return lambda change_pct, _s=s: change_pct * _s
+        return None
+
+    # ------------------------------------------------------------------
+    # Forward causal simulation
+    # ------------------------------------------------------------------
+
+    def simulate_intervention(self, intervention: str, change_pct: float) -> List:
+        """Forward simulate: 'what if I reduce feed_rate by 20%?'
+
+        Traces all causal paths forward from the intervention node.
+        Returns list of InterventionResult for each affected effect.
+
+        Physics-informed rules:
+        - feed_rate → force: F ∝ feed^0.8, so -20% feed → -16.4% force
+        - feed_rate → surface_roughness: Ra ∝ feed^2, so -20% feed → -36% Ra
+        - feed_rate → tool_wear: Taylor life ∝ 1/feed^2, so -20% feed → +56% life
+        - spindle_speed → chatter: depends on stability lobe position
+        - spindle_speed → temperature: T ∝ speed^0.5
+        - depth_of_cut → force: F ∝ depth (linear)
+        - coolant → temperature: proportional to coolant factor
+        """
+        propagated = self._forward_propagate(intervention, change_pct)
+        if not propagated:
+            return []
+
+        results = []
+        now = time.time()
+        for effect_name, effect_change in propagated.items():
+            # Find all paths to compute confidence
+            paths = self.find_all_causal_paths(intervention, effect_name)
+            if paths:
+                best_path = max(paths, key=lambda p: p.strength)
+                confidence = best_path.strength * best_path.decay_factor
+                # Confidence decreases with path length
+                confidence *= math.pow(0.9, len(best_path.nodes) - 2)
+            else:
+                confidence = 0.5  # direct physics link, no graph path
+
+            # Determine side effects (effects the user likely didn't intend)
+            side_effects = []
+            for other_effect, other_change in propagated.items():
+                if other_effect != effect_name:
+                    direction = "increase" if other_change > 0 else "decrease"
+                    side_effects.append(
+                        f"{other_effect} will {direction} by {abs(other_change):.1f}%"
+                    )
+
+            direction = "increase" if effect_change > 0 else "decrease"
+            reasoning = (
+                f"Changing {intervention} by {change_pct:+.1f}% is predicted to "
+                f"{direction} {effect_name} by {abs(effect_change):.1f}% "
+                f"(confidence: {confidence:.2f})"
+            )
+
+            results.append(InterventionResult(
+                intervention=intervention,
+                intervention_value=change_pct,
+                affected_effects={effect_name: effect_change},
+                confidence=min(1.0, max(0.0, confidence)),
+                reasoning=reasoning,
+                side_effects=side_effects,
+            ))
+
+        return results
+
+    def find_all_causal_paths(self, source: str, target: str,
+                              max_depth: int = 5) -> List[CausalPath]:
+        """Find all causal paths from source to target (forward BFS)."""
+        now = time.time()
+        all_paths: List[CausalPath] = []
+
+        # BFS with path tracking: queue contains (current_node, path_so_far, strength_product)
+        queue = [(source, [source], 1.0)]
+
+        while queue:
+            current, path, strength_prod = queue.pop(0)
+            if len(path) > max_depth + 1:
+                continue
+
+            with self._lock:
+                links = self._causal_graph.get(current, [])
+                for link in links:
+                    if link.effect in path:
+                        continue  # avoid cycles
+                    new_path = path + [link.effect]
+                    eff_strength = self._effective_strength(link, now)
+                    new_strength = strength_prod * (eff_strength if eff_strength > 0 else link.strength)
+                    decay = self.compute_decay_factor(
+                        now - link.last_evidence_time if link.last_evidence_time > 0 else 0,
+                        link.decay_half_life_sec,
+                    )
+
+                    if link.effect == target:
+                        all_paths.append(CausalPath(
+                            nodes=new_path,
+                            strength=new_strength,
+                            decay_factor=decay,
+                        ))
+                    else:
+                        queue.append((link.effect, new_path, new_strength))
+
+        return all_paths
+
+    def get_intervention_points(self, target_effect: str) -> List[Tuple[str, float, float]]:
+        """Find all possible interventions that could affect the target.
+
+        Returns list of (intervention_name, estimated_impact, confidence)
+        sorted by impact magnitude.
+        """
+        interventions: Dict[str, Tuple[float, float]] = {}
+        now = time.time()
+
+        # Check physics transfer map for direct causes
+        for (cause, effect), multiplier in self.PHYSICS_TRANSFER_MAP.items():
+            if effect == target_effect:
+                # A 10% change in cause produces multiplier*10% change in effect
+                impact = abs(multiplier * 10.0)
+                confidence = 0.9  # physics-based → high confidence
+                if cause not in interventions or impact > interventions[cause][0]:
+                    interventions[cause] = (impact, confidence)
+
+        # Check causal graph for indirect causes
+        with self._lock:
+            for cause_name in self._causal_graph:
+                paths = self.find_all_causal_paths(cause_name, target_effect)
+                for path in paths:
+                    impact = path.strength * 10.0  # normalized to 10% input
+                    conf = path.strength * path.decay_factor * math.pow(0.9, len(path.nodes) - 2)
+                    if cause_name not in interventions or impact > interventions[cause_name][0]:
+                        interventions[cause_name] = (impact, min(1.0, conf))
+
+        result = [
+            (name, impact, conf)
+            for name, (impact, conf) in interventions.items()
+        ]
+        result.sort(key=lambda x: x[1], reverse=True)
+        return result
+
+    def _forward_propagate(self, node: str, change_pct: float,
+                           visited: Optional[set] = None) -> Dict[str, float]:
+        """Recursively propagate a change forward through the causal graph.
+
+        Returns {effect_name: predicted_change_pct} for all reachable effects.
+        """
+        if visited is None:
+            visited = {node}
+
+        effects: Dict[str, float] = {}
+
+        # Check physics transfer map for direct effects
+        for (cause, effect), _mult in self.PHYSICS_TRANSFER_MAP.items():
+            if cause == node and effect not in visited:
+                tf = self._get_physics_transfer_function(cause, effect)
+                if tf is not None:
+                    propagated_change = tf(change_pct)
+                    effects[effect] = propagated_change
+                    # Recurse
+                    visited.add(effect)
+                    downstream = self._forward_propagate(effect, propagated_change, visited)
+                    for k, v in downstream.items():
+                        if k not in effects:
+                            effects[k] = v
+                        else:
+                            # Take the larger magnitude effect
+                            if abs(v) > abs(effects[k]):
+                                effects[k] = v
+
+        # Also check causal graph links not in physics map
+        with self._lock:
+            links = self._causal_graph.get(node, [])
+            for link in links:
+                if link.effect not in visited and link.effect not in effects:
+                    tf = self._get_physics_transfer_function(node, link.effect)
+                    if tf is not None:
+                        propagated_change = tf(change_pct)
+                    else:
+                        propagated_change = change_pct * link.strength
+                    effects[link.effect] = propagated_change
+                    visited.add(link.effect)
+                    downstream = self._forward_propagate(link.effect, propagated_change, visited)
+                    for k, v in downstream.items():
+                        if k not in effects:
+                            effects[k] = v
+                        else:
+                            if abs(v) > abs(effects[k]):
+                                effects[k] = v
+
+        return effects
 
     # ------------------------------------------------------------------
     # Callbacks

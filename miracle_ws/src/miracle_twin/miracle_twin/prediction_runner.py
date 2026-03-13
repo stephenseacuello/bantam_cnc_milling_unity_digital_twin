@@ -112,6 +112,10 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         self._validator: Optional[Any] = None
         self._block_telemetry = BlockTelemetryTracker()
         self._telemetry_block_counter: int = 0
+        self._auto_calibration_enabled: bool = True
+        self._calibration_cooldown_blocks: int = 100
+        self._blocks_since_last_calibration: int = 0
+        self._cutting_sim_proxy: Optional[CuttingSimProxy] = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure prediction runner."""
@@ -200,11 +204,12 @@ class PredictionRunnerNode(MiracleLifecycleNode):
         """
         self._block_telemetry.record(block_index, gcode_line, predicted, actual)
         self._telemetry_block_counter += 1
+        self._blocks_since_last_calibration += 1
         if self._telemetry_block_counter % 50 == 0:
             self._check_drift()
 
     def _check_drift(self) -> None:
-        """Log a warning if the model is drifting."""
+        """Log a warning if the model is drifting and auto-calibrate if enabled."""
         report = self._block_telemetry.get_drift_report(window=50)
         if report.is_drifting:
             self.get_logger().warning(
@@ -219,6 +224,49 @@ class PredictionRunnerNode(MiracleLifecycleNode):
                     "Recalibration suggested: drift persisting for >50 "
                     "consecutive checks"
                 )
+
+        # Auto-calibration integration
+        if not self._auto_calibration_enabled:
+            return
+        if self._blocks_since_last_calibration < self._calibration_cooldown_blocks:
+            return
+
+        trigger = self._block_telemetry.check_calibration_needed()
+        if not trigger.triggered:
+            return
+
+        proxy = self._cutting_sim_proxy
+        if proxy is None:
+            return
+
+        # Get suggested adjustments and apply corrections
+        adjustments = trigger.suggested_adjustments or {}
+        force_corr = adjustments.get('force_scale', trigger.force_correction)
+        temp_corr = adjustments.get('temp_scale', trigger.temp_correction)
+        power_corr = adjustments.get('power_scale', trigger.power_correction)
+
+        if abs(force_corr - 1.0) > 1e-6:
+            proxy.scale_force_coefficients(force_corr)
+        if abs(power_corr - 1.0) > 1e-6:
+            proxy.scale_edge_coefficients(power_corr)
+        if abs(temp_corr - 1.0) > 1e-6:
+            proxy.scale_thermal_factor(temp_corr)
+
+        # Mark calibration performed and reset counters
+        self._block_telemetry.mark_calibrated()
+        self._blocks_since_last_calibration = 0
+
+        self.get_logger().info(
+            "Auto-calibration applied: reason=%s, drift_mag=%.4f, "
+            "force=%.4f, temp=%.4f, power=%.4f, confidence=%.3f, blocks=%d",
+            trigger.reason,
+            trigger.drift_magnitude,
+            force_corr,
+            temp_corr,
+            power_corr,
+            trigger.confidence,
+            trigger.blocks_analyzed,
+        )
 
     def set_validator(self, validator: Any) -> None:
         """Attach a PredictionValidatorNode for prediction-vs-actual tracking.

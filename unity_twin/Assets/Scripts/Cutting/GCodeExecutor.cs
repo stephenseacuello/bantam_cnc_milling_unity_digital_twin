@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using MiracleTwin.CNC;
 using MiracleTwin.Core;
+using MiracleTwin.UI;
 
 namespace MiracleTwin.Cutting
 {
@@ -34,6 +35,9 @@ namespace MiracleTwin.Cutting
         [SerializeField] private bool requireSignedGCode = false;
         [Tooltip("Public key PEM for signature verification (TextAsset).")]
         [SerializeField] private TextAsset signaturePublicKey;
+
+        [Header("Chart Integration")]
+        [SerializeField] private ForceChart forceChart;
 
         [Header("Lookahead")]
         [SerializeField] private GCodeLookahead lookahead;
@@ -282,6 +286,9 @@ namespace MiracleTwin.Cutting
                     var results = lookahead.RunLookahead(segments, currentSegmentIndex);
                     OnLookaheadUpdated?.Invoke(results);
 
+                    // Forward anomaly annotations to the force chart
+                    UpdateForceChartAnnotations(results);
+
                     // Log and react to collision detections by severity
                     bool shouldPauseForCollision = false;
                     foreach (var r in results)
@@ -394,6 +401,91 @@ namespace MiracleTwin.Cutting
                 center.y + radius * Mathf.Sin(angle),
                 z
             );
+        }
+
+        /// <summary>
+        /// Forward anomaly markers from lookahead/prediction results to the force chart.
+        /// Converts LookaheadResult entries that exceed thresholds into AnomalyAnnotation
+        /// instances and pushes them to the ForceChart for visual overlay.
+        /// </summary>
+        public void UpdateForceChartAnnotations(IReadOnlyList<LookaheadResult> results)
+        {
+            if (forceChart == null || results == null) return;
+
+            var annotations = new List<AnomalyAnnotation>();
+
+            foreach (var r in results)
+            {
+                // Force critical/warning
+                if (r.peakForceN >= 180f)
+                {
+                    annotations.Add(new AnomalyAnnotation
+                    {
+                        blockIndex = r.segmentIndex,
+                        markerType = "FORCE_CRITICAL",
+                        severity = Mathf.Clamp01(r.peakForceN / 250f),
+                        predictedValue = r.peakForceN,
+                        threshold = 180f,
+                        recommendation = $"Reduce feed rate by {Mathf.RoundToInt((r.peakForceN - 180f) / 180f * 100f)}%"
+                    });
+                }
+                else if (r.peakForceN >= 150f)
+                {
+                    annotations.Add(new AnomalyAnnotation
+                    {
+                        blockIndex = r.segmentIndex,
+                        markerType = "FORCE_WARNING",
+                        severity = Mathf.Clamp01(r.peakForceN / 250f),
+                        predictedValue = r.peakForceN,
+                        threshold = 150f,
+                        recommendation = "Monitor force levels closely"
+                    });
+                }
+
+                // Chatter risk
+                if (r.chatterRiskScore >= 0.7f)
+                {
+                    annotations.Add(new AnomalyAnnotation
+                    {
+                        blockIndex = r.segmentIndex,
+                        markerType = "CHATTER_HIGH",
+                        severity = r.chatterRiskScore,
+                        predictedValue = r.chatterRiskScore,
+                        threshold = 0.7f,
+                        recommendation = "Adjust spindle speed to avoid resonance"
+                    });
+                }
+
+                // Collision
+                if (r.collisionFlag)
+                {
+                    annotations.Add(new AnomalyAnnotation
+                    {
+                        blockIndex = r.segmentIndex,
+                        markerType = "TOOL_COLLISION",
+                        severity = 1.0f,
+                        predictedValue = 1.0f,
+                        threshold = 0.0f,
+                        recommendation = "Verify toolpath clearance at this block"
+                    });
+                }
+
+                // Wear contribution
+                if (r.cumulativeWearMM >= 0.25f)
+                {
+                    annotations.Add(new AnomalyAnnotation
+                    {
+                        blockIndex = r.segmentIndex,
+                        markerType = "WEAR_CRITICAL",
+                        severity = Mathf.Clamp01(r.cumulativeWearMM / 0.30f),
+                        predictedValue = r.cumulativeWearMM,
+                        threshold = 0.30f,
+                        recommendation = "Schedule tool change before VB_max exceeded"
+                    });
+                }
+            }
+
+            forceChart.SetAnomalyAnnotations(annotations);
         }
 
         private void CompleteExecution()

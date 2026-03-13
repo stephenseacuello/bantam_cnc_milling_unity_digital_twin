@@ -237,6 +237,33 @@ class SurfaceRoughnessModel:
         return round(max(0.1, Ra_total), 3)  # minimum 0.1 um (polished)
 
 
+@dataclass
+class BlockOptimization:
+    """Optimization suggestion for a specific block."""
+    block_index: int = 0
+    original_feed: float = 0.0
+    optimized_feed: float = 0.0
+    original_speed: float = 0.0
+    optimized_speed: float = 0.0
+    reason: str = ''  # e.g. "force_headroom", "chatter_avoidance", "wear_reduction"
+    force_change_pct: float = 0.0
+    time_change_pct: float = 0.0
+
+
+@dataclass
+class ProgramOptimizationResult:
+    """Result of optimizing a complete G-code program."""
+    original_cycle_time_min: float = 0.0
+    optimized_cycle_time_min: float = 0.0
+    time_savings_pct: float = 0.0
+    original_max_force_n: float = 0.0
+    optimized_max_force_n: float = 0.0
+    original_tool_life_min: float = 0.0
+    optimized_tool_life_min: float = 0.0
+    optimization_actions: list = field(default_factory=list)  # list of BlockOptimization
+    risk_assessment: str = 'low'  # "low", "medium", "high"
+
+
 class CuttingSimProxy:
     """Python proxy for cutting force + wear simulation.
 
@@ -1142,4 +1169,290 @@ class CuttingSimProxy:
             'wear_rate': wear,  # mm accumulated through this block
             'chatter_risk_score': chatter,
             'surface_ra_um': surface_ra,
+        }
+
+    # ------------------------------------------------------------------
+    # Program-level optimization
+    # ------------------------------------------------------------------
+
+    def optimize_program(
+        self,
+        blocks: List[GCodeBlock],
+        tool_state: Optional[ToolState] = None,
+        constraints: Optional[Dict] = None,
+    ) -> 'ProgramOptimizationResult':
+        """Analyze a full program and suggest per-block optimizations.
+
+        Strategy:
+        1. Simulate program at current parameters
+        2. For blocks with force < 60% of threshold: increase feed (more aggressive)
+        3. For blocks with force > 85% of threshold: decrease feed (safer)
+        4. For blocks near chatter boundary: shift RPM to stable pocket
+        5. For blocks with high wear rate: reduce feed to extend tool life
+        6. Re-simulate with optimized parameters to verify
+
+        Args:
+            blocks: List of GCodeBlock to optimize.
+            tool_state: Current tool state.
+            constraints: Dict with optional keys:
+                - max_feed_increase_pct: max allowed feed increase (default 30%)
+                - max_force_pct: maximum force as % of threshold (default 80%)
+                - min_tool_life_min: minimum acceptable RUL (default 30)
+                - preserve_surface_quality: bool (default True)
+                - force_threshold_n: force threshold in N (default 180.0)
+                - temp_threshold_c: temperature threshold in C (default 200.0)
+
+        Returns:
+            ProgramOptimizationResult with per-block suggestions.
+        """
+        if not blocks:
+            return ProgramOptimizationResult()
+
+        constraints = constraints or {}
+        max_feed_inc_pct = constraints.get('max_feed_increase_pct', 30.0)
+        max_force_pct = constraints.get('max_force_pct', 80.0)
+        force_threshold = constraints.get('force_threshold_n', 180.0)
+        temp_threshold = constraints.get('temp_threshold_c', 200.0)
+
+        # Step 1: simulate at original parameters
+        original_result = self.simulate_program(blocks, tool_state=tool_state)
+        original_cycle_time = self._estimate_cycle_time(blocks)
+
+        # Compute original peak force & tool life
+        original_max_force = max(
+            (bp.peak_force_n for bp in original_result.block_predictions), default=0.0
+        )
+        tool = tool_state or ToolState()
+        v_mpm = math.pi * tool.diameter_mm * (blocks[0].spindle_rpm or 8000) / 1000.0
+        fz = blocks[0].feed_rate_mmpm / (blocks[0].spindle_rpm * tool.flute_count) if blocks[0].spindle_rpm > 0 else 0.05
+        original_tool_life = self.taylor_life_prediction(v_mpm, fz, blocks[0].axial_depth_mm)
+
+        # Step 2-5: per-block optimization
+        optimization_actions: List[BlockOptimization] = []
+        optimized_blocks = []
+
+        for i, block in enumerate(blocks):
+            if block.feed_rate_mmpm <= 0 or block.spindle_rpm <= 0:
+                optimized_blocks.append(block)
+                continue
+
+            pred = original_result.block_predictions[i] if i < len(original_result.block_predictions) else BlockPrediction()
+            force_ratio = pred.peak_force_n / force_threshold if force_threshold > 0 else 0.0
+            chatter = self._chatter_risk_score(block.spindle_rpm)
+
+            opt_feed = block.feed_rate_mmpm
+            opt_speed = block.spindle_rpm
+            reason = ''
+
+            if force_ratio < 0.60:
+                # Strategy 2: headroom available, increase feed
+                opt_feed = self._compute_optimal_feed(block, pred, constraints)
+                reason = 'force_headroom'
+            elif force_ratio > 0.85:
+                # Strategy 3: too aggressive, decrease feed
+                target_force = force_threshold * (max_force_pct / 100.0)
+                opt_feed = self._compute_optimal_feed(
+                    block, pred, {**constraints, '_target_force': target_force}
+                )
+                reason = 'force_reduction'
+
+            # Strategy 4: chatter avoidance
+            if chatter >= 0.5:
+                fn = 250.0
+                # Find nearest stable pocket: RPM = 60 * fn / (k + 0.5)
+                best_rpm = opt_speed
+                best_risk = chatter
+                for k in range(1, 10):
+                    stable_rpm = 60.0 * fn / (k + 0.5)
+                    risk = self._chatter_risk_score(stable_rpm)
+                    if risk < best_risk and abs(stable_rpm - block.spindle_rpm) / block.spindle_rpm < 0.2:
+                        best_rpm = stable_rpm
+                        best_risk = risk
+                if best_rpm != opt_speed:
+                    opt_speed = best_rpm
+                    reason = 'chatter_avoidance' if not reason else reason
+
+            # Strategy 5: high wear rate → reduce feed
+            if pred.wear_after_block_mm > 0.20:
+                wear_reduction = 0.85
+                opt_feed = min(opt_feed, block.feed_rate_mmpm * wear_reduction)
+                reason = 'wear_reduction' if not reason else reason
+
+            # Clamp feed increase
+            max_allowed_feed = block.feed_rate_mmpm * (1.0 + max_feed_inc_pct / 100.0)
+            opt_feed = min(opt_feed, max_allowed_feed)
+            # Never reduce below 50% of original
+            opt_feed = max(opt_feed, block.feed_rate_mmpm * 0.5)
+
+            if abs(opt_feed - block.feed_rate_mmpm) > 0.01 or abs(opt_speed - block.spindle_rpm) > 0.01:
+                force_change = 0.0
+                if pred.peak_force_n > 0:
+                    # Approximate force change: F ∝ feed^0.8
+                    force_change = ((opt_feed / block.feed_rate_mmpm) ** 0.8 - 1.0) * 100.0
+
+                time_change = 0.0
+                if opt_feed > 0 and block.feed_rate_mmpm > 0:
+                    time_change = (block.feed_rate_mmpm / opt_feed - 1.0) * 100.0
+
+                optimization_actions.append(BlockOptimization(
+                    block_index=i,
+                    original_feed=block.feed_rate_mmpm,
+                    optimized_feed=opt_feed,
+                    original_speed=block.spindle_rpm,
+                    optimized_speed=opt_speed,
+                    reason=reason,
+                    force_change_pct=round(force_change, 2),
+                    time_change_pct=round(time_change, 2),
+                ))
+
+                # Build optimized block copy
+                new_block = GCodeBlock(
+                    feed_rate_mmpm=opt_feed,
+                    spindle_rpm=opt_speed,
+                    axial_depth_mm=block.axial_depth_mm,
+                    radial_depth_mm=block.radial_depth_mm,
+                    length_mm=block.length_mm,
+                )
+                optimized_blocks.append(new_block)
+            else:
+                optimized_blocks.append(block)
+
+        # Step 6: re-simulate optimized program
+        optimized_result = self.simulate_program(optimized_blocks, tool_state=tool_state)
+        optimized_cycle_time = self._estimate_cycle_time(optimized_blocks)
+        optimized_max_force = max(
+            (bp.peak_force_n for bp in optimized_result.block_predictions), default=0.0
+        )
+
+        # Optimized tool life
+        if optimized_blocks and optimized_blocks[0].spindle_rpm > 0:
+            v_opt = math.pi * tool.diameter_mm * optimized_blocks[0].spindle_rpm / 1000.0
+            fz_opt = optimized_blocks[0].feed_rate_mmpm / (optimized_blocks[0].spindle_rpm * tool.flute_count)
+            optimized_tool_life = self.taylor_life_prediction(v_opt, fz_opt, optimized_blocks[0].axial_depth_mm)
+        else:
+            optimized_tool_life = original_tool_life
+
+        # Time savings
+        time_savings_pct = 0.0
+        if original_cycle_time > 0:
+            time_savings_pct = (original_cycle_time - optimized_cycle_time) / original_cycle_time * 100.0
+
+        # Risk assessment
+        if optimized_max_force > force_threshold * 0.85:
+            risk = 'high'
+        elif optimized_max_force > force_threshold * 0.70 or len(optimization_actions) > len(blocks) * 0.5:
+            risk = 'medium'
+        else:
+            risk = 'low'
+
+        return ProgramOptimizationResult(
+            original_cycle_time_min=original_cycle_time,
+            optimized_cycle_time_min=optimized_cycle_time,
+            time_savings_pct=round(time_savings_pct, 2),
+            original_max_force_n=original_max_force,
+            optimized_max_force_n=optimized_max_force,
+            original_tool_life_min=original_tool_life,
+            optimized_tool_life_min=optimized_tool_life,
+            optimization_actions=optimization_actions,
+            risk_assessment=risk,
+        )
+
+    def _compute_optimal_feed(
+        self,
+        block: GCodeBlock,
+        sim_result: 'BlockPrediction',
+        constraints: Dict,
+    ) -> float:
+        """Compute optimal feed rate for a single block.
+
+        Using: F proportional to feed^0.8, so for target force F_target:
+        feed_optimal = feed_current * (F_target / F_current) ^ (1/0.8)
+        Clamped by constraints.
+        """
+        force_threshold = constraints.get('force_threshold_n', 180.0)
+        max_force_pct = constraints.get('max_force_pct', 80.0)
+        target_force = constraints.get('_target_force', force_threshold * (max_force_pct / 100.0))
+
+        current_force = sim_result.peak_force_n
+        current_feed = block.feed_rate_mmpm
+
+        if current_force <= 0 or current_feed <= 0:
+            return current_feed
+
+        # F ∝ feed^0.8 → feed_opt = feed_cur * (F_target / F_current)^(1/0.8)
+        ratio = target_force / current_force
+        exponent = 1.0 / 0.8  # = 1.25
+        feed_optimal = current_feed * (ratio ** exponent)
+
+        return max(0.0, feed_optimal)
+
+    def _estimate_cycle_time(self, blocks: List[GCodeBlock]) -> float:
+        """Estimate total cycle time from block feed rates and distances.
+
+        Returns time in minutes.
+        """
+        total_time = 0.0
+        for block in blocks:
+            if block.feed_rate_mmpm > 0 and block.length_mm > 0:
+                total_time += block.length_mm / block.feed_rate_mmpm
+        return total_time
+
+    def get_program_statistics(
+        self,
+        blocks: List[GCodeBlock],
+        sim_result: 'SimulationResult',
+    ) -> Dict:
+        """Get overall program statistics.
+
+        Args:
+            blocks: The G-code blocks that were simulated.
+            sim_result: The SimulationResult from simulate_program().
+
+        Returns:
+            Dict with program-level statistics.
+        """
+        total_blocks = len(blocks)
+        cutting_blocks = sum(1 for b in blocks if b.feed_rate_mmpm > 0 and b.spindle_rpm > 0)
+        rapid_blocks = total_blocks - cutting_blocks
+
+        total_distance = sum(b.length_mm for b in blocks)
+        estimated_cycle_time = self._estimate_cycle_time(blocks)
+
+        predictions = sim_result.block_predictions
+        peak_force = max((p.peak_force_n for p in predictions), default=0.0)
+        avg_force = (
+            sum(p.avg_force_n for p in predictions) / len(predictions)
+            if predictions else 0.0
+        )
+        total_wear = sim_result.final_wear_mm
+
+        # Thermal hotspots: blocks where temperature > threshold
+        temp_threshold = 200.0  # degrees C
+        thermal_hotspots = [
+            i for i, p in enumerate(predictions)
+            if p.temperature_rise_c > temp_threshold
+        ]
+
+        # Chatter risk blocks
+        chatter_risk_blocks = [
+            i for i, b in enumerate(blocks)
+            if self._chatter_risk_score(b.spindle_rpm) >= 0.5
+        ]
+
+        # Force utilization: avg force / threshold
+        force_threshold = 180.0
+        force_utilization = (avg_force / force_threshold * 100.0) if force_threshold > 0 else 0.0
+
+        return {
+            'total_blocks': total_blocks,
+            'cutting_blocks': cutting_blocks,
+            'rapid_blocks': rapid_blocks,
+            'total_distance_mm': total_distance,
+            'estimated_cycle_time_min': estimated_cycle_time,
+            'peak_force_n': peak_force,
+            'avg_force_n': avg_force,
+            'total_wear_mm': total_wear,
+            'thermal_hotspots': thermal_hotspots,
+            'chatter_risk_blocks': chatter_risk_blocks,
+            'force_utilization_pct': round(force_utilization, 2),
         }

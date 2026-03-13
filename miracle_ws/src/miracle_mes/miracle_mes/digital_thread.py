@@ -52,6 +52,12 @@ class DigitalThreadNode(MiracleLifecycleNode):
     ENTRY_JOB_FAILED = 'JOB_FAILED'
     ENTRY_MACHINE_ERROR = 'MACHINE_ERROR'
 
+    # Prediction and calibration entry types
+    PREDICTION_RECORDED = 'PREDICTION_RECORDED'
+    PREDICTION_COMPARED = 'PREDICTION_COMPARED'
+    CALIBRATION_APPLIED = 'CALIBRATION_APPLIED'
+    CALIBRATION_REVERTED = 'CALIBRATION_REVERTED'
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(
             'digital_thread',
@@ -473,6 +479,201 @@ class DigitalThreadNode(MiracleLifecycleNode):
                 if e.get('batch_id') == batch_id or
                    e.get('material_batch') == batch_id
             ]
+
+    # ------------------------------------------------------------------
+    # Prediction accuracy tracking
+    # ------------------------------------------------------------------
+
+    def record_prediction(
+        self,
+        machine_id: str,
+        program_name: str,
+        block_index: int,
+        predicted_force: float,
+        predicted_temp: float,
+        predicted_wear: float,
+        predicted_rul_min: float,
+        anomaly_markers: Optional[List[str]] = None,
+    ) -> None:
+        """Record a prediction for later comparison with actuals."""
+        entry = {
+            'entry_type': self.PREDICTION_RECORDED,
+            'machine_id': machine_id,
+            'program_name': program_name,
+            'block_index': block_index,
+            'predicted_force': predicted_force,
+            'predicted_temp': predicted_temp,
+            'predicted_wear': predicted_wear,
+            'predicted_rul_min': predicted_rul_min,
+            'anomaly_markers': anomaly_markers or [],
+            'timestamp': time.time(),
+        }
+        self._record_entry(entry)
+
+    def record_prediction_comparison(
+        self,
+        machine_id: str,
+        program_name: str,
+        block_index: int,
+        predicted_force: float,
+        actual_force: float,
+        predicted_temp: float,
+        actual_temp: float,
+        force_error_pct: float,
+        temp_error_pct: float,
+    ) -> None:
+        """Record comparison of prediction vs actual for traceability."""
+        entry = {
+            'entry_type': self.PREDICTION_COMPARED,
+            'machine_id': machine_id,
+            'program_name': program_name,
+            'block_index': block_index,
+            'predicted_force': predicted_force,
+            'actual_force': actual_force,
+            'predicted_temp': predicted_temp,
+            'actual_temp': actual_temp,
+            'force_error_pct': force_error_pct,
+            'temp_error_pct': temp_error_pct,
+            'timestamp': time.time(),
+        }
+        self._record_entry(entry)
+
+    def record_calibration_event(
+        self,
+        machine_id: str,
+        tool_id: str,
+        calibration_type: str,
+        adjustments: dict,
+        reason: str,
+        blocks_analyzed: int,
+    ) -> None:
+        """Log a calibration event in the digital thread."""
+        entry = {
+            'entry_type': self.CALIBRATION_APPLIED,
+            'machine_id': machine_id,
+            'tool_id': tool_id,
+            'calibration_type': calibration_type,
+            'adjustments': adjustments,
+            'reason': reason,
+            'blocks_analyzed': blocks_analyzed,
+            'timestamp': time.time(),
+        }
+        self._record_entry(entry)
+
+    def get_prediction_accuracy_history(
+        self,
+        machine_id: Optional[str] = None,
+        program_name: Optional[str] = None,
+        last_n: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Query prediction comparison history for trend analysis."""
+        with self._thread_lock:
+            results = [
+                e for e in self._entries
+                if e.get('entry_type') == self.PREDICTION_COMPARED
+            ]
+            if machine_id is not None:
+                results = [e for e in results if e.get('machine_id') == machine_id]
+            if program_name is not None:
+                results = [e for e in results if e.get('program_name') == program_name]
+            results.sort(key=lambda e: e.get('timestamp', 0))
+            return results[-last_n:]
+
+    def get_calibration_history(
+        self,
+        machine_id: Optional[str] = None,
+        tool_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query calibration events for audit trail."""
+        with self._thread_lock:
+            results = [
+                e for e in self._entries
+                if e.get('entry_type') == self.CALIBRATION_APPLIED
+            ]
+            if machine_id is not None:
+                results = [e for e in results if e.get('machine_id') == machine_id]
+            if tool_id is not None:
+                results = [e for e in results if e.get('tool_id') == tool_id]
+            results.sort(key=lambda e: e.get('timestamp', 0))
+            return results
+
+    def compute_model_accuracy_summary(self, machine_id: str) -> dict:
+        """Compute overall model accuracy metrics from comparison history.
+
+        Returns:
+            {
+                'total_comparisons': int,
+                'mean_force_error_pct': float,
+                'mean_temp_error_pct': float,
+                'force_r_squared': float,
+                'calibrations_applied': int,
+                'accuracy_trend': str,  # "improving", "stable", "degrading"
+            }
+        """
+        comparisons = self.get_prediction_accuracy_history(machine_id=machine_id, last_n=10000)
+        calibrations = self.get_calibration_history(machine_id=machine_id)
+
+        if not comparisons:
+            return {
+                'total_comparisons': 0,
+                'mean_force_error_pct': 0.0,
+                'mean_temp_error_pct': 0.0,
+                'force_r_squared': 0.0,
+                'calibrations_applied': len(calibrations),
+                'accuracy_trend': 'stable',
+            }
+
+        force_errors = [abs(c['force_error_pct']) for c in comparisons]
+        temp_errors = [abs(c['temp_error_pct']) for c in comparisons]
+        mean_force_err = sum(force_errors) / len(force_errors)
+        mean_temp_err = sum(temp_errors) / len(temp_errors)
+
+        # Compute R-squared for force predictions
+        predicted = [c['predicted_force'] for c in comparisons]
+        actual = [c['actual_force'] for c in comparisons]
+        force_r_sq = self._compute_r_squared(predicted, actual)
+
+        # Determine accuracy trend from recent vs older comparisons
+        accuracy_trend = self._classify_accuracy_trend(force_errors)
+
+        return {
+            'total_comparisons': len(comparisons),
+            'mean_force_error_pct': round(mean_force_err, 4),
+            'mean_temp_error_pct': round(mean_temp_err, 4),
+            'force_r_squared': round(force_r_sq, 4),
+            'calibrations_applied': len(calibrations),
+            'accuracy_trend': accuracy_trend,
+        }
+
+    @staticmethod
+    def _compute_r_squared(predicted: List[float], actual: List[float]) -> float:
+        """Compute R-squared (coefficient of determination)."""
+        n = len(actual)
+        if n < 2:
+            return 0.0
+        mean_actual = sum(actual) / n
+        ss_tot = sum((a - mean_actual) ** 2 for a in actual)
+        if ss_tot == 0:
+            return 1.0 if all(p == a for p, a in zip(predicted, actual)) else 0.0
+        ss_res = sum((a - p) ** 2 for a, p in zip(actual, predicted))
+        return max(0.0, 1.0 - ss_res / ss_tot)
+
+    @staticmethod
+    def _classify_accuracy_trend(errors: List[float]) -> str:
+        """Classify accuracy trend as improving, stable, or degrading."""
+        if len(errors) < 6:
+            return 'stable'
+        mid = len(errors) // 2
+        first_half_mean = sum(errors[:mid]) / mid
+        second_half_mean = sum(errors[mid:]) / (len(errors) - mid)
+        if first_half_mean == 0:
+            return 'stable' if second_half_mean == 0 else 'degrading'
+        ratio = second_half_mean / first_half_mean
+        if ratio < 0.85:
+            return 'improving'
+        elif ratio > 1.15:
+            return 'degrading'
+        return 'stable'
 
     def verify_chain_integrity(self) -> bool:
         """Verify the integrity of the digital thread chain.

@@ -575,6 +575,7 @@ namespace MiracleTwin.UI
             if (currentAlert == null)
             {
                 ApplyAnalyticalFallback(feedOverridePct, spindleOverridePct);
+                RequestCausalPreview(feedOverridePct, spindleOverridePct);
                 return;
             }
 
@@ -600,6 +601,9 @@ namespace MiracleTwin.UI
             {
                 ApplyAnalyticalFallback(feedOverridePct, spindleOverridePct);
             }
+
+            // Always request causal trajectory preview alongside the prediction
+            RequestCausalPreview(feedOverridePct, spindleOverridePct);
         }
 
         // --- Improved Analytical Fallback Model ---
@@ -1208,6 +1212,508 @@ namespace MiracleTwin.UI
             label.AddToClassList(isHeader ? "comparison-cell-header" : "comparison-cell");
             label.style.width = new StyleLength(new Length(25f, LengthUnit.Percent));
             return label;
+        }
+
+        // ========================================================================
+        // Causal Trajectory Preview — Forward Simulation Visualization
+        // ========================================================================
+
+        /// <summary>
+        /// A single point on a causal trajectory, capturing predicted metrics
+        /// at a specific G-code block index.
+        /// </summary>
+        [Serializable]
+        public class CausalTrajectoryPoint
+        {
+            public int blockIndex;
+            public float forceN;
+            public float temperatureC;
+            public float wearMM;
+            public float surfaceRaUM;
+            public float toolLifeMin;
+        }
+
+        /// <summary>
+        /// Result of a forward causal simulation comparing baseline and modified
+        /// trajectories for a specific intervention.
+        /// </summary>
+        [Serializable]
+        public class CausalPreviewResult
+        {
+            public string interventionType;   // "REDUCE_FEED", "REDUCE_SPEED", etc.
+            public float interventionValue;    // e.g. -20 for 20% reduction
+            public List<CausalTrajectoryPoint> baselineTrajectory;
+            public List<CausalTrajectoryPoint> modifiedTrajectory;
+            public float forceChangePct;
+            public float toolLifeChangePct;
+            public float cycleTimeChangePct;
+            public float surfaceQualityChangePct;
+            public string reasoning;           // human-readable causal explanation
+            public float confidence;
+            public List<string> sideEffects;
+        }
+
+        // Causal preview UI state
+        private VisualElement causalPreviewContainer;
+        private VisualElement trajectoryChartContainer;
+        private VisualElement impactSummaryContainer;
+        private VisualElement confidenceBarContainer;
+        private string selectedMetric = "Force";
+        private CausalPreviewResult currentCausalPreview;
+        private bool causalPreviewPending;
+
+        /// <summary>
+        /// Display causal trajectory comparison in the decision support panel.
+        /// Called when the forward causal simulation returns a preview result.
+        /// </summary>
+        public void ShowCausalPreview(CausalPreviewResult preview)
+        {
+            if (panelRoot == null || preview == null) return;
+
+            currentCausalPreview = preview;
+
+            // Create the causal preview container if it doesn't exist
+            EnsureCausalPreviewUIExists();
+
+            if (causalPreviewContainer == null) return;
+
+            // Clear previous content
+            causalPreviewContainer.Clear();
+
+            // Section header
+            var header = new Label("Causal Trajectory Preview");
+            header.AddToClassList("decision-section-title");
+            causalPreviewContainer.Add(header);
+
+            // Intervention label
+            var interventionLabel = new Label(
+                $"Intervention: {preview.interventionType} ({preview.interventionValue:+0;-0;0}%)");
+            interventionLabel.AddToClassList("causal-intervention-label");
+            causalPreviewContainer.Add(interventionLabel);
+
+            // Trajectory comparison chart
+            var chart = BuildTrajectoryComparisonChart(preview);
+            causalPreviewContainer.Add(chart);
+
+            // Impact summary cards
+            var summary = BuildCausalImpactSummary(preview);
+            causalPreviewContainer.Add(summary);
+
+            // Confidence indicator
+            var confidence = BuildConfidenceIndicator(preview.confidence);
+            causalPreviewContainer.Add(confidence);
+
+            causalPreviewContainer.style.display = DisplayStyle.Flex;
+        }
+
+        /// <summary>
+        /// Ensure the causal preview container exists in the panel hierarchy.
+        /// </summary>
+        private void EnsureCausalPreviewUIExists()
+        {
+            if (causalPreviewContainer != null) return;
+
+            causalPreviewContainer = new VisualElement { name = "causal-preview-container" };
+            causalPreviewContainer.AddToClassList("causal-preview-container");
+            causalPreviewContainer.style.display = DisplayStyle.None;
+
+            // Insert before ranked actions or feedback, after impact preview
+            if (rankedActionsContainer != null)
+            {
+                int idx = panelRoot.IndexOf(rankedActionsContainer);
+                if (idx >= 0)
+                    panelRoot.Insert(idx, causalPreviewContainer);
+                else
+                    panelRoot.Add(causalPreviewContainer);
+            }
+            else if (feedbackContainer != null)
+            {
+                int idx = panelRoot.IndexOf(feedbackContainer);
+                if (idx >= 0)
+                    panelRoot.Insert(idx, causalPreviewContainer);
+                else
+                    panelRoot.Add(causalPreviewContainer);
+            }
+            else
+            {
+                panelRoot.Add(causalPreviewContainer);
+            }
+        }
+
+        /// <summary>
+        /// Build the trajectory comparison chart with metric selector and two overlaid traces.
+        /// Baseline is gray dashed, modified is colored solid. Green/red shading marks
+        /// blocks where modification improves/worsens the selected metric.
+        /// </summary>
+        private VisualElement BuildTrajectoryComparisonChart(CausalPreviewResult preview)
+        {
+            var container = new VisualElement();
+            container.AddToClassList("trajectory-chart");
+
+            // Metric selector row
+            var selectorRow = new VisualElement();
+            selectorRow.style.flexDirection = FlexDirection.Row;
+            selectorRow.AddToClassList("trajectory-metric-selector");
+
+            string[] metrics = { "Force", "Temperature", "Wear", "Surface Roughness" };
+            foreach (string metric in metrics)
+            {
+                string m = metric;  // capture for closure
+                var btn = new Button(() => OnTrajectoryMetricSelected(m, preview))
+                {
+                    text = metric
+                };
+                btn.AddToClassList("trajectory-metric-btn");
+                if (metric == selectedMetric)
+                    btn.AddToClassList("trajectory-metric-btn-active");
+                selectorRow.Add(btn);
+            }
+            container.Add(selectorRow);
+
+            // Chart area
+            trajectoryChartContainer = new VisualElement { name = "trajectory-chart-area" };
+            trajectoryChartContainer.AddToClassList("trajectory-chart-area");
+            container.Add(trajectoryChartContainer);
+
+            // Populate chart with selected metric
+            PopulateTrajectoryChart(preview, selectedMetric);
+
+            // Legend
+            var legend = new VisualElement();
+            legend.style.flexDirection = FlexDirection.Row;
+            legend.AddToClassList("trajectory-legend");
+
+            var baselineLegend = new Label("--- Baseline");
+            baselineLegend.AddToClassList("trajectory-baseline");
+            legend.Add(baselineLegend);
+
+            var modifiedLegend = new Label("--- Modified");
+            modifiedLegend.AddToClassList("trajectory-modified");
+            legend.Add(modifiedLegend);
+
+            container.Add(legend);
+
+            return container;
+        }
+
+        /// <summary>
+        /// Called when operator selects a different metric in the trajectory chart.
+        /// </summary>
+        private void OnTrajectoryMetricSelected(string metric, CausalPreviewResult preview)
+        {
+            selectedMetric = metric;
+            // Rebuild the chart with new metric
+            if (currentCausalPreview != null)
+                ShowCausalPreview(currentCausalPreview);
+        }
+
+        /// <summary>
+        /// Populate the trajectory chart area with block-by-block comparison bars.
+        /// Uses vertical bars to represent baseline (gray) and modified (colored) values.
+        /// Green shading where modified improves; red where it worsens.
+        /// </summary>
+        private void PopulateTrajectoryChart(CausalPreviewResult preview, string metric)
+        {
+            if (trajectoryChartContainer == null) return;
+            trajectoryChartContainer.Clear();
+
+            var baseline = preview.baselineTrajectory;
+            var modified = preview.modifiedTrajectory;
+
+            if (baseline == null || modified == null || baseline.Count == 0) return;
+
+            int count = Math.Min(baseline.Count, modified.Count);
+
+            // Find max value for Y-axis scaling
+            float maxVal = 0.001f;
+            for (int i = 0; i < count; i++)
+            {
+                float bVal = GetMetricValue(baseline[i], metric);
+                float mVal = GetMetricValue(modified[i], metric);
+                maxVal = Math.Max(maxVal, Math.Max(bVal, mVal));
+            }
+
+            // X-axis label
+            var xLabel = new Label("Block Index ->");
+            xLabel.AddToClassList("trajectory-axis-label");
+            trajectoryChartContainer.Add(xLabel);
+
+            // Bar chart row
+            var chartRow = new VisualElement();
+            chartRow.style.flexDirection = FlexDirection.Row;
+            chartRow.AddToClassList("trajectory-bar-row");
+
+            for (int i = 0; i < count; i++)
+            {
+                float bVal = GetMetricValue(baseline[i], metric);
+                float mVal = GetMetricValue(modified[i], metric);
+
+                var blockGroup = new VisualElement();
+                blockGroup.AddToClassList("trajectory-block-group");
+
+                // Determine if modification is an improvement
+                // For Force, Temperature, Wear, Surface Roughness: lower is better
+                bool isImprovement = mVal < bVal;
+                blockGroup.AddToClassList(isImprovement ? "impact-positive" : "impact-negative");
+
+                // Baseline bar
+                var bBar = new VisualElement();
+                bBar.AddToClassList("trajectory-baseline-bar");
+                float bPct = (bVal / maxVal) * 100f;
+                bBar.style.height = new StyleLength(new Length(bPct, LengthUnit.Percent));
+                blockGroup.Add(bBar);
+
+                // Modified bar
+                var mBar = new VisualElement();
+                mBar.AddToClassList("trajectory-modified-bar");
+                float mPct = (mVal / maxVal) * 100f;
+                mBar.style.height = new StyleLength(new Length(mPct, LengthUnit.Percent));
+                blockGroup.Add(mBar);
+
+                chartRow.Add(blockGroup);
+            }
+
+            trajectoryChartContainer.Add(chartRow);
+        }
+
+        /// <summary>Extract a named metric value from a trajectory point.</summary>
+        internal static float GetMetricValue(CausalTrajectoryPoint point, string metric)
+        {
+            if (point == null) return 0f;
+            return metric switch
+            {
+                "Force" => point.forceN,
+                "Temperature" => point.temperatureC,
+                "Wear" => point.wearMM,
+                "Surface Roughness" => point.surfaceRaUM,
+                _ => point.forceN
+            };
+        }
+
+        /// <summary>
+        /// Build the impact summary cards showing force, tool life, cycle time,
+        /// and surface quality changes with direction arrows and color coding.
+        /// </summary>
+        private VisualElement BuildCausalImpactSummary(CausalPreviewResult preview)
+        {
+            var container = new VisualElement();
+            container.AddToClassList("causal-impact-summary");
+
+            // Cards row
+            var cardsRow = new VisualElement();
+            cardsRow.style.flexDirection = FlexDirection.Row;
+            cardsRow.style.flexWrap = Wrap.Wrap;
+            cardsRow.AddToClassList("impact-cards-row");
+
+            cardsRow.Add(BuildImpactCard("Force", preview.forceChangePct, lowerIsBetter: true));
+            cardsRow.Add(BuildImpactCard("Tool Life", preview.toolLifeChangePct, lowerIsBetter: false));
+            cardsRow.Add(BuildImpactCard("Cycle Time", preview.cycleTimeChangePct, lowerIsBetter: true));
+            cardsRow.Add(BuildImpactCard("Surface Quality", preview.surfaceQualityChangePct, lowerIsBetter: true));
+
+            container.Add(cardsRow);
+
+            // Reasoning text
+            if (!string.IsNullOrEmpty(preview.reasoning))
+            {
+                var reasoningLabel = new Label(preview.reasoning);
+                reasoningLabel.AddToClassList("causal-reasoning-text");
+                container.Add(reasoningLabel);
+            }
+
+            // Side effects
+            if (preview.sideEffects != null && preview.sideEffects.Count > 0)
+            {
+                var sideEffectsHeader = new Label("Side Effects:");
+                sideEffectsHeader.AddToClassList("causal-side-effects-header");
+                container.Add(sideEffectsHeader);
+
+                foreach (string sideEffect in preview.sideEffects)
+                {
+                    var effectLabel = new Label($"\u26a0 {sideEffect}");
+                    effectLabel.AddToClassList("side-effect-warning");
+                    container.Add(effectLabel);
+                }
+            }
+
+            return container;
+        }
+
+        /// <summary>Build a single impact card with metric name, change %, arrow, and color.</summary>
+        private static VisualElement BuildImpactCard(string metricName, float changePct, bool lowerIsBetter)
+        {
+            var card = new VisualElement();
+            card.AddToClassList("impact-card");
+
+            // Determine direction and whether it's positive or negative
+            bool isPositive = lowerIsBetter ? (changePct < 0f) : (changePct > 0f);
+            card.AddToClassList(isPositive ? "impact-positive" : "impact-negative");
+
+            // Metric name
+            var nameLabel = new Label(metricName);
+            nameLabel.AddToClassList("impact-card-name");
+            card.Add(nameLabel);
+
+            // Change value with arrow
+            string arrow = changePct > 0f ? "\u2191" : changePct < 0f ? "\u2193" : "\u2192";
+            var valueLabel = new Label($"{arrow} {changePct:+0.0;-0.0;0.0}%");
+            valueLabel.AddToClassList("impact-card-value");
+            card.Add(valueLabel);
+
+            return card;
+        }
+
+        /// <summary>
+        /// Build a horizontal confidence indicator bar with label and color coding.
+        /// Green > 0.7, Yellow 0.4-0.7, Red below 0.4.
+        /// </summary>
+        private VisualElement BuildConfidenceIndicator(float confidence)
+        {
+            var container = new VisualElement();
+            container.AddToClassList("confidence-container");
+
+            // Label
+            string level = confidence > 0.7f ? "High" : confidence >= 0.4f ? "Medium" : "Low";
+            var label = new Label($"Confidence: {level} ({confidence:P0})");
+            label.AddToClassList("confidence-label");
+            container.Add(label);
+
+            // Bar track
+            var barTrack = new VisualElement();
+            barTrack.AddToClassList("confidence-bar");
+
+            var barFill = new VisualElement();
+            barFill.AddToClassList("confidence-bar-fill");
+            barFill.style.width = new StyleLength(new Length(confidence * 100f, LengthUnit.Percent));
+
+            // Color coding
+            if (confidence > 0.7f)
+                barFill.style.backgroundColor = new Color(0.2f, 0.85f, 0.4f);
+            else if (confidence >= 0.4f)
+                barFill.style.backgroundColor = new Color(0.9f, 0.75f, 0.15f);
+            else
+                barFill.style.backgroundColor = new Color(0.9f, 0.25f, 0.2f);
+
+            barTrack.Add(barFill);
+            container.Add(barTrack);
+
+            return container;
+        }
+
+        /// <summary>
+        /// Request a causal preview from MiracleBridge when what-if sliders change.
+        /// Called after the debounced prediction request.
+        /// </summary>
+        private void RequestCausalPreview(float feedOverridePct, float spindleOverridePct)
+        {
+            if (miracleBridge == null)
+                miracleBridge = MiracleBridge.Instance;
+
+            if (miracleBridge == null) return;
+
+            // Determine intervention type based on which slider changed most
+            float feedChange = feedOverridePct - 100f;
+            float spindleChange = spindleOverridePct - 100f;
+
+            string interventionType;
+            float interventionValue;
+
+            if (Math.Abs(feedChange) >= Math.Abs(spindleChange))
+            {
+                interventionType = feedChange < 0 ? "REDUCE_FEED" : "INCREASE_FEED";
+                interventionValue = feedChange;
+            }
+            else
+            {
+                interventionType = spindleChange < 0 ? "REDUCE_SPEED" : "INCREASE_SPEED";
+                interventionValue = spindleChange;
+            }
+
+            // Generate a local causal preview using analytical models
+            // In production, this would call miracleBridge.RequestCausalPreview()
+            var preview = GenerateLocalCausalPreview(interventionType, interventionValue,
+                feedOverridePct, spindleOverridePct);
+            ShowCausalPreview(preview);
+        }
+
+        /// <summary>
+        /// Generate a local causal trajectory preview using the analytical fallback model.
+        /// Produces 10 simulated blocks of baseline vs modified trajectories.
+        /// </summary>
+        private CausalPreviewResult GenerateLocalCausalPreview(
+            string interventionType, float interventionValue,
+            float feedOverridePct, float spindleOverridePct)
+        {
+            float feedRatio = feedOverridePct / 100f;
+            float spindleRatio = spindleOverridePct / 100f;
+
+            // Force: proportional to feed^0.8
+            float forceMultiplier = Mathf.Pow(feedRatio, 0.8f);
+            // Temperature: proportional to speed^0.5
+            float tempMultiplier = Mathf.Pow(spindleRatio, 0.5f);
+            // Surface roughness: proportional to feed^2
+            float surfaceMultiplier = Mathf.Pow(feedRatio, 2f);
+            // Tool life: inversely proportional to feed^2
+            float toolLifeMultiplier = 1f / Mathf.Max(Mathf.Pow(feedRatio, 2f), 0.01f);
+
+            var baselineTrajectory = new List<CausalTrajectoryPoint>();
+            var modifiedTrajectory = new List<CausalTrajectoryPoint>();
+
+            const int numBlocks = 10;
+            for (int i = 0; i < numBlocks; i++)
+            {
+                // Simulate progressive wear over blocks
+                float wearProgression = 1f + (i * 0.05f);
+
+                baselineTrajectory.Add(new CausalTrajectoryPoint
+                {
+                    blockIndex = i,
+                    forceN = baselineForceN * wearProgression,
+                    temperatureC = 85f * wearProgression,
+                    wearMM = 0.1f * wearProgression,
+                    surfaceRaUM = baselineRa * wearProgression,
+                    toolLifeMin = baselineToolLifeMin * (1f - i * 0.08f)
+                });
+
+                modifiedTrajectory.Add(new CausalTrajectoryPoint
+                {
+                    blockIndex = i,
+                    forceN = baselineForceN * forceMultiplier * wearProgression,
+                    temperatureC = 85f * tempMultiplier * wearProgression,
+                    wearMM = 0.1f * forceMultiplier * wearProgression,
+                    surfaceRaUM = baselineRa * surfaceMultiplier * wearProgression,
+                    toolLifeMin = baselineToolLifeMin * toolLifeMultiplier * (1f - i * 0.08f)
+                });
+            }
+
+            float forceChangePct = (forceMultiplier - 1f) * 100f;
+            float toolLifeChangePct = (toolLifeMultiplier - 1f) * 100f;
+            float cycleTimeChangePct = feedRatio < 1f ? ((1f / feedRatio) - 1f) * 100f : (1f - feedRatio) * 100f;
+            float surfaceChangePct = (surfaceMultiplier - 1f) * 100f;
+
+            var sideEffects = new List<string>();
+            if (Math.Abs(cycleTimeChangePct) > 5f)
+                sideEffects.Add($"Cycle time will {(cycleTimeChangePct > 0 ? "increase" : "decrease")} by {Math.Abs(cycleTimeChangePct):F1}%");
+            if (Math.Abs(forceChangePct) > 5f && interventionType.Contains("SPEED"))
+                sideEffects.Add($"Cutting force {(forceChangePct > 0 ? "increase" : "decrease")} by {Math.Abs(forceChangePct):F1}%");
+
+            string reasoning = $"Changing {interventionType.Replace("_", " ").ToLowerInvariant()} by {interventionValue:+0;-0;0}% "
+                + $"is predicted to {(forceChangePct < 0 ? "reduce" : "increase")} cutting force by {Math.Abs(forceChangePct):F1}% "
+                + $"and {(toolLifeChangePct > 0 ? "extend" : "reduce")} tool life by {Math.Abs(toolLifeChangePct):F1}%.";
+
+            return new CausalPreviewResult
+            {
+                interventionType = interventionType,
+                interventionValue = interventionValue,
+                baselineTrajectory = baselineTrajectory,
+                modifiedTrajectory = modifiedTrajectory,
+                forceChangePct = forceChangePct,
+                toolLifeChangePct = toolLifeChangePct,
+                cycleTimeChangePct = cycleTimeChangePct,
+                surfaceQualityChangePct = surfaceChangePct,
+                reasoning = reasoning,
+                confidence = 0.65f,
+                sideEffects = sideEffects
+            };
         }
 
         /// <summary>Update the do-nothing risk indicator bar and label.</summary>

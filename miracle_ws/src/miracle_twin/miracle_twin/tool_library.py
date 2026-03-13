@@ -6,9 +6,12 @@ AdaptiveController.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+import copy
+import json
 import os
 import math
+import time
 
 
 @dataclass
@@ -77,6 +80,42 @@ class ToolDefinition:
         return math.radians(self.rake_angle_deg)
 
 
+@dataclass
+class ToolCalibrationData:
+    """Per-tool empirically measured calibration offsets."""
+    tool_id: str
+    machine_id: str
+    force_scale: float = 1.0      # multiply ktc/krc/kac by this
+    edge_scale: float = 1.0       # multiply kte/kre/kae by this
+    thermal_scale: float = 1.0    # multiply thermal coefficients
+    wear_rate_scale: float = 1.0  # multiply wear rate
+    calibration_count: int = 0    # how many calibrations applied
+    total_blocks_measured: int = 0
+    last_calibrated_timestamp: float = 0.0
+    calibration_history: list = field(default_factory=list)  # list of (timestamp, scales_dict)
+
+    def apply_calibration(self, force_corr: float, edge_corr: float = 1.0,
+                          thermal_corr: float = 1.0, wear_corr: float = 1.0,
+                          blocks: int = 0):
+        """Apply a calibration update with exponential moving average."""
+        alpha = 0.3  # learning rate
+        self.force_scale = self.force_scale * (1 - alpha) + force_corr * alpha
+        self.edge_scale = self.edge_scale * (1 - alpha) + edge_corr * alpha
+        self.thermal_scale = self.thermal_scale * (1 - alpha) + thermal_corr * alpha
+        self.wear_rate_scale = self.wear_rate_scale * (1 - alpha) + wear_corr * alpha
+        self.calibration_count += 1
+        self.total_blocks_measured += blocks
+        self.last_calibrated_timestamp = time.time()
+        self.calibration_history.append((
+            self.last_calibrated_timestamp,
+            {'force': self.force_scale, 'edge': self.edge_scale,
+             'thermal': self.thermal_scale, 'wear': self.wear_rate_scale}
+        ))
+        # Cap history
+        if len(self.calibration_history) > 50:
+            self.calibration_history = self.calibration_history[-50:]
+
+
 class ToolLibrary:
     """Central repository of cutting tool definitions.
 
@@ -86,6 +125,8 @@ class ToolLibrary:
 
     def __init__(self):
         self._tools: Dict[str, ToolDefinition] = {}
+        self._calibration_data: Dict[Tuple[str, str], ToolCalibrationData] = {}
+        self._calibration_file: str = ''
         self._load_builtin_tools()
 
     def _load_builtin_tools(self):
@@ -217,3 +258,96 @@ class ToolLibrary:
             self.register(tool)
             count += 1
         return count
+
+    # ------------------------------------------------------------------
+    # Calibration support
+    # ------------------------------------------------------------------
+
+    def get_calibrated_tool(self, tool_id: str, machine_id: str) -> Optional[ToolDefinition]:
+        """Return a ToolDefinition with calibration offsets applied."""
+        base = self.get(tool_id)
+        if base is None:
+            return None
+        cal = self._calibration_data.get((tool_id, machine_id))
+        if cal is None:
+            return base
+        # Return a copy with scaled coefficients
+        calibrated = copy.deepcopy(base)
+        calibrated.ktc *= cal.force_scale
+        calibrated.krc *= cal.force_scale
+        calibrated.kac *= cal.force_scale
+        calibrated.kte *= cal.edge_scale
+        calibrated.kre *= cal.edge_scale
+        calibrated.kae *= cal.edge_scale
+        return calibrated
+
+    def update_calibration(self, tool_id: str, machine_id: str,
+                           force_corr: float, blocks: int = 0, **kwargs):
+        """Update calibration data for a tool on a specific machine."""
+        key = (tool_id, machine_id)
+        if key not in self._calibration_data:
+            self._calibration_data[key] = ToolCalibrationData(
+                tool_id=tool_id, machine_id=machine_id)
+        self._calibration_data[key].apply_calibration(
+            force_corr, blocks=blocks, **kwargs)
+
+    def save_calibrations(self, path: str) -> None:
+        """Persist calibration data to JSON."""
+        records = []
+        for (tool_id, machine_id), cal in self._calibration_data.items():
+            records.append({
+                'tool_id': cal.tool_id,
+                'machine_id': cal.machine_id,
+                'force_scale': cal.force_scale,
+                'edge_scale': cal.edge_scale,
+                'thermal_scale': cal.thermal_scale,
+                'wear_rate_scale': cal.wear_rate_scale,
+                'calibration_count': cal.calibration_count,
+                'total_blocks_measured': cal.total_blocks_measured,
+                'last_calibrated_timestamp': cal.last_calibrated_timestamp,
+                'calibration_history': cal.calibration_history,
+            })
+        with open(path, 'w') as f:
+            json.dump({'calibrations': records}, f, indent=2)
+
+    def load_calibrations(self, path: str) -> int:
+        """Load calibration data from JSON. Returns count loaded."""
+        if not os.path.exists(path):
+            return 0
+        with open(path, 'r') as f:
+            data = json.load(f)
+        count = 0
+        for rec in data.get('calibrations', []):
+            cal = ToolCalibrationData(
+                tool_id=rec['tool_id'],
+                machine_id=rec['machine_id'],
+                force_scale=rec.get('force_scale', 1.0),
+                edge_scale=rec.get('edge_scale', 1.0),
+                thermal_scale=rec.get('thermal_scale', 1.0),
+                wear_rate_scale=rec.get('wear_rate_scale', 1.0),
+                calibration_count=rec.get('calibration_count', 0),
+                total_blocks_measured=rec.get('total_blocks_measured', 0),
+                last_calibrated_timestamp=rec.get('last_calibrated_timestamp', 0.0),
+                calibration_history=[
+                    tuple(entry) if isinstance(entry, list) else entry
+                    for entry in rec.get('calibration_history', [])
+                ],
+            )
+            self._calibration_data[(cal.tool_id, cal.machine_id)] = cal
+            count += 1
+        return count
+
+    def get_calibration_summary(self) -> dict:
+        """Return summary of all calibration data."""
+        summary = {}
+        for (tool_id, machine_id), cal in self._calibration_data.items():
+            summary[f'{tool_id}@{machine_id}'] = {
+                'force_scale': cal.force_scale,
+                'edge_scale': cal.edge_scale,
+                'thermal_scale': cal.thermal_scale,
+                'wear_rate_scale': cal.wear_rate_scale,
+                'calibration_count': cal.calibration_count,
+                'total_blocks_measured': cal.total_blocks_measured,
+                'last_calibrated_timestamp': cal.last_calibrated_timestamp,
+            }
+        return summary

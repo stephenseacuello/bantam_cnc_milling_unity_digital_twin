@@ -5,8 +5,8 @@ Performs logical reasoning over the knowledge graph.
 Supports forward chaining, backward chaining, and rule evaluation.
 """
 
-from typing import Any, Dict, List, Tuple
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 import threading
 
 from rclpy.lifecycle import TransitionCallbackReturn
@@ -31,6 +31,18 @@ _ACTION_MAPPING = {
 
 
 @dataclass
+class SimulatedAction:
+    """An action with physics-based predicted outcomes."""
+    action_type: str           # REDUCE_FEED, TOOL_CHANGE, etc.
+    parameters: dict           # e.g. {"feed_reduction_pct": 20}
+    predicted_outcomes: dict   # e.g. {"force_change_pct": -16.4, "cycle_time_change_pct": +25}
+    confidence: float          # 0-1, from causal simulation
+    side_effects: list         # unintended consequences
+    net_benefit_score: float   # weighted sum of outcomes (positive = good)
+    reasoning_chain: str       # human-readable causal chain
+
+
+@dataclass
 class Rule:
     """An inference rule."""
     name: str
@@ -47,6 +59,15 @@ class ReasoningEngineNode(MiracleLifecycleNode):
         reasoning_interval_sec (float): Periodic reasoning cycle.
     """
 
+    # Default action parameters used when simulating candidate actions.
+    _DEFAULT_ACTION_PARAMS: Dict[str, dict] = {
+        'REDUCE_FEED': {'feed_reduction_pct': 20},
+        'REDUCE_SPEED': {'speed_reduction_pct': 20},
+        'TOOL_CHANGE': {},
+        'COOLANT_INCREASE': {'coolant_increase_pct': 30},
+        'PAUSE': {},
+    }
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__('reasoning_engine', criticality=self.CRITICALITY_MEDIUM, **kwargs)
         self._rules: List[Rule] = []
@@ -57,6 +78,7 @@ class ReasoningEngineNode(MiracleLifecycleNode):
         self._inference_pub = None
         self._action_pub = None
         self._reason_timer = None
+        self._causal_engine: Optional[Any] = None
 
     def _do_configure(self) -> TransitionCallbackReturn:
         self.declare_and_validate_parameters({
@@ -181,11 +203,240 @@ class ReasoningEngineNode(MiracleLifecycleNode):
                     action_msg.predicate = p
                     action_msg.object_value = o
                     action_msg.confidence = c
-                    action_msg.reasoning = f'{action_type} triggered by ({s}, {p}, {o}) conf={c:.2f}'
+
+                    # Enrich with causal simulation when available
+                    sim_result = self._try_simulate_action(action_type)
+                    if sim_result is not None:
+                        action_msg.reasoning = (
+                            f'{action_type} triggered by ({s}, {p}, {o}) conf={c:.2f} | '
+                            f'sim: net_benefit={sim_result.net_benefit_score:.2f}, '
+                            f'{sim_result.reasoning_chain}'
+                        )
+                    else:
+                        action_msg.reasoning = f'{action_type} triggered by ({s}, {p}, {o}) conf={c:.2f}'
+
                     self._action_pub.publish(action_msg)
                     self.get_logger().info(
                         f"Published inferred action: {action_type} for {s} (confidence={c:.2f})"
                     )
+
+    # ------------------------------------------------------------------
+    # Causal simulation integration
+    # ------------------------------------------------------------------
+
+    def _get_causal_engine(self):
+        """Lazily obtain a CausalInferenceNode-compatible forward-sim engine.
+
+        Returns None if the causal inference module is unavailable.
+        """
+        if self._causal_engine is not None:
+            return self._causal_engine
+        try:
+            from miracle_cognitive.knowledge.causal_inference import CausalInferenceNode
+            engine = CausalInferenceNode.__new__(CausalInferenceNode)
+            # Initialise just the fields needed for forward simulation
+            engine._causal_graph = {}
+            engine._lock = threading.RLock()
+            engine._decay_half_life_sec = 3600.0
+            engine._init_causal_model()
+            self._causal_engine = engine
+        except Exception:
+            self._causal_engine = None
+        return self._causal_engine
+
+    def _map_action_to_intervention(self, action_type: str, parameters: dict) -> tuple:
+        """Map a reasoning engine action to a causal intervention.
+
+        Returns (intervention_variable, change_pct) suitable for
+        ``CausalInferenceNode.simulate_intervention``.
+        """
+        if action_type == 'REDUCE_FEED':
+            pct = parameters.get('feed_reduction_pct', 20)
+            return ('feed_rate', -pct)
+        elif action_type == 'REDUCE_SPEED':
+            pct = parameters.get('speed_reduction_pct', 20)
+            return ('spindle_speed', -pct)
+        elif action_type == 'TOOL_CHANGE':
+            # Fresh tool → model as resetting tool_wear to zero (~-100%)
+            return ('tool_wear', -100.0)
+        elif action_type == 'COOLANT_INCREASE':
+            pct = parameters.get('coolant_increase_pct', 30)
+            return ('coolant_flow', pct)
+        elif action_type == 'PAUSE':
+            return (None, 0.0)
+        else:
+            return (None, 0.0)
+
+    def simulate_action_outcomes(self, action_type: str, parameters: dict,
+                                  current_state: dict = None) -> SimulatedAction:
+        """Use forward causal simulation to predict action outcomes.
+
+        Maps action types to causal interventions:
+        - REDUCE_FEED  -> simulate_intervention("feed_rate", -reduction_pct)
+        - REDUCE_SPEED -> simulate_intervention("spindle_speed", -reduction_pct)
+        - TOOL_CHANGE  -> simulate fresh tool state
+        - COOLANT_INCREASE -> simulate_intervention("coolant_flow", +increase_pct)
+        - PAUSE        -> no causal effects, just time delay
+
+        Returns SimulatedAction with physics-based predictions.
+        """
+        intervention_var, change_pct = self._map_action_to_intervention(action_type, parameters)
+
+        # PAUSE or unknown: no causal effects
+        if intervention_var is None:
+            return SimulatedAction(
+                action_type=action_type,
+                parameters=parameters,
+                predicted_outcomes={},
+                confidence=1.0 if action_type == 'PAUSE' else 0.0,
+                side_effects=[],
+                net_benefit_score=0.0,
+                reasoning_chain=f'{action_type}: no causal effects modelled',
+            )
+
+        engine = self._get_causal_engine()
+        if engine is None:
+            # Causal engine unavailable – return a default simulation
+            return SimulatedAction(
+                action_type=action_type,
+                parameters=parameters,
+                predicted_outcomes={},
+                confidence=0.0,
+                side_effects=[],
+                net_benefit_score=0.0,
+                reasoning_chain=f'{action_type}: causal engine unavailable',
+            )
+
+        results = engine.simulate_intervention(intervention_var, change_pct)
+
+        # Aggregate all intervention results into a single outcomes dict
+        predicted_outcomes: Dict[str, float] = {}
+        all_side_effects: List[str] = []
+        confidences: List[float] = []
+        for r in results:
+            predicted_outcomes.update(r.affected_effects)
+            confidences.append(r.confidence)
+
+        # Build side effects: effects the user didn't directly intend
+        primary_effects = self._primary_effects_for(action_type)
+        for effect_name, change in predicted_outcomes.items():
+            if effect_name not in primary_effects:
+                direction = "increase" if change > 0 else "decrease"
+                all_side_effects.append(
+                    f'{effect_name} will {direction} by {abs(change):.1f}%'
+                )
+
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        net_benefit = self._compute_net_benefit(predicted_outcomes)
+
+        # Build reasoning chain
+        parts = []
+        for effect_name, change in predicted_outcomes.items():
+            direction = "decrease" if change < 0 else "increase"
+            parts.append(f'{effect_name} {direction} {abs(change):.1f}%')
+        reasoning = f'{action_type}({intervention_var} {change_pct:+.0f}%) -> ' + ', '.join(parts) if parts else f'{action_type}: no effects predicted'
+
+        return SimulatedAction(
+            action_type=action_type,
+            parameters=parameters,
+            predicted_outcomes=predicted_outcomes,
+            confidence=min(1.0, max(0.0, avg_confidence)),
+            side_effects=all_side_effects,
+            net_benefit_score=net_benefit,
+            reasoning_chain=reasoning,
+        )
+
+    def _compute_net_benefit(self, outcomes: dict) -> float:
+        """Weighted benefit score from predicted outcomes.
+
+        Score = 0.4 * risk_reduction + 0.3 * quality_improvement
+              - 0.2 * cycle_time_cost + 0.1 * tool_life_bonus
+
+        Convention: negative change in a harmful metric = good (positive score).
+        """
+        score = 0.0
+
+        # Risk reduction: cutting force reduction is good
+        force_change = outcomes.get('cutting_force', 0.0)
+        score += 0.4 * (-force_change / 100.0)  # -16% force -> +0.064
+
+        # Quality improvement: surface roughness reduction is good
+        roughness_change = outcomes.get('surface_roughness', 0.0)
+        score += 0.3 * (-roughness_change / 100.0)
+
+        # Cycle time cost: cycle time increase is bad
+        cycle_change = outcomes.get('cycle_time', 0.0)
+        score -= 0.2 * (cycle_change / 100.0)
+
+        # Temperature reduction is good
+        temp_change = outcomes.get('temperature', 0.0)
+        score += 0.1 * (-temp_change / 100.0)
+
+        # Tool life increase is good
+        life_change = outcomes.get('tool_life', 0.0)
+        score += 0.1 * (life_change / 100.0)
+
+        return score
+
+    def get_best_action_with_simulation(self, facts: dict) -> Optional[SimulatedAction]:
+        """Run inference to get candidate actions, then simulate each one.
+
+        Returns the action with highest net_benefit_score.
+        ``facts`` is a dict of {(subject, predicate): object_value} entries
+        to inject before reasoning.
+        """
+        # Inject facts
+        with self._lock:
+            for (subj, pred), obj in facts.items():
+                self._facts.append((subj, pred, obj))
+
+        # Run inference to find candidate actions
+        candidates: List[SimulatedAction] = []
+        with self._lock:
+            for rule in self._rules:
+                bindings = self._match_rule(rule)
+                for binding in bindings:
+                    p = self._apply_binding(rule.conclusion[1], binding)
+                    o = self._apply_binding(rule.conclusion[2], binding)
+                    action_type = _ACTION_MAPPING.get((p, o))
+                    if action_type is not None:
+                        params = dict(self._DEFAULT_ACTION_PARAMS.get(action_type, {}))
+                        sim = self.simulate_action_outcomes(action_type, params)
+                        # Scale confidence by rule confidence
+                        sim = SimulatedAction(
+                            action_type=sim.action_type,
+                            parameters=sim.parameters,
+                            predicted_outcomes=sim.predicted_outcomes,
+                            confidence=sim.confidence * rule.confidence,
+                            side_effects=sim.side_effects,
+                            net_benefit_score=sim.net_benefit_score,
+                            reasoning_chain=sim.reasoning_chain,
+                        )
+                        candidates.append(sim)
+
+        if not candidates:
+            return None
+
+        return max(candidates, key=lambda s: s.net_benefit_score)
+
+    def _try_simulate_action(self, action_type: str) -> Optional[SimulatedAction]:
+        """Attempt to simulate an action; returns None on failure."""
+        try:
+            params = dict(self._DEFAULT_ACTION_PARAMS.get(action_type, {}))
+            return self.simulate_action_outcomes(action_type, params)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _primary_effects_for(action_type: str) -> set:
+        """Return the set of effect names the user primarily intends."""
+        return {
+            'REDUCE_FEED': {'cutting_force', 'surface_roughness'},
+            'REDUCE_SPEED': {'temperature', 'surface_finish'},
+            'TOOL_CHANGE': {'surface_roughness', 'cutting_force'},
+            'COOLANT_INCREASE': {'temperature'},
+            'PAUSE': set(),
+        }.get(action_type, set())
 
     def _match_rule(self, rule: Rule) -> List[Dict[str, str]]:
         """Find variable bindings that satisfy rule conditions."""

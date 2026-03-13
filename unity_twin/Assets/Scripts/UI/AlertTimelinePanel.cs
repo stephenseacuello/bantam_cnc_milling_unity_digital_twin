@@ -8,9 +8,26 @@ using MiracleTwin.Core;
 namespace MiracleTwin.UI
 {
     /// <summary>
+    /// G-code context data attached to an alert, describing which program block
+    /// was executing when the alert fired.
+    /// </summary>
+    [System.Serializable]
+    public class AlertGCodeContext
+    {
+        public int blockIndex;
+        public string gcodeLine;       // e.g. "G01 X50.0 Y25.0 F800"
+        public string operationType;   // "LINEAR_CUT", "ARC_CUT", "DRILL", etc.
+        public float feedRate;
+        public float spindleRPM;
+        public float programProgressPct;
+        public string toolId;
+    }
+
+    /// <summary>
     /// Scrolling timeline of alerts with severity color-coding.
     /// Subscribes to AnomalyAlertEventSO, CorrelatedAlertEventSO, and SecurityAlertEventSO
     /// and displays a filterable, color-coded list of recent alerts (newest first).
+    /// Supports G-code context display and block-range filtering.
     /// </summary>
     public class AlertTimelinePanel : MonoBehaviour
     {
@@ -41,11 +58,20 @@ namespace MiracleTwin.UI
             public AlertCategory Category;
         }
 
+        /// <summary>Fired when the operator clicks "Go to Block" on a G-code context section.</summary>
+        public event System.Action<int> OnGoToBlock;
+
         /// <summary>Total number of alerts currently stored.</summary>
         public int AlertCount => alerts.Count;
 
         private readonly List<AlertEntry> alerts = new();
+        private readonly Dictionary<int, AlertGCodeContext> _alertGCodeContexts = new();
+        private readonly HashSet<int> _recurringBlocks = new();
         private AlertCategory? activeFilter;
+
+        // Block-range filter state
+        private int _filterBlockStart = -1;
+        private int _filterBlockEnd = -1;
 
         // UI elements
         private VisualElement timelinePanel;
@@ -94,6 +120,53 @@ namespace MiracleTwin.UI
         public void ClearAlerts()
         {
             alerts.Clear();
+            _alertGCodeContexts.Clear();
+            RefreshUI();
+        }
+
+        /// <summary>
+        /// Attach G-code context to an existing alert by its index in the alert list.
+        /// </summary>
+        public void SetAlertGCodeContext(int alertIndex, AlertGCodeContext context)
+        {
+            if (alertIndex < 0 || alertIndex >= alerts.Count) return;
+            if (context == null) return;
+
+            _alertGCodeContexts[alertIndex] = context;
+            RefreshUI();
+        }
+
+        /// <summary>Mark a block index as a known recurring issue block.</summary>
+        public void MarkBlockRecurring(int blockIndex)
+        {
+            _recurringBlocks.Add(blockIndex);
+        }
+
+        /// <summary>Check whether a block index is marked as recurring.</summary>
+        public bool IsBlockRecurring(int blockIndex)
+        {
+            return _recurringBlocks.Contains(blockIndex);
+        }
+
+        /// <summary>
+        /// Filter displayed alerts to only those whose G-code context block index
+        /// falls within [startBlock, endBlock] inclusive. Alerts without context are hidden.
+        /// </summary>
+        public void FilterByBlockRange(int startBlock, int endBlock)
+        {
+            if (startBlock < 0 || endBlock < 0 || endBlock < startBlock)
+                return;
+
+            _filterBlockStart = startBlock;
+            _filterBlockEnd = endBlock;
+            RefreshUI();
+        }
+
+        /// <summary>Clear any active block-range filter, showing all alerts again.</summary>
+        public void ClearBlockFilter()
+        {
+            _filterBlockStart = -1;
+            _filterBlockEnd = -1;
             RefreshUI();
         }
 
@@ -172,13 +245,27 @@ namespace MiracleTwin.UI
 
             alertScrollView.Clear();
 
-            var filtered = activeFilter.HasValue
-                ? alerts.Where(a => a.Category == activeFilter.Value)
-                : alerts;
+            bool blockFilterActive = _filterBlockStart >= 0 && _filterBlockEnd >= 0;
 
-            foreach (var alert in filtered)
+            for (int i = 0; i < alerts.Count; i++)
             {
-                alertScrollView.Add(CreateAlertCard(alert));
+                var alert = alerts[i];
+
+                // Category filter
+                if (activeFilter.HasValue && alert.Category != activeFilter.Value)
+                    continue;
+
+                // Block-range filter
+                if (blockFilterActive)
+                {
+                    if (!_alertGCodeContexts.TryGetValue(i, out var ctx))
+                        continue; // no context => hidden when block filter active
+                    if (ctx.blockIndex < _filterBlockStart || ctx.blockIndex > _filterBlockEnd)
+                        continue;
+                }
+
+                _alertGCodeContexts.TryGetValue(i, out var context);
+                alertScrollView.Add(CreateAlertCard(alert, i, context));
             }
 
             if (alertCountLabel != null)
@@ -187,7 +274,7 @@ namespace MiracleTwin.UI
 
         // ── Alert card construction ─────────────────────────────────────
 
-        private VisualElement CreateAlertCard(AlertEntry alert)
+        private VisualElement CreateAlertCard(AlertEntry alert, int alertIndex = -1, AlertGCodeContext context = null)
         {
             var card = new VisualElement();
             card.AddToClassList("alert-card");
@@ -197,6 +284,13 @@ namespace MiracleTwin.UI
             severityBar.AddToClassList("alert-severity-bar");
             severityBar.style.backgroundColor = GetSeverityColor(alert.Severity);
             card.Add(severityBar);
+
+            // Block badge next to severity bar (when context available)
+            if (context != null)
+            {
+                bool isRecurring = _recurringBlocks.Contains(context.blockIndex);
+                card.Add(CreateBlockBadge(context.blockIndex, isRecurring));
+            }
 
             // Card content
             var content = new VisualElement();
@@ -243,8 +337,89 @@ namespace MiracleTwin.UI
             });
             content.Add(badge);
 
+            // Collapsible G-code context section
+            if (context != null)
+            {
+                content.Add(CreateGCodeContextSection(context));
+            }
+
             card.Add(content);
             return card;
+        }
+
+        // ── G-code context UI helpers ────────────────────────────────────
+
+        private VisualElement CreateGCodeContextSection(AlertGCodeContext context)
+        {
+            var section = new VisualElement();
+            section.AddToClassList("gcode-context");
+
+            // Toggle button for collapse/expand
+            var toggle = new Button { text = "G-code Context \u25BC" };
+            toggle.AddToClassList("alert-filter-btn");
+            var detailContainer = new VisualElement();
+            detailContainer.style.display = DisplayStyle.None;
+
+            toggle.clicked += () =>
+            {
+                bool isHidden = detailContainer.style.display == DisplayStyle.None;
+                detailContainer.style.display = isHidden ? DisplayStyle.Flex : DisplayStyle.None;
+                toggle.text = isHidden ? "G-code Context \u25B2" : "G-code Context \u25BC";
+            };
+            section.Add(toggle);
+
+            // G-code line display
+            var gcodeLine = new Label(context.gcodeLine ?? "--");
+            gcodeLine.AddToClassList("gcode-line");
+            detailContainer.Add(gcodeLine);
+
+            // Block index
+            var blockRow = new VisualElement();
+            blockRow.AddToClassList("alert-card-detail");
+            blockRow.Add(new Label("Block:") { name = "ctx-block-label" });
+            blockRow.Add(new Label($"#{context.blockIndex}"));
+            detailContainer.Add(blockRow);
+
+            // Operation type
+            var opRow = new VisualElement();
+            opRow.AddToClassList("alert-card-detail");
+            opRow.Add(new Label("Operation:"));
+            opRow.Add(new Label(context.operationType ?? "--"));
+            detailContainer.Add(opRow);
+
+            // Feed / RPM
+            var feedRow = new VisualElement();
+            feedRow.AddToClassList("alert-card-detail");
+            feedRow.Add(new Label($"Feed: {context.feedRate:F0} mm/min"));
+            feedRow.Add(new Label($"RPM: {context.spindleRPM:F0}"));
+            detailContainer.Add(feedRow);
+
+            // Program progress
+            var progressRow = new VisualElement();
+            progressRow.AddToClassList("alert-card-detail");
+            progressRow.Add(new Label($"Progress: {context.programProgressPct:F1}%"));
+            if (!string.IsNullOrEmpty(context.toolId))
+                progressRow.Add(new Label($"Tool: {context.toolId}"));
+            detailContainer.Add(progressRow);
+
+            // "Go to Block" button
+            var goToBtn = new Button { text = $"Go to Block #{context.blockIndex}" };
+            goToBtn.AddToClassList("goto-block-btn");
+            int blockIdx = context.blockIndex;
+            goToBtn.clicked += () => OnGoToBlock?.Invoke(blockIdx);
+            detailContainer.Add(goToBtn);
+
+            section.Add(detailContainer);
+            return section;
+        }
+
+        private VisualElement CreateBlockBadge(int blockIndex, bool isRecurring)
+        {
+            var badge = new Label($"B{blockIndex}");
+            badge.AddToClassList("block-badge");
+            if (isRecurring)
+                badge.AddToClassList("block-badge-recurring");
+            return badge;
         }
 
         private static Color GetSeverityColor(float severity)

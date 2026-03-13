@@ -13,10 +13,12 @@ Quality      = Good Count / Total Count
 """
 
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+import json
 import math
 import threading
 import time
+import uuid
 
 from rclpy.lifecycle import TransitionCallbackReturn
 
@@ -884,6 +886,485 @@ def compute_real_mttr(repair_durations: List[float]) -> float:
     if not repair_durations:
         return 0.0
     return sum(repair_durations) / len(repair_durations)
+
+
+# ------------------------------------------------------------------
+# Shift Handoff Report
+# ------------------------------------------------------------------
+
+# Valid event types for ShiftEvent
+SHIFT_EVENT_TYPES = {
+    'ALARM', 'TOOL_CHANGE', 'PROGRAM_START', 'PROGRAM_END',
+    'OVERRIDE', 'ANOMALY', 'MAINTENANCE', 'CALIBRATION',
+}
+
+# Valid severity levels for ShiftEvent
+SHIFT_SEVERITY_LEVELS = {'INFO', 'WARNING', 'CRITICAL'}
+
+
+@dataclass
+class ShiftEvent:
+    """An event that occurred during a shift."""
+    timestamp: float
+    event_type: str  # ALARM, TOOL_CHANGE, PROGRAM_START, PROGRAM_END, OVERRIDE, ANOMALY, MAINTENANCE, CALIBRATION
+    machine_id: str
+    severity: str  # INFO, WARNING, CRITICAL
+    description: str
+    data: Optional[Dict] = field(default_factory=dict)
+
+
+@dataclass
+class ShiftReport:
+    """Aggregated report for a single shift, used for handoff."""
+    shift_id: str
+    shift_start: float
+    shift_end: float
+    operator_id: str
+    machine_ids: List[str]
+    oee_summary: Dict[str, Dict[str, float]]  # machine_id -> {availability, performance, quality, overall}
+    total_parts_produced: int
+    total_scrap_count: int
+    tool_changes: int
+    alarms: List[ShiftEvent]
+    anomalies: List[ShiftEvent]
+    maintenance_performed: List[ShiftEvent]
+    pending_issues: List[str]
+    recommendations: List[str]
+    highlight: str
+
+
+class ShiftReportGenerator:
+    """Generates shift handoff reports from recorded events and KPI data."""
+
+    def __init__(self) -> None:
+        self._events: List[ShiftEvent] = []
+
+    @property
+    def events(self) -> List[ShiftEvent]:
+        return list(self._events)
+
+    def record_event(self, event: ShiftEvent) -> None:
+        """Add an event to the buffer."""
+        self._events.append(event)
+
+    def generate_report(
+        self,
+        shift_start: float,
+        shift_end: float,
+        operator_id: str,
+        machine_ids: List[str],
+        machine_metrics: Optional[Dict[str, MachineMetrics]] = None,
+        oee_snapshots: Optional[List[OEESnapshot]] = None,
+        machine_oee_snapshots: Optional[Dict[str, List[OEESnapshot]]] = None,
+    ) -> ShiftReport:
+        """Generate a shift handoff report.
+
+        Args:
+            shift_start: Shift start time in seconds.
+            shift_end: Shift end time in seconds.
+            operator_id: Operator identifier.
+            machine_ids: List of machine IDs in this shift.
+            machine_metrics: Optional per-machine MachineMetrics for parts/scrap counts.
+            oee_snapshots: Optional fleet-level OEE snapshots for the shift window.
+            machine_oee_snapshots: Optional per-machine OEE snapshots.
+
+        Returns:
+            A populated ShiftReport.
+        """
+        # Filter events within time window
+        shift_events = [
+            e for e in self._events
+            if shift_start <= e.timestamp <= shift_end
+        ]
+
+        # Categorise events
+        alarms = [e for e in shift_events if e.event_type == 'ALARM']
+        anomalies = [e for e in shift_events if e.event_type == 'ANOMALY']
+        maintenance = [e for e in shift_events if e.event_type == 'MAINTENANCE']
+        tool_change_events = [e for e in shift_events if e.event_type == 'TOOL_CHANGE']
+        tool_changes = len(tool_change_events)
+
+        # OEE summary per machine
+        oee_summary: Dict[str, Dict[str, float]] = {}
+        if machine_oee_snapshots:
+            for mid in machine_ids:
+                snaps = [
+                    s for s in machine_oee_snapshots.get(mid, [])
+                    if shift_start <= s.timestamp <= shift_end
+                ]
+                if snaps:
+                    oee_summary[mid] = {
+                        'availability': sum(s.availability for s in snaps) / len(snaps),
+                        'performance': sum(s.performance for s in snaps) / len(snaps),
+                        'quality': sum(s.quality for s in snaps) / len(snaps),
+                        'overall': sum(s.oee for s in snaps) / len(snaps),
+                    }
+                else:
+                    oee_summary[mid] = {
+                        'availability': 0.0, 'performance': 0.0,
+                        'quality': 0.0, 'overall': 0.0,
+                    }
+        elif oee_snapshots:
+            # Use fleet-level snapshots if per-machine not available
+            fleet_snaps = [
+                s for s in oee_snapshots
+                if shift_start <= s.timestamp <= shift_end
+            ]
+            if fleet_snaps:
+                fleet_avg = {
+                    'availability': sum(s.availability for s in fleet_snaps) / len(fleet_snaps),
+                    'performance': sum(s.performance for s in fleet_snaps) / len(fleet_snaps),
+                    'quality': sum(s.quality for s in fleet_snaps) / len(fleet_snaps),
+                    'overall': sum(s.oee for s in fleet_snaps) / len(fleet_snaps),
+                }
+                for mid in machine_ids:
+                    oee_summary[mid] = dict(fleet_avg)
+            else:
+                for mid in machine_ids:
+                    oee_summary[mid] = {
+                        'availability': 0.0, 'performance': 0.0,
+                        'quality': 0.0, 'overall': 0.0,
+                    }
+        else:
+            for mid in machine_ids:
+                oee_summary[mid] = {
+                    'availability': 0.0, 'performance': 0.0,
+                    'quality': 0.0, 'overall': 0.0,
+                }
+
+        # Parts and scrap from machine metrics
+        total_parts = 0
+        total_scrap = 0
+        if machine_metrics:
+            for mid in machine_ids:
+                m = machine_metrics.get(mid)
+                if m:
+                    total_parts += m.total_jobs
+                    total_scrap += m.defect_jobs
+
+        # Pending issues
+        pending_issues = self._identify_pending_issues(
+            alarms, anomalies, shift_events, machine_metrics, machine_ids,
+        )
+
+        # Recommendations
+        recommendations = self._generate_recommendations(
+            shift_events, machine_metrics, machine_ids, oee_summary,
+        )
+
+        # Highlight
+        highlight = self._pick_highlight(shift_events, oee_summary, machine_ids)
+
+        shift_id = str(uuid.uuid4())
+
+        return ShiftReport(
+            shift_id=shift_id,
+            shift_start=shift_start,
+            shift_end=shift_end,
+            operator_id=operator_id,
+            machine_ids=list(machine_ids),
+            oee_summary=oee_summary,
+            total_parts_produced=total_parts,
+            total_scrap_count=total_scrap,
+            tool_changes=tool_changes,
+            alarms=alarms,
+            anomalies=anomalies,
+            maintenance_performed=maintenance,
+            pending_issues=pending_issues,
+            recommendations=recommendations,
+            highlight=highlight,
+        )
+
+    def export_report_text(self, report: ShiftReport) -> str:
+        """Export a shift report as human-readable markdown."""
+        lines = []
+        lines.append(f"# Shift Handoff Report")
+        lines.append(f"")
+        lines.append(f"**Shift ID:** {report.shift_id}")
+        lines.append(f"**Operator:** {report.operator_id}")
+        lines.append(f"**Period:** {report.shift_start:.0f} - {report.shift_end:.0f}")
+        lines.append(f"**Machines:** {', '.join(report.machine_ids)}")
+        lines.append(f"")
+        lines.append(f"## Production Summary")
+        lines.append(f"")
+        lines.append(f"- **Parts Produced:** {report.total_parts_produced}")
+        lines.append(f"- **Scrap Count:** {report.total_scrap_count}")
+        lines.append(f"- **Tool Changes:** {report.tool_changes}")
+        lines.append(f"")
+        lines.append(f"## OEE Summary")
+        lines.append(f"")
+        for mid, oee in report.oee_summary.items():
+            lines.append(
+                f"- **{mid}:** OEE={oee['overall']:.1%} "
+                f"(A={oee['availability']:.1%}, "
+                f"P={oee['performance']:.1%}, "
+                f"Q={oee['quality']:.1%})"
+            )
+        lines.append(f"")
+
+        if report.alarms:
+            lines.append(f"## Alarms ({len(report.alarms)})")
+            lines.append(f"")
+            for a in report.alarms:
+                lines.append(f"- [{a.severity}] {a.machine_id}: {a.description}")
+            lines.append(f"")
+
+        if report.anomalies:
+            lines.append(f"## Anomalies ({len(report.anomalies)})")
+            lines.append(f"")
+            for a in report.anomalies:
+                lines.append(f"- [{a.severity}] {a.machine_id}: {a.description}")
+            lines.append(f"")
+
+        if report.maintenance_performed:
+            lines.append(f"## Maintenance Performed ({len(report.maintenance_performed)})")
+            lines.append(f"")
+            for m in report.maintenance_performed:
+                lines.append(f"- {m.machine_id}: {m.description}")
+            lines.append(f"")
+
+        if report.pending_issues:
+            lines.append(f"## Pending Issues")
+            lines.append(f"")
+            for issue in report.pending_issues:
+                lines.append(f"- {issue}")
+            lines.append(f"")
+
+        if report.recommendations:
+            lines.append(f"## Recommendations")
+            lines.append(f"")
+            for rec in report.recommendations:
+                lines.append(f"- {rec}")
+            lines.append(f"")
+
+        if report.highlight:
+            lines.append(f"## Shift Highlight")
+            lines.append(f"")
+            lines.append(f"{report.highlight}")
+            lines.append(f"")
+
+        return '\n'.join(lines)
+
+    def export_report_json(self, report: ShiftReport) -> str:
+        """Export a shift report as JSON string for integration."""
+        data = {
+            'shift_id': report.shift_id,
+            'shift_start': report.shift_start,
+            'shift_end': report.shift_end,
+            'operator_id': report.operator_id,
+            'machine_ids': report.machine_ids,
+            'oee_summary': report.oee_summary,
+            'total_parts_produced': report.total_parts_produced,
+            'total_scrap_count': report.total_scrap_count,
+            'tool_changes': report.tool_changes,
+            'alarms': [self._event_to_dict(e) for e in report.alarms],
+            'anomalies': [self._event_to_dict(e) for e in report.anomalies],
+            'maintenance_performed': [self._event_to_dict(e) for e in report.maintenance_performed],
+            'pending_issues': report.pending_issues,
+            'recommendations': report.recommendations,
+            'highlight': report.highlight,
+        }
+        return json.dumps(data, indent=2)
+
+    def get_shift_comparison(
+        self, report1: ShiftReport, report2: ShiftReport,
+    ) -> Dict[str, Any]:
+        """Compare two shift reports and return deltas.
+
+        Returns a dict with delta values for key metrics.  Positive deltas
+        indicate improvement from report1 to report2.
+        """
+        # Aggregate OEE across all machines in each report
+        oee1 = self._avg_oee(report1)
+        oee2 = self._avg_oee(report2)
+
+        return {
+            'oee_delta': oee2 - oee1,
+            'availability_delta': self._avg_metric(report2, 'availability') - self._avg_metric(report1, 'availability'),
+            'performance_delta': self._avg_metric(report2, 'performance') - self._avg_metric(report1, 'performance'),
+            'quality_delta': self._avg_metric(report2, 'quality') - self._avg_metric(report1, 'quality'),
+            'parts_delta': report2.total_parts_produced - report1.total_parts_produced,
+            'scrap_delta': report2.total_scrap_count - report1.total_scrap_count,
+            'alarm_count_delta': len(report2.alarms) - len(report1.alarms),
+            'tool_changes_delta': report2.tool_changes - report1.tool_changes,
+            'shift1_id': report1.shift_id,
+            'shift2_id': report2.shift_id,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _event_to_dict(event: ShiftEvent) -> Dict:
+        return {
+            'timestamp': event.timestamp,
+            'event_type': event.event_type,
+            'machine_id': event.machine_id,
+            'severity': event.severity,
+            'description': event.description,
+            'data': event.data if event.data else {},
+        }
+
+    @staticmethod
+    def _avg_oee(report: ShiftReport) -> float:
+        if not report.oee_summary:
+            return 0.0
+        vals = [v.get('overall', 0.0) for v in report.oee_summary.values()]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    @staticmethod
+    def _avg_metric(report: ShiftReport, metric: str) -> float:
+        if not report.oee_summary:
+            return 0.0
+        vals = [v.get(metric, 0.0) for v in report.oee_summary.values()]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    @staticmethod
+    def _identify_pending_issues(
+        alarms: List[ShiftEvent],
+        anomalies: List[ShiftEvent],
+        shift_events: List[ShiftEvent],
+        machine_metrics: Optional[Dict[str, MachineMetrics]],
+        machine_ids: List[str],
+    ) -> List[str]:
+        """Identify issues the next shift needs to know about."""
+        issues: List[str] = []
+
+        # Unresolved critical/warning alarms
+        critical_alarms = [a for a in alarms if a.severity in ('CRITICAL', 'WARNING')]
+        for a in critical_alarms:
+            issues.append(f"Unresolved {a.severity.lower()} alarm on {a.machine_id}: {a.description}")
+
+        # Recurring anomalies (same type on same machine appears 2+ times)
+        anomaly_counts: Dict[str, int] = {}
+        for a in anomalies:
+            key = f"{a.machine_id}:{a.event_type}:{a.description}"
+            anomaly_counts[key] = anomaly_counts.get(key, 0) + 1
+        for key, count in anomaly_counts.items():
+            if count >= 2:
+                parts = key.split(':', 2)
+                issues.append(
+                    f"Recurring anomaly on {parts[0]}: {parts[2]} ({count} occurrences)"
+                )
+
+        # Low tool RUL from metrics
+        if machine_metrics:
+            for mid in machine_ids:
+                m = machine_metrics.get(mid)
+                if m and m.tool_life_total > 0:
+                    remaining = 1.0 - (m.tool_life_used / m.tool_life_total)
+                    if remaining < 0.2:
+                        issues.append(
+                            f"Tool on {mid} at {remaining:.0%} remaining life"
+                        )
+
+        # Calibration events that may indicate drift
+        calibrations = [e for e in shift_events if e.event_type == 'CALIBRATION']
+        for c in calibrations:
+            drift = (c.data or {}).get('drift')
+            if drift is not None and abs(drift) > 0.05:
+                issues.append(
+                    f"Calibration drift on {c.machine_id}: {drift:.3f}"
+                )
+
+        return issues
+
+    @staticmethod
+    def _generate_recommendations(
+        shift_events: List[ShiftEvent],
+        machine_metrics: Optional[Dict[str, MachineMetrics]],
+        machine_ids: List[str],
+        oee_summary: Dict[str, Dict[str, float]],
+    ) -> List[str]:
+        """Generate actionable recommendations for the next shift."""
+        recs: List[str] = []
+
+        # Tool approaching end-of-life
+        if machine_metrics:
+            for mid in machine_ids:
+                m = machine_metrics.get(mid)
+                if m and m.tool_life_total > 0:
+                    remaining = 1.0 - (m.tool_life_used / m.tool_life_total)
+                    if remaining < 0.3:
+                        recs.append(
+                            f"Schedule tool change for {mid} "
+                            f"({remaining:.0%} remaining)"
+                        )
+
+        # Recurring anomaly patterns
+        anomaly_types: Dict[str, int] = {}
+        for e in shift_events:
+            if e.event_type == 'ANOMALY':
+                key = f"{e.machine_id}:{e.description}"
+                anomaly_types[key] = anomaly_types.get(key, 0) + 1
+        for key, count in anomaly_types.items():
+            if count >= 3:
+                mid, desc = key.split(':', 1)
+                recs.append(
+                    f"Investigate recurring anomaly on {mid}: "
+                    f"{desc} ({count} times this shift)"
+                )
+
+        # Low OEE machines
+        for mid, oee in oee_summary.items():
+            if oee.get('overall', 0.0) < 0.65:
+                recs.append(
+                    f"Review low OEE on {mid} "
+                    f"({oee['overall']:.1%})"
+                )
+
+        # High scrap rate
+        if machine_metrics:
+            for mid in machine_ids:
+                m = machine_metrics.get(mid)
+                if m and m.total_jobs > 0:
+                    scrap_rate = m.defect_jobs / m.total_jobs
+                    if scrap_rate > 0.1:
+                        recs.append(
+                            f"High scrap rate on {mid}: "
+                            f"{scrap_rate:.1%} — check tooling and material"
+                        )
+
+        return recs
+
+    @staticmethod
+    def _pick_highlight(
+        shift_events: List[ShiftEvent],
+        oee_summary: Dict[str, Dict[str, float]],
+        machine_ids: List[str],
+    ) -> str:
+        """Pick the most notable event or achievement for the shift."""
+        # Priority: critical event > best OEE achievement > summary
+        critical_events = [
+            e for e in shift_events if e.severity == 'CRITICAL'
+        ]
+        if critical_events:
+            e = critical_events[0]
+            return (
+                f"CRITICAL event on {e.machine_id}: {e.description}"
+            )
+
+        # Best OEE achievement
+        best_mid = None
+        best_oee = -1.0
+        for mid, oee in oee_summary.items():
+            val = oee.get('overall', 0.0)
+            if val > best_oee:
+                best_oee = val
+                best_mid = mid
+        if best_mid and best_oee > 0.85:
+            return (
+                f"Excellent OEE on {best_mid}: {best_oee:.1%}"
+            )
+
+        if not shift_events:
+            return "Quiet shift with no notable events."
+
+        return (
+            f"Shift completed with {len(shift_events)} events across "
+            f"{len(machine_ids)} machine(s)."
+        )
 
 
 # ------------------------------------------------------------------

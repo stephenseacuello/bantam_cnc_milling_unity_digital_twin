@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 import threading
 import asyncio
+import time
+import uuid
 
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -30,6 +32,231 @@ class RecoveryAction:
     attempt: int = 0
     max_retries: int = 3
     status: str = 'PENDING'  # PENDING, IN_PROGRESS, VERIFYING, COMPLETED, FAILED
+
+
+@dataclass
+class NetworkPartition:
+    """Represents a detected network partition event."""
+    partition_id: str
+    detected_at: float
+    affected_nodes: List[str]
+    reachable_nodes: List[str]
+    unreachable_nodes: List[str]
+    partition_type: str  # FULL, PARTIAL, INTERMITTENT
+    estimated_severity: float  # 0.0 - 1.0
+    recovery_strategy: str
+
+
+# Well-known safety-critical node names
+SAFETY_NODES = frozenset({
+    'emergency_stop', 'safety_monitor', 'collision_detector',
+    'estop_controller', 'safety_controller',
+})
+
+
+class PartitionDetector:
+    """Detects network partitions by monitoring node heartbeats.
+
+    Tracks heartbeat arrivals and failures per node.  When consecutive
+    failures exceed the configured threshold the node is marked
+    unreachable.  Unreachable nodes are then grouped by timing to
+    distinguish full, partial, and intermittent partitions.
+    """
+
+    def __init__(
+        self,
+        heartbeat_timeout_sec: float = 5.0,
+        min_failures: int = 3,
+    ) -> None:
+        self._heartbeat_timeout_sec = heartbeat_timeout_sec
+        self._min_failures = min_failures
+
+        # node_name -> last successful heartbeat timestamp
+        self._last_heartbeat: Dict[str, float] = {}
+        # node_name -> consecutive failure count
+        self._failure_counts: Dict[str, int] = {}
+        # node_name -> list of failure timestamps (for flap detection)
+        self._failure_timestamps: Dict[str, List[float]] = {}
+        # node_name -> total heartbeat count (for uptime %)
+        self._heartbeat_counts: Dict[str, int] = {}
+        # node_name -> total check count
+        self._check_counts: Dict[str, int] = {}
+        # node_name -> first seen timestamp
+        self._first_seen: Dict[str, float] = {}
+
+        # Partition bookkeeping
+        self._active_partitions: Dict[str, NetworkPartition] = {}
+        self._partition_history: List[NetworkPartition] = []
+
+    # ------------------------------------------------------------------ #
+    #  Heartbeat recording
+    # ------------------------------------------------------------------ #
+
+    def record_heartbeat(self, node_name: str, timestamp: float) -> None:
+        """Record a successful heartbeat from *node_name*."""
+        self._last_heartbeat[node_name] = timestamp
+        self._failure_counts[node_name] = 0
+        self._heartbeat_counts[node_name] = (
+            self._heartbeat_counts.get(node_name, 0) + 1
+        )
+        self._check_counts[node_name] = (
+            self._check_counts.get(node_name, 0) + 1
+        )
+        if node_name not in self._first_seen:
+            self._first_seen[node_name] = timestamp
+
+    def record_heartbeat_failure(self, node_name: str, timestamp: float) -> None:
+        """Record a heartbeat failure (missed heartbeat) for *node_name*."""
+        self._failure_counts[node_name] = (
+            self._failure_counts.get(node_name, 0) + 1
+        )
+        self._failure_timestamps.setdefault(node_name, []).append(timestamp)
+        self._check_counts[node_name] = (
+            self._check_counts.get(node_name, 0) + 1
+        )
+        if node_name not in self._first_seen:
+            self._first_seen[node_name] = timestamp
+
+    # ------------------------------------------------------------------ #
+    #  Partition detection
+    # ------------------------------------------------------------------ #
+
+    def check_partitions(self, current_time: float) -> List[NetworkPartition]:
+        """Analyse current heartbeat state and return new partitions."""
+        all_nodes = set(self._last_heartbeat) | set(self._failure_counts)
+        if not all_nodes:
+            return []
+
+        unreachable: List[str] = []
+        reachable: List[str] = []
+
+        for node in all_nodes:
+            failures = self._failure_counts.get(node, 0)
+
+            if failures >= self._min_failures:
+                unreachable.append(node)
+            else:
+                reachable.append(node)
+
+        if not unreachable:
+            return []
+
+        # Classify partition type
+        partition_type = self._classify_partition(
+            all_nodes, reachable, unreachable, current_time,
+        )
+
+        severity = len(unreachable) / len(all_nodes) if all_nodes else 0.0
+
+        partition = NetworkPartition(
+            partition_id=str(uuid.uuid4()),
+            detected_at=current_time,
+            affected_nodes=sorted(all_nodes),
+            reachable_nodes=sorted(reachable),
+            unreachable_nodes=sorted(unreachable),
+            partition_type=partition_type,
+            estimated_severity=round(severity, 4),
+            recovery_strategy=self._compute_recovery_strategy(
+                partition_type, unreachable,
+            ),
+        )
+
+        self._active_partitions[partition.partition_id] = partition
+        self._partition_history.append(partition)
+        return [partition]
+
+    # ------------------------------------------------------------------ #
+    #  Query helpers
+    # ------------------------------------------------------------------ #
+
+    def get_node_health(self) -> Dict[str, Dict[str, Any]]:
+        """Return per-node health information."""
+        all_nodes = set(self._last_heartbeat) | set(self._failure_counts)
+        result: Dict[str, Dict[str, Any]] = {}
+        for node in sorted(all_nodes):
+            checks = self._check_counts.get(node, 0)
+            successes = self._heartbeat_counts.get(node, 0)
+            uptime_pct = (successes / checks * 100.0) if checks > 0 else 0.0
+            failures = self._failure_counts.get(node, 0)
+            status = 'unreachable' if failures >= self._min_failures else 'reachable'
+            result[node] = {
+                'status': status,
+                'last_seen': self._last_heartbeat.get(node),
+                'failure_count': failures,
+                'uptime_pct': round(uptime_pct, 2),
+            }
+        return result
+
+    def get_partition_history(self) -> List[NetworkPartition]:
+        """Return all detected partitions (active and resolved)."""
+        return list(self._partition_history)
+
+    def clear_partition(self, partition_id: str) -> None:
+        """Mark a partition as resolved and remove from active set."""
+        self._active_partitions.pop(partition_id, None)
+
+    def is_node_reachable(self, node_name: str) -> bool:
+        """Return True if *node_name* is considered reachable."""
+        failures = self._failure_counts.get(node_name, 0)
+        return failures < self._min_failures
+
+    def get_recommended_recovery(self, partition: NetworkPartition) -> str:
+        """Return a recovery recommendation string for *partition*."""
+        return self._compute_recovery_strategy(
+            partition.partition_type, partition.unreachable_nodes,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _classify_partition(
+        self,
+        all_nodes: set,
+        reachable: List[str],
+        unreachable: List[str],
+        current_time: float,
+    ) -> str:
+        """Classify partition as FULL, PARTIAL, or INTERMITTENT."""
+        # Check for intermittent (flapping) -- node that has had both
+        # successes *and* failures recently.
+        flapping = False
+        for node in unreachable:
+            ts_list = self._failure_timestamps.get(node, [])
+            if len(ts_list) >= 2:
+                # If failures are spread out (not a single burst) and
+                # the node has had successful heartbeats in between,
+                # treat as intermittent.
+                hb_count = self._heartbeat_counts.get(node, 0)
+                if hb_count > 0:
+                    flapping = True
+                    break
+
+        if flapping:
+            return 'INTERMITTENT'
+
+        if len(reachable) == 0:
+            return 'FULL'
+
+        return 'PARTIAL'
+
+    @staticmethod
+    def _compute_recovery_strategy(
+        partition_type: str,
+        unreachable_nodes: List[str],
+    ) -> str:
+        """Decide recovery strategy based on partition type and nodes."""
+        if partition_type == 'FULL':
+            return 'escalate_to_operator'
+
+        if partition_type == 'INTERMITTENT':
+            return 'increase_heartbeat_frequency'
+
+        # PARTIAL -- check if any safety-critical nodes are affected
+        if any(n in SAFETY_NODES for n in unreachable_nodes):
+            return 'emergency_stop'
+
+        return 'continue_degraded'
 
 
 # Default dependency graph for MIRACLE nodes
@@ -96,6 +323,7 @@ class RecoveryOrchestratorNode(MiracleLifecycleNode):
         self._lifecycle_client: Optional[LifecycleClient] = None
         self._recent_heartbeats: Dict[str, float] = {}
         self._dependency_graph = dict(DEFAULT_DEPENDENCIES)
+        self._partition_detector = PartitionDetector()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         self.declare_and_validate_parameters({
@@ -148,10 +376,10 @@ class RecoveryOrchestratorNode(MiracleLifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _on_heartbeat(self, msg: Heartbeat) -> None:
-        """Track heartbeats for recovery verification."""
-        self._recent_heartbeats[msg.node_name] = (
-            msg.timestamp.sec + msg.timestamp.nanosec * 1e-9
-        )
+        """Track heartbeats for recovery verification and partition detection."""
+        ts = msg.timestamp.sec + msg.timestamp.nanosec * 1e-9
+        self._recent_heartbeats[msg.node_name] = ts
+        self._partition_detector.record_heartbeat(msg.node_name, ts)
 
     def _on_recovery_request(self, msg: RecoveryRequest) -> None:
         """Handle recovery request."""

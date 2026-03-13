@@ -513,6 +513,252 @@ class CoolantOptimizer:
         return f'{recommended}: ' + '; '.join(parts)
 
 
+@dataclass
+class ThermalZone:
+    """Represents a thermal zone in the multi-zone thermal model."""
+    zone_id: str
+    temperature_c: float = 25.0
+    thermal_mass_j_per_c: float = 1000.0
+    heat_input_w: float = 0.0
+    heat_dissipation_w_per_c: float = 1.0
+    max_safe_temp_c: float = 100.0
+    adjacent_zones: List[str] = field(default_factory=list)
+
+
+class ThermalModel:
+    """Multi-zone thermal model for CNC milling simulation.
+
+    Models heat generation, dissipation, and inter-zone conduction across
+    five thermal zones: spindle, workpiece, tool_holder, coolant_reservoir,
+    and ambient.
+    """
+
+    # Coolant effectiveness multiplier on dissipation coefficient
+    COOLANT_DISSIPATION_MULTIPLIER: Dict[str, float] = {
+        'dry': 1.0,
+        'mist': 1.5,
+        'flood': 2.5,
+        'high_pressure': 3.5,
+        'cryogenic': 5.0,
+    }
+
+    # Inter-zone thermal conductance (W/C) between adjacent zones
+    ZONE_CONDUCTANCE: float = 2.0
+
+    # Cutting power partition fractions
+    POWER_PARTITION = {
+        'workpiece': 0.60,
+        'tool_holder': 0.25,
+        'spindle': 0.10,
+        'coolant_reservoir': 0.05,
+    }
+
+    AMBIENT_TEMP: float = 25.0
+
+    def __init__(self) -> None:
+        self._zones: Dict[str, ThermalZone] = {}
+        self._init_zones()
+
+    def _init_zones(self) -> None:
+        """Initialize the five default thermal zones."""
+        self._zones['spindle'] = ThermalZone(
+            zone_id='spindle',
+            temperature_c=self.AMBIENT_TEMP,
+            thermal_mass_j_per_c=5000.0,
+            heat_dissipation_w_per_c=5.0,
+            max_safe_temp_c=80.0,
+            adjacent_zones=['tool_holder', 'ambient'],
+        )
+        self._zones['workpiece'] = ThermalZone(
+            zone_id='workpiece',
+            temperature_c=self.AMBIENT_TEMP,
+            thermal_mass_j_per_c=2000.0,
+            heat_dissipation_w_per_c=3.0,
+            max_safe_temp_c=200.0,
+            adjacent_zones=['tool_holder', 'coolant_reservoir', 'ambient'],
+        )
+        self._zones['tool_holder'] = ThermalZone(
+            zone_id='tool_holder',
+            temperature_c=self.AMBIENT_TEMP,
+            thermal_mass_j_per_c=500.0,
+            heat_dissipation_w_per_c=4.0,
+            max_safe_temp_c=150.0,
+            adjacent_zones=['spindle', 'workpiece', 'ambient'],
+        )
+        self._zones['coolant_reservoir'] = ThermalZone(
+            zone_id='coolant_reservoir',
+            temperature_c=self.AMBIENT_TEMP,
+            thermal_mass_j_per_c=20000.0,
+            heat_dissipation_w_per_c=10.0,
+            max_safe_temp_c=45.0,
+            adjacent_zones=['workpiece', 'ambient'],
+        )
+        self._zones['ambient'] = ThermalZone(
+            zone_id='ambient',
+            temperature_c=self.AMBIENT_TEMP,
+            thermal_mass_j_per_c=1e12,  # effectively infinite
+            heat_dissipation_w_per_c=0.0,
+            max_safe_temp_c=1e6,
+            adjacent_zones=[],
+        )
+
+    def update(self, dt_sec: float, cutting_power_w: float,
+               spindle_power_w: float = 0.0,
+               coolant_type: str = 'flood') -> Dict[str, float]:
+        """Advance the thermal model by dt_sec seconds.
+
+        Args:
+            dt_sec: Time step in seconds.
+            cutting_power_w: Total cutting power in watts.
+            spindle_power_w: Additional spindle motor heat in watts.
+            coolant_type: Active coolant type for dissipation scaling.
+
+        Returns:
+            Dict mapping zone_id to current temperature.
+        """
+        if dt_sec <= 0:
+            return self.get_thermal_state()
+
+        coolant_mult = self.COOLANT_DISSIPATION_MULTIPLIER.get(coolant_type, 1.0)
+
+        # Assign heat inputs based on power partition
+        for zone_id, fraction in self.POWER_PARTITION.items():
+            zone = self._zones[zone_id]
+            zone.heat_input_w = cutting_power_w * fraction
+        # Add spindle motor heat to spindle zone
+        self._zones['spindle'].heat_input_w += spindle_power_w
+
+        # Compute temperature changes for non-ambient zones
+        for zone_id, zone in self._zones.items():
+            if zone_id == 'ambient':
+                continue
+
+            # Net heat input
+            q_in = zone.heat_input_w
+
+            # Dissipation to ambient (convection/conduction)
+            delta_t_ambient = zone.temperature_c - self.AMBIENT_TEMP
+            q_dissipation = zone.heat_dissipation_w_per_c * delta_t_ambient * coolant_mult
+
+            # Inter-zone conduction
+            q_conduction = 0.0
+            for adj_id in zone.adjacent_zones:
+                if adj_id == 'ambient':
+                    continue
+                adj_zone = self._zones.get(adj_id)
+                if adj_zone is None:
+                    continue
+                temp_diff = zone.temperature_c - adj_zone.temperature_c
+                q_conduction += self.ZONE_CONDUCTANCE * temp_diff
+
+            # Net heat balance: dT = (q_in - q_out) * dt / thermal_mass
+            q_net = q_in - q_dissipation - q_conduction
+            dT = (q_net * dt_sec) / zone.thermal_mass_j_per_c
+            zone.temperature_c += dT
+
+        return self.get_thermal_state()
+
+    def get_thermal_state(self) -> Dict[str, float]:
+        """Return current temperatures for all zones."""
+        return {zid: z.temperature_c for zid, z in self._zones.items()}
+
+    def get_thermal_warnings(self) -> List[tuple]:
+        """Return warnings for zones approaching or exceeding safe limits.
+
+        Returns:
+            List of (zone_id, current_temp, max_safe_temp, pct_of_limit) tuples
+            for zones at or above 80% of their safe limit (relative to ambient).
+        """
+        warnings = []
+        for zid, zone in self._zones.items():
+            if zid == 'ambient':
+                continue
+            temp_range = zone.max_safe_temp_c - self.AMBIENT_TEMP
+            if temp_range <= 0:
+                continue
+            current_rise = zone.temperature_c - self.AMBIENT_TEMP
+            pct = (current_rise / temp_range) * 100.0
+            if pct >= 80.0:
+                warnings.append((
+                    zid,
+                    zone.temperature_c,
+                    zone.max_safe_temp_c,
+                    round(pct, 2),
+                ))
+        return warnings
+
+    def predict_thermal_trajectory(self, power_w: float, duration_sec: float,
+                                   steps: int = 10,
+                                   coolant_type: str = 'flood') -> List[Dict[str, float]]:
+        """Predict temperature evolution over a future time period.
+
+        Creates a copy of current state and simulates forward without
+        modifying the actual model state.
+
+        Args:
+            power_w: Constant cutting power in watts.
+            duration_sec: Total prediction horizon in seconds.
+            steps: Number of time steps to simulate.
+            coolant_type: Coolant type for the prediction.
+
+        Returns:
+            List of dicts, each mapping zone_id to temperature at that step.
+        """
+        # Save current state
+        saved_temps = {zid: z.temperature_c for zid, z in self._zones.items()}
+
+        trajectory = []
+        dt = duration_sec / max(steps, 1)
+        for _ in range(steps):
+            state = self.update(dt, power_w, coolant_type=coolant_type)
+            trajectory.append(dict(state))
+
+        # Restore original state
+        for zid, temp in saved_temps.items():
+            self._zones[zid].temperature_c = temp
+
+        return trajectory
+
+    def reset(self) -> None:
+        """Reset all zones to ambient temperature."""
+        for zone in self._zones.items():
+            pass
+        for zid, zone in self._zones.items():
+            zone.temperature_c = self.AMBIENT_TEMP
+            zone.heat_input_w = 0.0
+
+    def get_time_to_limit(self, zone_id: str) -> Optional[float]:
+        """Estimate seconds until a zone reaches its max safe temperature.
+
+        Uses current heat input rate and dissipation to extrapolate linearly.
+        Returns None if the zone is cooling or already at/above limit, or
+        if the zone does not exist.
+
+        Args:
+            zone_id: The zone to check.
+
+        Returns:
+            Estimated seconds to reach limit, or None if not applicable.
+        """
+        zone = self._zones.get(zone_id)
+        if zone is None:
+            return None
+        if zone.temperature_c >= zone.max_safe_temp_c:
+            return 0.0
+
+        # Net heat rate at current temperature
+        delta_t = zone.temperature_c - self.AMBIENT_TEMP
+        q_dissipation = zone.heat_dissipation_w_per_c * delta_t
+        q_net = zone.heat_input_w - q_dissipation
+        if q_net <= 0:
+            return None  # zone is cooling or stable
+
+        # dT/dt = q_net / thermal_mass
+        dT_dt = q_net / zone.thermal_mass_j_per_c
+        remaining_temp = zone.max_safe_temp_c - zone.temperature_c
+        return remaining_temp / dT_dt
+
+
 class CuttingSimProxy:
     """Python proxy for cutting force + wear simulation.
 
@@ -550,6 +796,7 @@ class CuttingSimProxy:
         self._active_tool_def: Optional[ToolDefinition] = None
         self._coolant: CoolantConfig = coolant or CoolantConfig()
         self._calibration_log: List[Dict] = []
+        self._thermal_model: ThermalModel = ThermalModel()
 
     @property
     def coolant(self) -> 'CoolantConfig':
@@ -559,6 +806,42 @@ class CuttingSimProxy:
     def set_coolant(self, config: 'CoolantConfig') -> None:
         """Set coolant/lubrication configuration."""
         self._coolant = config
+
+    def update_thermal_state(self, block: 'GCodeBlock', dt_sec: float) -> Dict[str, float]:
+        """Update the thermal model based on a G-code block's cutting power.
+
+        Calculates cutting power from the block parameters and feeds it
+        into the multi-zone ThermalModel.
+
+        Args:
+            block: The G-code block with current cutting parameters.
+            dt_sec: Time step in seconds.
+
+        Returns:
+            Dict mapping zone_id to current temperature.
+        """
+        cutting_power_w = 0.0
+        spindle_power_w = 0.0
+
+        if block.spindle_rpm > 0 and block.feed_rate_mmpm > 0:
+            flute_count = 2
+            fz = block.feed_rate_mmpm / (block.spindle_rpm * flute_count)
+            forces = self.calculate_forces(
+                spindle_rpm=block.spindle_rpm,
+                feed_per_tooth=fz,
+                axial_depth=block.axial_depth_mm,
+                radial_depth=block.radial_depth_mm,
+            )
+            cutting_power_w = forces.get('power_w', 0.0)
+            # Estimate spindle motor heat as 5% of cutting power
+            spindle_power_w = cutting_power_w * 0.05
+
+        return self._thermal_model.update(
+            dt_sec=dt_sec,
+            cutting_power_w=cutting_power_w,
+            spindle_power_w=spindle_power_w,
+            coolant_type=self._coolant.coolant_type,
+        )
 
     def get_coolant_recommendation(
         self,

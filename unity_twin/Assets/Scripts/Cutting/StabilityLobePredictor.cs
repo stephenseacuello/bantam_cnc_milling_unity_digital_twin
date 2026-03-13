@@ -1,9 +1,375 @@
 using UnityEngine;
 using System;
+using System.Collections.Generic;
 using RosMessageTypes.Miracle;
 
 namespace MiracleTwin.Cutting
 {
+    // -----------------------------------------------------------------------
+    // Spindle Vibration Spectrum Analysis
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Frequency-domain representation of a spindle vibration signal.
+    /// </summary>
+    [Serializable]
+    public class VibrationSpectrum
+    {
+        public float[] frequencies;          // Hz
+        public float[] amplitudes;           // mm
+        public float[] phases;              // radians
+        public float dominantFrequencyHz;
+        public float dominantAmplitudeMM;
+        public float totalRMS;
+        public double timestamp;
+    }
+
+    /// <summary>
+    /// Result of chatter detection analysis.
+    /// </summary>
+    [Serializable]
+    public class ChatterDetectionResult
+    {
+        public bool isChatter;
+        public float chatterFrequencyHz;
+        public float chatterAmplitudeMM;
+        public float toothPassingFrequencyHz;
+        public float confidence;
+    }
+
+    /// <summary>
+    /// Composite spindle health report derived from vibration analysis.
+    /// </summary>
+    [Serializable]
+    public class SpindleHealthReport
+    {
+        public float vibrationRMS;
+        public float dominantFrequency;
+        public bool chatterDetected;
+        public float runoutMM;
+        public float bearingHealth;
+        public float overallHealth;          // weighted composite 0-1
+        public List<string> recommendations;
+    }
+
+    /// <summary>
+    /// Analyzes spindle vibration signals using DFT to detect chatter,
+    /// estimate runout, and assess bearing health.
+    /// </summary>
+    public class SpindleVibrationAnalyzer
+    {
+        private readonly float[] sampleBuffer;
+        private int writeIndex;
+        private int sampleCount;
+        public float sampleRateHz;
+
+        /// <summary>Number of valid samples currently in the buffer.</summary>
+        public int SampleCount => sampleCount;
+
+        /// <summary>Buffer capacity.</summary>
+        public int Capacity => sampleBuffer.Length;
+
+        public SpindleVibrationAnalyzer(int capacity = 4096, float sampleRate = 10000f)
+        {
+            sampleBuffer = new float[capacity];
+            writeIndex = 0;
+            sampleCount = 0;
+            sampleRateHz = sampleRate;
+        }
+
+        /// <summary>
+        /// Add a vibration amplitude sample to the circular buffer.
+        /// </summary>
+        public void AddSample(float amplitude)
+        {
+            sampleBuffer[writeIndex] = amplitude;
+            writeIndex = (writeIndex + 1) % sampleBuffer.Length;
+            if (sampleCount < sampleBuffer.Length)
+                sampleCount++;
+        }
+
+        /// <summary>
+        /// Retrieve samples in chronological order from the circular buffer.
+        /// </summary>
+        private float[] GetOrderedSamples()
+        {
+            float[] ordered = new float[sampleCount];
+            if (sampleCount < sampleBuffer.Length)
+            {
+                Array.Copy(sampleBuffer, 0, ordered, 0, sampleCount);
+            }
+            else
+            {
+                int start = writeIndex; // oldest sample
+                int firstChunk = sampleBuffer.Length - start;
+                Array.Copy(sampleBuffer, start, ordered, 0, firstChunk);
+                Array.Copy(sampleBuffer, 0, ordered, firstChunk, start);
+            }
+            return ordered;
+        }
+
+        /// <summary>
+        /// Compute the vibration spectrum using a simplified DFT.
+        /// Only computes bins up to Nyquist (N/2).
+        /// </summary>
+        public VibrationSpectrum ComputeSpectrum()
+        {
+            if (sampleCount == 0)
+            {
+                return new VibrationSpectrum
+                {
+                    frequencies = Array.Empty<float>(),
+                    amplitudes = Array.Empty<float>(),
+                    phases = Array.Empty<float>(),
+                    dominantFrequencyHz = 0f,
+                    dominantAmplitudeMM = 0f,
+                    totalRMS = 0f,
+                    timestamp = Time.timeAsDouble
+                };
+            }
+
+            float[] samples = GetOrderedSamples();
+            int N = samples.Length;
+            int numBins = N / 2;
+
+            float[] frequencies = new float[numBins];
+            float[] amplitudes = new float[numBins];
+            float[] phases = new float[numBins];
+
+            float freqResolution = sampleRateHz / N;
+
+            // DFT: X[k] = sum_{n=0}^{N-1} x[n] * e^{-j*2*pi*k*n/N}
+            for (int k = 0; k < numBins; k++)
+            {
+                float realPart = 0f;
+                float imagPart = 0f;
+
+                for (int n = 0; n < N; n++)
+                {
+                    float angle = 2f * Mathf.PI * k * n / N;
+                    realPart += samples[n] * Mathf.Cos(angle);
+                    imagPart -= samples[n] * Mathf.Sin(angle);
+                }
+
+                // Normalize by N; multiply by 2 for single-sided spectrum (except DC)
+                float mag = Mathf.Sqrt(realPart * realPart + imagPart * imagPart) / N;
+                if (k > 0) mag *= 2f;
+
+                frequencies[k] = k * freqResolution;
+                amplitudes[k] = mag;
+                phases[k] = Mathf.Atan2(imagPart, realPart);
+            }
+
+            // Find dominant (skip DC bin k=0)
+            float domFreq = 0f;
+            float domAmp = 0f;
+            for (int k = 1; k < numBins; k++)
+            {
+                if (amplitudes[k] > domAmp)
+                {
+                    domAmp = amplitudes[k];
+                    domFreq = frequencies[k];
+                }
+            }
+
+            // RMS from time domain
+            float sumSq = 0f;
+            for (int n = 0; n < N; n++)
+                sumSq += samples[n] * samples[n];
+            float rms = Mathf.Sqrt(sumSq / N);
+
+            return new VibrationSpectrum
+            {
+                frequencies = frequencies,
+                amplitudes = amplitudes,
+                phases = phases,
+                dominantFrequencyHz = domFreq,
+                dominantAmplitudeMM = domAmp,
+                totalRMS = rms,
+                timestamp = Time.timeAsDouble
+            };
+        }
+
+        /// <summary>
+        /// Detect chatter by looking for spectral peaks that are NOT at
+        /// tooth passing frequency harmonics (1x, 2x, 3x).
+        /// </summary>
+        public ChatterDetectionResult DetectChatterFrequency(float spindleRPM, int numFlutes)
+        {
+            var spectrum = ComputeSpectrum();
+            float toothPassFreq = spindleRPM * numFlutes / 60f;
+
+            var result = new ChatterDetectionResult
+            {
+                isChatter = false,
+                chatterFrequencyHz = 0f,
+                chatterAmplitudeMM = 0f,
+                toothPassingFrequencyHz = toothPassFreq,
+                confidence = 0f
+            };
+
+            if (spectrum.amplitudes == null || spectrum.amplitudes.Length < 2 || toothPassFreq <= 0f)
+                return result;
+
+            // Frequency tolerance: +/- 1 bin width
+            float freqResolution = spectrum.frequencies.Length > 1
+                ? spectrum.frequencies[1] - spectrum.frequencies[0]
+                : sampleRateHz;
+            float tolerance = freqResolution * 1.5f;
+
+            // Find the largest non-harmonic peak (skip DC)
+            float maxNonHarmonicAmp = 0f;
+            float maxNonHarmonicFreq = 0f;
+            float maxHarmonicAmp = 0f;
+
+            for (int k = 1; k < spectrum.amplitudes.Length; k++)
+            {
+                float freq = spectrum.frequencies[k];
+                float amp = spectrum.amplitudes[k];
+
+                bool isHarmonic = false;
+                for (int h = 1; h <= 3; h++)
+                {
+                    if (Mathf.Abs(freq - h * toothPassFreq) < tolerance)
+                    {
+                        isHarmonic = true;
+                        if (amp > maxHarmonicAmp)
+                            maxHarmonicAmp = amp;
+                        break;
+                    }
+                }
+
+                if (!isHarmonic && amp > maxNonHarmonicAmp)
+                {
+                    maxNonHarmonicAmp = amp;
+                    maxNonHarmonicFreq = freq;
+                }
+            }
+
+            // Chatter if a non-harmonic peak is significant relative to the harmonic energy
+            float threshold = maxHarmonicAmp * 0.3f; // 30% of strongest harmonic
+            if (maxNonHarmonicAmp > threshold && maxNonHarmonicAmp > 1e-6f)
+            {
+                result.isChatter = true;
+                result.chatterFrequencyHz = maxNonHarmonicFreq;
+                result.chatterAmplitudeMM = maxNonHarmonicAmp;
+                // Confidence: how much larger the chatter peak is vs threshold
+                float ratio = maxHarmonicAmp > 0
+                    ? maxNonHarmonicAmp / maxHarmonicAmp
+                    : 1f;
+                result.confidence = Mathf.Clamp01(ratio);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Estimate spindle runout (mm) — the once-per-revolution vibration component.
+        /// Returns the amplitude at the 1x RPM frequency bin.
+        /// </summary>
+        public float GetRunoutEstimate(float spindleRPM)
+        {
+            if (spindleRPM <= 0f || sampleCount == 0) return 0f;
+
+            var spectrum = ComputeSpectrum();
+            float oncePerRevHz = spindleRPM / 60f;
+
+            if (spectrum.frequencies == null || spectrum.frequencies.Length < 2)
+                return 0f;
+
+            float freqRes = spectrum.frequencies[1] - spectrum.frequencies[0];
+            if (freqRes <= 0) return 0f;
+
+            // Find closest bin to 1x RPM
+            int bin = Mathf.RoundToInt(oncePerRevHz / freqRes);
+            if (bin < 0 || bin >= spectrum.amplitudes.Length)
+                return 0f;
+
+            return spectrum.amplitudes[bin];
+        }
+
+        /// <summary>
+        /// Bearing health indicator: ratio of high-frequency energy (>2 kHz) to total.
+        /// Returns 0-1 where 1 = healthy (little high-freq energy), 0 = degraded.
+        /// </summary>
+        public float GetBearingHealthIndicator()
+        {
+            if (sampleCount == 0) return 1f;
+
+            var spectrum = ComputeSpectrum();
+            if (spectrum.amplitudes == null || spectrum.amplitudes.Length < 2)
+                return 1f;
+
+            float freqRes = spectrum.frequencies[1] - spectrum.frequencies[0];
+            float totalEnergy = 0f;
+            float highFreqEnergy = 0f;
+            float highFreqThreshold = 2000f; // Hz
+
+            for (int k = 1; k < spectrum.amplitudes.Length; k++)
+            {
+                float energy = spectrum.amplitudes[k] * spectrum.amplitudes[k];
+                totalEnergy += energy;
+                if (spectrum.frequencies[k] > highFreqThreshold)
+                    highFreqEnergy += energy;
+            }
+
+            if (totalEnergy < 1e-12f) return 1f;
+
+            float highFreqRatio = highFreqEnergy / totalEnergy;
+            // Invert: high ratio = bad bearing health
+            return Mathf.Clamp01(1f - highFreqRatio);
+        }
+
+        /// <summary>
+        /// Generate a comprehensive spindle health report.
+        /// </summary>
+        public SpindleHealthReport GenerateHealthReport(float spindleRPM, int numFlutes)
+        {
+            var spectrum = ComputeSpectrum();
+            var chatterResult = DetectChatterFrequency(spindleRPM, numFlutes);
+            float runout = GetRunoutEstimate(spindleRPM);
+            float bearingHealth = GetBearingHealthIndicator();
+
+            var recommendations = new List<string>();
+
+            // Weighted composite health: bearing 30%, vibration RMS 30%, chatter 25%, runout 15%
+            float rmsScore = Mathf.Clamp01(1f - spectrum.totalRMS / 0.1f);  // 0.1mm RMS = bad
+            float chatterScore = chatterResult.isChatter ? (1f - chatterResult.confidence) : 1f;
+            float runoutScore = Mathf.Clamp01(1f - runout / 0.05f);         // 0.05mm runout = bad
+
+            float overallHealth = 0.30f * bearingHealth
+                                + 0.30f * rmsScore
+                                + 0.25f * chatterScore
+                                + 0.15f * runoutScore;
+
+            if (chatterResult.isChatter)
+                recommendations.Add($"Chatter detected at {chatterResult.chatterFrequencyHz:F0} Hz. Consider adjusting RPM or depth of cut.");
+
+            if (runout > 0.025f)
+                recommendations.Add($"Runout {runout:F3} mm exceeds 0.025 mm threshold. Inspect collet and tool holder.");
+
+            if (bearingHealth < 0.7f)
+                recommendations.Add("Elevated high-frequency vibration. Schedule bearing inspection.");
+
+            if (spectrum.totalRMS > 0.05f)
+                recommendations.Add($"RMS vibration {spectrum.totalRMS:F3} mm is elevated. Check tool condition and workholding.");
+
+            if (recommendations.Count == 0)
+                recommendations.Add("Spindle health is within normal operating parameters.");
+
+            return new SpindleHealthReport
+            {
+                vibrationRMS = spectrum.totalRMS,
+                dominantFrequency = spectrum.dominantFrequencyHz,
+                chatterDetected = chatterResult.isChatter,
+                runoutMM = runout,
+                bearingHealth = bearingHealth,
+                overallHealth = Mathf.Clamp01(overallHealth),
+                recommendations = recommendations
+            };
+        }
+    }
+
     /// <summary>
     /// Chatter risk levels for machining operations.
     /// </summary>

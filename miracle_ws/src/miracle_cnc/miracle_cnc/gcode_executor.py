@@ -3,11 +3,250 @@ G-Code Execution Node.
 
 Parses and executes G-code programs on CNC machines via action server.
 Supports line-by-line execution with real-time feedback.
+Supports G-code macro/subroutine expansion (O-word, M98, G65).
 """
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 import re
 import time as time_module
+
+
+# ---------------------------------------------------------------------------
+# G-code Macro / Subroutine Expansion
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GCodeMacro:
+    """A reusable G-code macro (subroutine).
+
+    Attributes:
+        macro_id: Identifier such as "O1000" or a symbolic name.
+        name: Human-readable name for the macro.
+        parameters: Formal parameter names (e.g. ["#1", "#2", "#3"]).
+        body: The G-code lines that make up the macro body.
+        description: Optional description of what the macro does.
+    """
+
+    macro_id: str
+    name: str
+    parameters: List[str] = field(default_factory=list)
+    body: List[str] = field(default_factory=list)
+    description: str = ''
+
+
+class MacroExpansionError(Exception):
+    """Raised when macro expansion fails (e.g. max depth exceeded)."""
+
+
+# Mapping from G65 letter arguments to numbered parameters.
+_G65_PARAM_MAP = {
+    'A': '#1', 'B': '#2', 'C': '#3', 'D': '#7', 'E': '#8',
+    'F': '#9', 'H': '#11', 'I': '#4', 'J': '#5', 'K': '#6',
+    'M': '#13', 'Q': '#17', 'R': '#18', 'S': '#19', 'T': '#20',
+    'U': '#21', 'V': '#22', 'W': '#23', 'X': '#24', 'Y': '#25',
+    'Z': '#26',
+}
+
+_MAX_EXPANSION_DEPTH = 5
+
+
+class MacroLibrary:
+    """Registry of G-code macros with expansion capabilities."""
+
+    def __init__(self) -> None:
+        self._macros: Dict[str, GCodeMacro] = {}
+        self._register_builtins()
+
+    # -- public API ----------------------------------------------------------
+
+    def register_macro(self, macro: GCodeMacro) -> None:
+        """Add or update a macro in the library."""
+        self._macros[macro.macro_id] = macro
+
+    def get_macro(self, macro_id: str) -> Optional[GCodeMacro]:
+        """Return the macro for *macro_id*, or ``None``."""
+        return self._macros.get(macro_id)
+
+    def expand_macro_call(self, line: str, *, _depth: int = 0) -> List[str]:
+        """Expand a single G-code line that may contain a macro call.
+
+        Recognised call syntaxes:
+        * ``M98 P<id> [L<count>]``  – call O<id>, repeat *count* times.
+        * ``G65 P<id> [A<v>] [B<v>] …`` – call with lettered arguments.
+
+        Returns a list of expanded G-code lines.  If the line is not a macro
+        call it is returned unchanged as a single-element list.
+
+        Raises:
+            MacroExpansionError: if nesting exceeds ``_MAX_EXPANSION_DEPTH``.
+        """
+        if _depth > _MAX_EXPANSION_DEPTH:
+            raise MacroExpansionError(
+                f"Macro expansion exceeded maximum depth of {_MAX_EXPANSION_DEPTH}"
+            )
+
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        # --- M98 call syntax: M98 P<id> [L<count>] -------------------------
+        m98_match = re.match(
+            r'M98\s+P(\d+)(?:\s+L(\d+))?', upper,
+        )
+        if m98_match:
+            macro_id = f"O{m98_match.group(1)}"
+            repeat = int(m98_match.group(2)) if m98_match.group(2) else 1
+            macro = self.get_macro(macro_id)
+            if macro is None:
+                return [line]  # unknown macro – pass through
+            expanded: List[str] = []
+            for _ in range(repeat):
+                for body_line in macro.body:
+                    expanded.extend(
+                        self.expand_macro_call(body_line, _depth=_depth + 1)
+                    )
+            return expanded
+
+        # --- G65 call syntax: G65 P<id> [A<v>] [B<v>] … --------------------
+        g65_match = re.match(r'G65\s+P(\d+)(.*)', upper)
+        if g65_match:
+            macro_id = f"O{g65_match.group(1)}"
+            args_str = g65_match.group(2)
+            macro = self.get_macro(macro_id)
+            if macro is None:
+                return [line]
+
+            # Parse lettered arguments from the *original* line (preserve case
+            # of values but match letters case-insensitively).
+            param_values: Dict[str, str] = {}
+            for letter_match in re.finditer(r'([A-Za-z])(-?\d+\.?\d*)', args_str):
+                letter = letter_match.group(1).upper()
+                value = letter_match.group(2)
+                param_var = _G65_PARAM_MAP.get(letter)
+                if param_var:
+                    param_values[param_var] = value
+
+            expanded = []
+            for body_line in macro.body:
+                substituted = body_line
+                for param, value in param_values.items():
+                    substituted = substituted.replace(f"[{param}]", value)
+                    substituted = substituted.replace(param, value)
+                expanded.extend(
+                    self.expand_macro_call(substituted, _depth=_depth + 1)
+                )
+            return expanded
+
+        # Not a macro call – return as-is.
+        return [line]
+
+    def parse_macro_definitions(self, program_lines: List[str]) -> List[str]:
+        """Extract O-word macro definitions from a program.
+
+        Scans for blocks of the form::
+
+            O<id> (name)       ; or just O<id>
+            …body…
+            M99
+
+        Each such block is registered as a macro.  The remaining (non-macro)
+        lines are returned.
+        """
+        remaining: List[str] = []
+        i = 0
+        while i < len(program_lines):
+            line = program_lines[i].strip()
+            # Match O-word start: O1000 or O1000 (name) or O1000 (name) (desc)
+            oword_match = re.match(
+                r'^O(\d+)\s*(?:\(([^)]*)\))?\s*(?:\(([^)]*)\))?\s*$',
+                line,
+                re.IGNORECASE,
+            )
+            if oword_match:
+                macro_id = f"O{oword_match.group(1)}"
+                name = (oword_match.group(2) or macro_id).strip()
+                description = (oword_match.group(3) or '').strip()
+                body: List[str] = []
+                i += 1
+                # Collect body lines until M99
+                while i < len(program_lines):
+                    bline = program_lines[i].strip()
+                    if bline.upper() == 'M99':
+                        i += 1
+                        break
+                    body.append(bline)
+                    i += 1
+                # Determine parameters used in body
+                params_used = sorted(
+                    set(re.findall(r'#\d+', ' '.join(body)))
+                )
+                macro = GCodeMacro(
+                    macro_id=macro_id,
+                    name=name,
+                    parameters=params_used,
+                    body=body,
+                    description=description,
+                )
+                self.register_macro(macro)
+            else:
+                remaining.append(program_lines[i])
+                i += 1
+        return remaining
+
+    # -- built-in macros -----------------------------------------------------
+
+    def _register_builtins(self) -> None:
+        """Register a set of commonly-used built-in macros."""
+
+        self.register_macro(GCodeMacro(
+            macro_id='O9000',
+            name='PROBE_Z',
+            parameters=['#1', '#2'],
+            body=[
+                'G91',
+                'G38.2 Z[#1] F[#2]',
+                'G0 Z2.0',
+                'G90',
+            ],
+            description='G38.2 probe cycle with retract',
+        ))
+
+        self.register_macro(GCodeMacro(
+            macro_id='O9001',
+            name='TOOL_MEASURE',
+            parameters=['#1'],
+            body=[
+                'G91',
+                'G38.2 Z-50.0 F100',
+                'G43 H[#1]',
+                'G0 Z5.0',
+                'G90',
+            ],
+            description='Tool length measurement sequence',
+        ))
+
+        self.register_macro(GCodeMacro(
+            macro_id='O9002',
+            name='SAFE_RETRACT',
+            parameters=[],
+            body=[
+                'G28 G91 Z0',
+            ],
+            description='G28 G91 Z0 safe retract',
+        ))
+
+        self.register_macro(GCodeMacro(
+            macro_id='O9003',
+            name='PECK_DRILL',
+            parameters=['#1', '#2', '#3'],
+            body=[
+                'G91',
+                'G1 Z[#1] F[#3]',
+                'G0 Z[#2]',
+                'G90',
+            ],
+            description='Parametric peck drill cycle',
+        ))
 
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -62,6 +301,7 @@ class GCodeExecutorNode(MiracleLifecycleNode):
         self._feed_override_pct: float = 100.0
         self._spindle_override_pct: float = 100.0
         self._override_sub = None
+        self._macro_library = MacroLibrary()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure G-code executor."""
@@ -200,9 +440,9 @@ class GCodeExecutorNode(MiracleLifecycleNode):
         )
 
         try:
-            lines = request.program_content.strip().split('\n')
+            raw_lines = request.program_content.strip().split('\n')
 
-            # Signature verification
+            # Signature verification (runs before macro expansion on raw text)
             if self._public_key_pem:
                 sig_result = self._gcode_signer.verify_text(
                     request.program_content, self._public_key_pem
@@ -225,6 +465,12 @@ class GCodeExecutorNode(MiracleLifecycleNode):
                     self.get_logger().warn("G-code is unsigned")
                 else:
                     self.get_logger().info("G-code signature verified")
+
+            # Macro expansion: extract definitions, then expand calls
+            after_defs = self._macro_library.parse_macro_definitions(raw_lines)
+            lines: List[str] = []
+            for raw_line in after_defs:
+                lines.extend(self._macro_library.expand_macro_call(raw_line))
 
             total_lines = len(lines)
             start_time = self.get_clock().now()
@@ -369,7 +615,11 @@ class GCodeExecutorNode(MiracleLifecycleNode):
             elif sig_result == SignatureResult.MISSING:
                 warnings.append('G-code is not signed')
 
-        lines = request.program_content.strip().split('\n')
+        raw_lines = request.program_content.strip().split('\n')
+        after_defs = self._macro_library.parse_macro_definitions(raw_lines)
+        lines: List[str] = []
+        for raw_line in after_defs:
+            lines.extend(self._macro_library.expand_macro_call(raw_line))
         for i, line in enumerate(lines):
             stripped = line.strip()
             if not stripped or stripped.startswith('(') or stripped.startswith(';'):

@@ -351,3 +351,352 @@ class ToolLibrary:
                 'last_calibrated_timestamp': cal.last_calibrated_timestamp,
             }
         return summary
+
+
+# ======================================================================
+# Workpiece Material Properties Database
+# ======================================================================
+
+@dataclass
+class MaterialProperties:
+    """Physical and machining properties of a workpiece material."""
+    material_id: str                       # e.g. "6061-T6", "304-SS"
+    name: str
+    category: str                          # aluminum, steel, stainless, titanium, nickel_alloy, plastic, composite
+    hardness_hrc: float                    # Rockwell C (or BHN equivalent)
+    tensile_strength_mpa: float
+    thermal_conductivity_w_mk: float
+    specific_heat_j_kgk: float
+    density_kg_m3: float
+    machinability_rating: float            # 0-1 scale, 1 = easiest
+    recommended_speed_sfm: Tuple[float, float]   # (min, max) surface feet/min
+    recommended_feed_ipt: Tuple[float, float]     # (min, max) inches per tooth
+    taylor_constant_c: float               # Taylor V*T^n = C constant
+    taylor_exponent_n: float               # Taylor exponent
+    specific_cutting_force_n_mm2: float    # Kc1.1
+    chip_formation: str                    # continuous, segmented, discontinuous
+
+
+class MaterialDatabase:
+    """Database of workpiece material properties for cutting parameter selection.
+
+    Ships pre-loaded with 10 common engineering materials and supports
+    user-defined additions, category filtering, and machining parameter
+    recommendations.
+    """
+
+    VALID_CATEGORIES = {
+        'aluminum', 'steel', 'stainless', 'titanium',
+        'nickel_alloy', 'plastic', 'composite',
+    }
+
+    def __init__(self):
+        self._materials: Dict[str, MaterialProperties] = {}
+        self._load_builtin_materials()
+
+    # ------------------------------------------------------------------
+    # Built-in material data
+    # ------------------------------------------------------------------
+
+    def _load_builtin_materials(self):
+        """Pre-load 10 common engineering materials."""
+        builtins = [
+            MaterialProperties(
+                material_id='6061-T6', name='Aluminum 6061-T6',
+                category='aluminum', hardness_hrc=15.0,
+                tensile_strength_mpa=310.0,
+                thermal_conductivity_w_mk=167.0,
+                specific_heat_j_kgk=896.0,
+                density_kg_m3=2710.0,
+                machinability_rating=0.90,
+                recommended_speed_sfm=(800.0, 1500.0),
+                recommended_feed_ipt=(0.003, 0.010),
+                taylor_constant_c=600.0, taylor_exponent_n=0.28,
+                specific_cutting_force_n_mm2=700.0,
+                chip_formation='continuous',
+            ),
+            MaterialProperties(
+                material_id='7075-T6', name='Aluminum 7075-T6',
+                category='aluminum', hardness_hrc=17.0,
+                tensile_strength_mpa=572.0,
+                thermal_conductivity_w_mk=130.0,
+                specific_heat_j_kgk=960.0,
+                density_kg_m3=2810.0,
+                machinability_rating=0.85,
+                recommended_speed_sfm=(600.0, 1200.0),
+                recommended_feed_ipt=(0.003, 0.008),
+                taylor_constant_c=550.0, taylor_exponent_n=0.26,
+                specific_cutting_force_n_mm2=800.0,
+                chip_formation='continuous',
+            ),
+            MaterialProperties(
+                material_id='1018', name='AISI 1018 Low Carbon Steel',
+                category='steel', hardness_hrc=12.0,
+                tensile_strength_mpa=440.0,
+                thermal_conductivity_w_mk=51.9,
+                specific_heat_j_kgk=486.0,
+                density_kg_m3=7870.0,
+                machinability_rating=0.70,
+                recommended_speed_sfm=(300.0, 600.0),
+                recommended_feed_ipt=(0.003, 0.008),
+                taylor_constant_c=350.0, taylor_exponent_n=0.20,
+                specific_cutting_force_n_mm2=1400.0,
+                chip_formation='continuous',
+            ),
+            MaterialProperties(
+                material_id='4140', name='AISI 4140 Alloy Steel',
+                category='steel', hardness_hrc=28.0,
+                tensile_strength_mpa=655.0,
+                thermal_conductivity_w_mk=42.7,
+                specific_heat_j_kgk=473.0,
+                density_kg_m3=7850.0,
+                machinability_rating=0.55,
+                recommended_speed_sfm=(200.0, 450.0),
+                recommended_feed_ipt=(0.002, 0.006),
+                taylor_constant_c=280.0, taylor_exponent_n=0.18,
+                specific_cutting_force_n_mm2=1800.0,
+                chip_formation='continuous',
+            ),
+            MaterialProperties(
+                material_id='D2', name='AISI D2 Tool Steel',
+                category='steel', hardness_hrc=60.0,
+                tensile_strength_mpa=1850.0,
+                thermal_conductivity_w_mk=20.0,
+                specific_heat_j_kgk=460.0,
+                density_kg_m3=7700.0,
+                machinability_rating=0.25,
+                recommended_speed_sfm=(60.0, 150.0),
+                recommended_feed_ipt=(0.001, 0.003),
+                taylor_constant_c=150.0, taylor_exponent_n=0.12,
+                specific_cutting_force_n_mm2=3000.0,
+                chip_formation='segmented',
+            ),
+            MaterialProperties(
+                material_id='304-SS', name='304 Stainless Steel',
+                category='stainless', hardness_hrc=20.0,
+                tensile_strength_mpa=515.0,
+                thermal_conductivity_w_mk=16.2,
+                specific_heat_j_kgk=500.0,
+                density_kg_m3=8000.0,
+                machinability_rating=0.45,
+                recommended_speed_sfm=(150.0, 350.0),
+                recommended_feed_ipt=(0.002, 0.006),
+                taylor_constant_c=220.0, taylor_exponent_n=0.15,
+                specific_cutting_force_n_mm2=2100.0,
+                chip_formation='continuous',
+            ),
+            MaterialProperties(
+                material_id='316-SS', name='316 Stainless Steel',
+                category='stainless', hardness_hrc=22.0,
+                tensile_strength_mpa=580.0,
+                thermal_conductivity_w_mk=14.0,
+                specific_heat_j_kgk=500.0,
+                density_kg_m3=8000.0,
+                machinability_rating=0.40,
+                recommended_speed_sfm=(120.0, 300.0),
+                recommended_feed_ipt=(0.002, 0.005),
+                taylor_constant_c=200.0, taylor_exponent_n=0.14,
+                specific_cutting_force_n_mm2=2200.0,
+                chip_formation='continuous',
+            ),
+            MaterialProperties(
+                material_id='Ti-6Al-4V', name='Titanium 6Al-4V',
+                category='titanium', hardness_hrc=36.0,
+                tensile_strength_mpa=950.0,
+                thermal_conductivity_w_mk=6.7,
+                specific_heat_j_kgk=526.0,
+                density_kg_m3=4430.0,
+                machinability_rating=0.22,
+                recommended_speed_sfm=(50.0, 150.0),
+                recommended_feed_ipt=(0.002, 0.005),
+                taylor_constant_c=120.0, taylor_exponent_n=0.12,
+                specific_cutting_force_n_mm2=2500.0,
+                chip_formation='segmented',
+            ),
+            MaterialProperties(
+                material_id='Inconel-718', name='Inconel 718',
+                category='nickel_alloy', hardness_hrc=40.0,
+                tensile_strength_mpa=1240.0,
+                thermal_conductivity_w_mk=11.4,
+                specific_heat_j_kgk=435.0,
+                density_kg_m3=8190.0,
+                machinability_rating=0.15,
+                recommended_speed_sfm=(30.0, 100.0),
+                recommended_feed_ipt=(0.001, 0.004),
+                taylor_constant_c=90.0, taylor_exponent_n=0.10,
+                specific_cutting_force_n_mm2=3200.0,
+                chip_formation='segmented',
+            ),
+            MaterialProperties(
+                material_id='PEEK', name='PEEK (Polyetheretherketone)',
+                category='plastic', hardness_hrc=5.0,
+                tensile_strength_mpa=100.0,
+                thermal_conductivity_w_mk=0.25,
+                specific_heat_j_kgk=2180.0,
+                density_kg_m3=1310.0,
+                machinability_rating=0.95,
+                recommended_speed_sfm=(500.0, 1000.0),
+                recommended_feed_ipt=(0.004, 0.012),
+                taylor_constant_c=800.0, taylor_exponent_n=0.35,
+                specific_cutting_force_n_mm2=250.0,
+                chip_formation='continuous',
+            ),
+        ]
+        for mat in builtins:
+            self._materials[mat.material_id] = mat
+
+    # ------------------------------------------------------------------
+    # Lookup
+    # ------------------------------------------------------------------
+
+    def get_material(self, material_id: str) -> MaterialProperties:
+        """Look up a material by ID. Raises KeyError if not found."""
+        if material_id not in self._materials:
+            raise KeyError(f"Unknown material: {material_id!r}")
+        return self._materials[material_id]
+
+    def get_materials_by_category(self, category: str) -> List[MaterialProperties]:
+        """Return all materials belonging to *category*."""
+        cat = category.lower()
+        return [m for m in self._materials.values() if m.category == cat]
+
+    # ------------------------------------------------------------------
+    # Machining parameter recommendations
+    # ------------------------------------------------------------------
+
+    def get_recommended_params(self, material_id: str,
+                               tool_diameter_mm: float,
+                               num_flutes: int) -> dict:
+        """Compute recommended RPM, feed, depth, and width for a material/tool pair.
+
+        Parameters
+        ----------
+        material_id : str
+        tool_diameter_mm : float  (must be > 0)
+        num_flutes : int  (must be > 0)
+
+        Returns
+        -------
+        dict with keys: rpm, feed_mmpm, depth_mm, width_mm
+        """
+        if tool_diameter_mm <= 0:
+            raise ValueError("tool_diameter_mm must be > 0")
+        if num_flutes <= 0:
+            raise ValueError("num_flutes must be > 0")
+
+        mat = self.get_material(material_id)
+
+        # Use midpoint of recommended SFM range
+        mid_sfm = (mat.recommended_speed_sfm[0] + mat.recommended_speed_sfm[1]) / 2.0
+        # SFM → m/min: SFM * 0.3048
+        mid_mpm = mid_sfm * 0.3048
+        # RPM = (cutting speed m/min * 1000) / (pi * D_mm)
+        rpm = (mid_mpm * 1000.0) / (math.pi * tool_diameter_mm)
+        rpm = round(rpm)
+
+        # Feed per tooth — midpoint in inches, convert to mm
+        mid_ipt = (mat.recommended_feed_ipt[0] + mat.recommended_feed_ipt[1]) / 2.0
+        fz_mm = mid_ipt * 25.4  # mm/tooth
+        feed_mmpm = round(rpm * num_flutes * fz_mm, 1)
+
+        # Depth of cut: 1x diameter for aluminum/plastic, 0.5x for others
+        if mat.category in ('aluminum', 'plastic'):
+            depth_mm = round(tool_diameter_mm * 1.0, 2)
+        else:
+            depth_mm = round(tool_diameter_mm * 0.5, 2)
+
+        # Width of cut: 50 % of diameter (general guideline)
+        width_mm = round(tool_diameter_mm * 0.5, 2)
+
+        return {
+            'rpm': rpm,
+            'feed_mmpm': feed_mmpm,
+            'depth_mm': depth_mm,
+            'width_mm': width_mm,
+        }
+
+    # ------------------------------------------------------------------
+    # Taylor tool life
+    # ------------------------------------------------------------------
+
+    def get_taylor_life(self, material_id: str,
+                        cutting_speed_mpm: float,
+                        feed_mmrev: float) -> float:
+        """Estimate tool life in minutes using the Taylor equation.
+
+        Uses the extended form: V * T^n = C, solved for T, with a feed
+        correction factor.  A higher feed shortens tool life linearly.
+
+        Returns tool life in minutes (always >= 0).
+        """
+        mat = self.get_material(material_id)
+        if cutting_speed_mpm <= 0 or feed_mmrev <= 0:
+            return 0.0
+
+        # Baseline mid-feed for normalisation (convert midpoint IPT to mm/rev)
+        mid_ipt = (mat.recommended_feed_ipt[0] + mat.recommended_feed_ipt[1]) / 2.0
+        ref_feed = mid_ipt * 25.4  # mm/rev (approximation for single-flute)
+
+        # Feed correction: life scales inversely with feed ratio
+        feed_ratio = feed_mmrev / ref_feed if ref_feed > 0 else 1.0
+
+        # Taylor: T = (C / V) ^ (1/n)
+        n = mat.taylor_exponent_n
+        if n <= 0:
+            return 0.0
+        base_life = (mat.taylor_constant_c / cutting_speed_mpm) ** (1.0 / n)
+
+        # Apply feed correction
+        life = base_life / feed_ratio
+        return max(life, 0.0)
+
+    # ------------------------------------------------------------------
+    # Material comparison
+    # ------------------------------------------------------------------
+
+    def compare_materials(self, id1: str, id2: str) -> dict:
+        """Compare two materials and return relative metrics.
+
+        Returns dict with keys:
+            machinability_ratio  — mat1 / mat2  (>1 means mat1 easier)
+            speed_ratio          — recommended speed mat1 / mat2
+            feed_ratio           — recommended feed mat1 / mat2
+            cutting_force_ratio  — Kc mat1 / mat2  (>1 means mat1 harder to cut)
+        """
+        m1 = self.get_material(id1)
+        m2 = self.get_material(id2)
+
+        def _mid(t: Tuple[float, float]) -> float:
+            return (t[0] + t[1]) / 2.0
+
+        speed_mid1 = _mid(m1.recommended_speed_sfm)
+        speed_mid2 = _mid(m2.recommended_speed_sfm)
+        feed_mid1 = _mid(m1.recommended_feed_ipt)
+        feed_mid2 = _mid(m2.recommended_feed_ipt)
+
+        return {
+            'machinability_ratio': m1.machinability_rating / m2.machinability_rating if m2.machinability_rating else float('inf'),
+            'speed_ratio': speed_mid1 / speed_mid2 if speed_mid2 else float('inf'),
+            'feed_ratio': feed_mid1 / feed_mid2 if feed_mid2 else float('inf'),
+            'cutting_force_ratio': m1.specific_cutting_force_n_mm2 / m2.specific_cutting_force_n_mm2 if m2.specific_cutting_force_n_mm2 else float('inf'),
+        }
+
+    # ------------------------------------------------------------------
+    # Custom materials
+    # ------------------------------------------------------------------
+
+    def add_custom_material(self, props: MaterialProperties) -> None:
+        """Add a user-defined material to the database."""
+        self._materials[props.material_id] = props
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def search_materials(self, query: str) -> List[MaterialProperties]:
+        """Fuzzy search materials by name or ID (case-insensitive substring match)."""
+        q = query.lower()
+        return [
+            m for m in self._materials.values()
+            if q in m.material_id.lower() or q in m.name.lower()
+        ]

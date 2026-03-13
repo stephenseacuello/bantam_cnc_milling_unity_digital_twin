@@ -18,11 +18,8 @@ for mod in (
     sys.modules.setdefault(mod, MagicMock())
 
 # Mock miracle_core and miracle_msgs submodules (NOT top-level).
-# Ensure the top-level packages exist first, then force-set attributes.
-if 'miracle_core' not in sys.modules:
-    sys.modules['miracle_core'] = MagicMock()
-if 'miracle_msgs' not in sys.modules:
-    sys.modules['miracle_msgs'] = MagicMock()
+# Never replace top-level miracle_core — it's eagerly imported as a real package.
+sys.modules.setdefault('miracle_msgs', MagicMock())
 
 import miracle_core  # noqa: E402
 import miracle_msgs  # noqa: E402

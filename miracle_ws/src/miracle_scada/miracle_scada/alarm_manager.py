@@ -8,7 +8,7 @@ notification, and emergency stop.
 Maintains alarm history with ISA-18.2 compliance.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
@@ -30,12 +30,16 @@ class AlarmState(Enum):
     SUPPRESSED = 'SUPPRESSED'
 
 
-class EscalationAction:
-    """Constants for escalation action types."""
+class EscalationActionType:
+    """Constants for escalation action types (legacy)."""
     PRIORITY_BOOST = 'PRIORITY_BOOST'
     FORCED_ACK_REQUIRED = 'FORCED_ACK_REQUIRED'
     SUPERVISOR_NOTIFY = 'SUPERVISOR_NOTIFY'
     EMERGENCY_STOP = 'EMERGENCY_STOP'
+
+
+# Backwards-compatible alias
+EscalationAction = EscalationActionType
 
 
 @dataclass
@@ -45,6 +49,7 @@ class Alarm:
     source: str
     severity: float
     message: str
+    alarm_type: str = ''
     state: AlarmState = AlarmState.UNACKNOWLEDGED
     timestamp: float = 0.0
     acknowledged_by: Optional[str] = None
@@ -56,6 +61,458 @@ class Alarm:
 
 # Minimum interval between successive escalations for a single alarm (seconds).
 MIN_ESCALATION_INTERVAL = 30.0
+
+
+# ---------------------------------------------------------------------------
+# Configurable alarm escalation policy engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EscalationLevel:
+    """Defines one level in an escalation policy.
+
+    Attributes:
+        level: Numeric level (1=initial, 2=supervisor, 3=manager, 4=emergency).
+        delay_sec: Seconds after alarm raised before escalating to this level.
+        notify_roles: Roles to notify (e.g. ["operator", "supervisor"]).
+        action: Action to take (e.g. "notify", "page", "auto_stop", "lockout").
+        message_template: Template string for the notification message.
+            May contain ``{alarm_id}``, ``{source}``, ``{severity}``,
+            ``{elapsed}``, ``{message}`` placeholders.
+    """
+    level: int
+    delay_sec: float
+    notify_roles: List[str] = field(default_factory=list)
+    action: str = 'notify'
+    message_template: str = 'Alarm {alarm_id} escalated to level {level}'
+
+
+@dataclass
+class EscalationPolicy:
+    """Configurable escalation policy for a category of alarms.
+
+    Attributes:
+        policy_id: Unique identifier for this policy.
+        name: Human-readable name.
+        alarm_types: List of alarm type strings this policy applies to.
+        levels: Ordered list of escalation levels.
+        auto_acknowledge_after_sec: Auto-ack timeout in seconds (0 = never).
+        suppress_duplicate_window_sec: Window in seconds to suppress duplicate
+            alarms of the same type from the same source.
+    """
+    policy_id: str
+    name: str
+    alarm_types: List[str] = field(default_factory=list)
+    levels: List[EscalationLevel] = field(default_factory=list)
+    auto_acknowledge_after_sec: float = 0.0
+    suppress_duplicate_window_sec: float = 60.0
+
+
+@dataclass
+class EscalationActionResult:
+    """Result of processing an alarm through the escalation engine.
+
+    Attributes:
+        action_type: One of NOTIFY, PAGE, AUTO_STOP, LOCKOUT, SUPPRESS,
+            ACKNOWLEDGE.
+        alarm_id: The alarm identifier.
+        level: Current escalation level.
+        notify_roles: Roles that should be notified.
+        message: Rendered notification message.
+    """
+    action_type: str
+    alarm_id: str
+    level: int = 1
+    notify_roles: List[str] = field(default_factory=list)
+    message: str = ''
+
+
+class EscalationEngine:
+    """Policy-driven alarm escalation engine.
+
+    Manages configurable escalation policies, duplicate suppression,
+    time-based escalation, acknowledgment, and auto-acknowledge.
+    """
+
+    # Action type constants
+    NOTIFY = 'NOTIFY'
+    PAGE = 'PAGE'
+    AUTO_STOP = 'AUTO_STOP'
+    LOCKOUT = 'LOCKOUT'
+    SUPPRESS = 'SUPPRESS'
+    ACKNOWLEDGE = 'ACKNOWLEDGE'
+
+    # Internal mapping from policy action strings to action type constants
+    _ACTION_MAP = {
+        'notify': 'NOTIFY',
+        'page': 'PAGE',
+        'auto_stop': 'AUTO_STOP',
+        'lockout': 'LOCKOUT',
+    }
+
+    def __init__(self) -> None:
+        self._policies: Dict[str, EscalationPolicy] = {}
+        # alarm_id -> {alarm, policy_id, first_seen, current_level,
+        #              level_entered_at, acknowledged, ack_operator, history}
+        self._active: Dict[str, Dict[str, Any]] = {}
+        # (alarm_type, source) -> last_seen_time  for duplicate suppression
+        self._recent_alarms: Dict[Tuple[str, str], float] = {}
+
+        # Register default policies
+        self._register_defaults()
+
+    # -- default policies ----------------------------------------------------
+
+    def _register_defaults(self) -> None:
+        """Register built-in policies for common alarm categories."""
+        defaults = [
+            EscalationPolicy(
+                policy_id='default_safety',
+                name='Safety Alarm Policy',
+                alarm_types=['SAFETY'],
+                levels=[
+                    EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'SAFETY alarm {alarm_id}: {message}'),
+                    EscalationLevel(2, 60.0, ['operator', 'supervisor'], 'page',
+                                    'SAFETY alarm {alarm_id} unacked for {elapsed:.0f}s'),
+                    EscalationLevel(3, 180.0, ['operator', 'supervisor', 'plant_manager'],
+                                    'auto_stop',
+                                    'SAFETY alarm {alarm_id} - auto stop triggered'),
+                    EscalationLevel(4, 300.0, ['operator', 'supervisor', 'plant_manager',
+                                               'emergency_team'], 'lockout',
+                                    'EMERGENCY: SAFETY alarm {alarm_id} - lockout'),
+                ],
+                auto_acknowledge_after_sec=0.0,
+                suppress_duplicate_window_sec=30.0,
+            ),
+            EscalationPolicy(
+                policy_id='default_quality',
+                name='Quality Alarm Policy',
+                alarm_types=['QUALITY'],
+                levels=[
+                    EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'Quality alarm {alarm_id}: {message}'),
+                    EscalationLevel(2, 120.0, ['operator', 'supervisor'], 'notify',
+                                    'Quality alarm {alarm_id} unacked for {elapsed:.0f}s'),
+                    EscalationLevel(3, 300.0, ['operator', 'supervisor', 'plant_manager'],
+                                    'page',
+                                    'Quality alarm {alarm_id} - manager paged'),
+                ],
+                auto_acknowledge_after_sec=0.0,
+                suppress_duplicate_window_sec=60.0,
+            ),
+            EscalationPolicy(
+                policy_id='default_tool',
+                name='Tool Alarm Policy',
+                alarm_types=['TOOL'],
+                levels=[
+                    EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'Tool alarm {alarm_id}: {message}'),
+                    EscalationLevel(2, 90.0, ['operator', 'supervisor'], 'page',
+                                    'Tool alarm {alarm_id} unacked for {elapsed:.0f}s'),
+                    EscalationLevel(3, 240.0, ['operator', 'supervisor', 'plant_manager'],
+                                    'auto_stop',
+                                    'Tool alarm {alarm_id} - auto stop'),
+                ],
+                auto_acknowledge_after_sec=0.0,
+                suppress_duplicate_window_sec=60.0,
+            ),
+            EscalationPolicy(
+                policy_id='default_thermal',
+                name='Thermal Alarm Policy',
+                alarm_types=['THERMAL'],
+                levels=[
+                    EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'Thermal alarm {alarm_id}: {message}'),
+                    EscalationLevel(2, 60.0, ['operator', 'supervisor'], 'page',
+                                    'Thermal alarm {alarm_id} unacked for {elapsed:.0f}s'),
+                    EscalationLevel(3, 180.0, ['operator', 'supervisor', 'plant_manager'],
+                                    'auto_stop',
+                                    'Thermal alarm {alarm_id} - auto stop'),
+                    EscalationLevel(4, 300.0, ['operator', 'supervisor', 'plant_manager',
+                                               'emergency_team'], 'lockout',
+                                    'EMERGENCY: Thermal alarm {alarm_id} - lockout'),
+                ],
+                auto_acknowledge_after_sec=0.0,
+                suppress_duplicate_window_sec=45.0,
+            ),
+            EscalationPolicy(
+                policy_id='default_communication',
+                name='Communication Alarm Policy',
+                alarm_types=['COMMUNICATION'],
+                levels=[
+                    EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'Comm alarm {alarm_id}: {message}'),
+                    EscalationLevel(2, 120.0, ['operator', 'supervisor'], 'notify',
+                                    'Comm alarm {alarm_id} unacked for {elapsed:.0f}s'),
+                ],
+                auto_acknowledge_after_sec=600.0,
+                suppress_duplicate_window_sec=120.0,
+            ),
+            EscalationPolicy(
+                policy_id='default_fallback',
+                name='Default Fallback Policy',
+                alarm_types=['__DEFAULT__'],
+                levels=[
+                    EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'Alarm {alarm_id}: {message}'),
+                    EscalationLevel(2, 120.0, ['operator', 'supervisor'], 'notify',
+                                    'Alarm {alarm_id} unacked for {elapsed:.0f}s'),
+                    EscalationLevel(3, 300.0, ['operator', 'supervisor', 'plant_manager'],
+                                    'page',
+                                    'Alarm {alarm_id} - manager paged'),
+                ],
+                auto_acknowledge_after_sec=0.0,
+                suppress_duplicate_window_sec=60.0,
+            ),
+        ]
+        for policy in defaults:
+            self._policies[policy.policy_id] = policy
+
+    # -- public API ----------------------------------------------------------
+
+    def register_policy(self, policy: EscalationPolicy) -> None:
+        """Register or replace an escalation policy."""
+        self._policies[policy.policy_id] = policy
+
+    def process_alarm(self, alarm: Alarm) -> EscalationActionResult:
+        """Process a new alarm through the escalation engine.
+
+        Returns an ``EscalationActionResult`` indicating the action to take.
+        Duplicate alarms (same type + source within the suppress window) are
+        suppressed.
+        """
+        policy = self._find_policy(alarm.alarm_type)
+
+        # -- duplicate suppression -------------------------------------------
+        dup_key = (alarm.alarm_type, alarm.source)
+        suppress_window = policy.suppress_duplicate_window_sec
+        last_seen = self._recent_alarms.get(dup_key)
+        if last_seen is not None and (alarm.timestamp - last_seen) < suppress_window:
+            return EscalationActionResult(
+                action_type=self.SUPPRESS,
+                alarm_id=alarm.alarm_id,
+                level=0,
+                notify_roles=[],
+                message=f'Duplicate alarm suppressed (within {suppress_window}s window)',
+            )
+
+        # Record this alarm occurrence
+        self._recent_alarms[dup_key] = alarm.timestamp
+
+        # -- determine initial escalation level ------------------------------
+        initial_level = policy.levels[0] if policy.levels else None
+        action_type = self._ACTION_MAP.get(
+            initial_level.action, self.NOTIFY
+        ) if initial_level else self.NOTIFY
+        notify_roles = list(initial_level.notify_roles) if initial_level else ['operator']
+        message = self._render_message(
+            initial_level.message_template if initial_level else 'Alarm {alarm_id}',
+            alarm, 0.0, initial_level.level if initial_level else 1,
+        )
+
+        # Track active alarm
+        self._active[alarm.alarm_id] = {
+            'alarm': alarm,
+            'policy_id': policy.policy_id,
+            'first_seen': alarm.timestamp,
+            'current_level': initial_level.level if initial_level else 1,
+            'level_entered_at': alarm.timestamp,
+            'acknowledged': False,
+            'ack_operator': None,
+            'history': [
+                (initial_level.level if initial_level else 1,
+                 alarm.timestamp,
+                 action_type),
+            ],
+        }
+
+        return EscalationActionResult(
+            action_type=action_type,
+            alarm_id=alarm.alarm_id,
+            level=initial_level.level if initial_level else 1,
+            notify_roles=notify_roles,
+            message=message,
+        )
+
+    def get_active_escalations(self) -> List[Tuple[str, int, float, Optional[float]]]:
+        """Return active (non-acknowledged) escalations.
+
+        Returns a list of tuples:
+            (alarm_id, current_level, time_at_level, next_escalation_in)
+
+        ``next_escalation_in`` is ``None`` if the alarm is at the highest
+        configured level.
+        """
+        result: List[Tuple[str, int, float, Optional[float]]] = []
+        for alarm_id, info in self._active.items():
+            if info['acknowledged']:
+                continue
+            policy = self._policies.get(info['policy_id'])
+            if policy is None:
+                continue
+
+            current_level = info['current_level']
+            time_at_level = info['alarm'].timestamp  # will be updated by caller
+            level_entered = info['level_entered_at']
+
+            # Find next level
+            next_level_def = None
+            for ldef in sorted(policy.levels, key=lambda l: l.level):
+                if ldef.level > current_level:
+                    next_level_def = ldef
+                    break
+
+            if next_level_def is not None:
+                time_since_alarm = 0.0  # caller needs current time
+                next_escalation_in = max(
+                    0.0,
+                    next_level_def.delay_sec - (level_entered - info['first_seen']),
+                )
+            else:
+                next_escalation_in = None
+
+            result.append((
+                alarm_id,
+                current_level,
+                level_entered,
+                next_escalation_in,
+            ))
+        return result
+
+    def acknowledge_alarm(self, alarm_id: str, operator_id: str) -> bool:
+        """Acknowledge an alarm, stopping further escalation.
+
+        Returns True if the alarm existed and was not already acknowledged.
+        """
+        info = self._active.get(alarm_id)
+        if info is None or info['acknowledged']:
+            return False
+        info['acknowledged'] = True
+        info['ack_operator'] = operator_id
+        info['history'].append((
+            info['current_level'],
+            info['alarm'].timestamp,  # ideally current_time
+            self.ACKNOWLEDGE,
+        ))
+        return True
+
+    def get_escalation_history(
+        self, alarm_id: str,
+    ) -> List[Tuple[int, float, str]]:
+        """Return escalation history for an alarm.
+
+        Returns list of (level, timestamp, action_taken).
+        """
+        info = self._active.get(alarm_id)
+        if info is None:
+            return []
+        return list(info['history'])
+
+    def update_escalation_timers(
+        self, current_time: float,
+    ) -> List[EscalationActionResult]:
+        """Check all active alarms and escalate as needed.
+
+        Should be called periodically. Returns a list of new escalation
+        actions for alarms that have crossed a level threshold.
+        Also handles auto-acknowledge.
+        """
+        actions: List[EscalationActionResult] = []
+
+        for alarm_id, info in list(self._active.items()):
+            if info['acknowledged']:
+                continue
+
+            alarm = info['alarm']
+            policy = self._policies.get(info['policy_id'])
+            if policy is None:
+                continue
+
+            elapsed = current_time - info['first_seen']
+
+            # -- auto-acknowledge check --------------------------------------
+            if (policy.auto_acknowledge_after_sec > 0
+                    and elapsed >= policy.auto_acknowledge_after_sec):
+                info['acknowledged'] = True
+                info['ack_operator'] = '__auto__'
+                action = EscalationActionResult(
+                    action_type=self.ACKNOWLEDGE,
+                    alarm_id=alarm_id,
+                    level=info['current_level'],
+                    notify_roles=[],
+                    message=f'Auto-acknowledged after {policy.auto_acknowledge_after_sec}s',
+                )
+                info['history'].append((
+                    info['current_level'], current_time, self.ACKNOWLEDGE,
+                ))
+                actions.append(action)
+                continue
+
+            # -- level escalation --------------------------------------------
+            current_level = info['current_level']
+            sorted_levels = sorted(policy.levels, key=lambda l: l.level)
+
+            for ldef in sorted_levels:
+                if ldef.level <= current_level:
+                    continue
+                if elapsed >= ldef.delay_sec:
+                    # Escalate to this level
+                    info['current_level'] = ldef.level
+                    info['level_entered_at'] = current_time
+                    action_type = self._ACTION_MAP.get(ldef.action, self.NOTIFY)
+                    message = self._render_message(
+                        ldef.message_template, alarm, elapsed, ldef.level,
+                    )
+                    action = EscalationActionResult(
+                        action_type=action_type,
+                        alarm_id=alarm_id,
+                        level=ldef.level,
+                        notify_roles=list(ldef.notify_roles),
+                        message=message,
+                    )
+                    info['history'].append((ldef.level, current_time, action_type))
+                    actions.append(action)
+                    # Don't break -- if multiple levels elapsed, apply all
+                else:
+                    break  # sorted, so remaining are higher delay
+
+        return actions
+
+    # -- helpers -------------------------------------------------------------
+
+    def _find_policy(self, alarm_type: str) -> EscalationPolicy:
+        """Find the best-matching policy for an alarm type."""
+        for policy in self._policies.values():
+            if alarm_type in policy.alarm_types:
+                return policy
+        # Fallback
+        for policy in self._policies.values():
+            if '__DEFAULT__' in policy.alarm_types:
+                return policy
+        # Last resort: return a minimal policy
+        return EscalationPolicy(
+            policy_id='_auto_fallback',
+            name='Auto Fallback',
+            alarm_types=[alarm_type],
+            levels=[EscalationLevel(1, 0.0, ['operator'], 'notify',
+                                    'Alarm {alarm_id}: {message}')],
+        )
+
+    def _render_message(self, template: str, alarm: Alarm,
+                        elapsed: float, level: int) -> str:
+        """Render a message template with alarm context."""
+        try:
+            return template.format(
+                alarm_id=alarm.alarm_id,
+                source=alarm.source,
+                severity=alarm.severity,
+                elapsed=elapsed,
+                message=alarm.message,
+                level=level,
+            )
+        except (KeyError, IndexError, ValueError):
+            return template
 
 
 class AlarmManagerNode(MiracleLifecycleNode):
@@ -93,6 +550,7 @@ class AlarmManagerNode(MiracleLifecycleNode):
         self._history_size: int = 10000
         self._correlated_sub = None
         self._correlated_suppression: set = set()
+        self._escalation_engine = EscalationEngine()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure alarm manager."""
@@ -182,10 +640,19 @@ class AlarmManagerNode(MiracleLifecycleNode):
             source=msg.machine_id,
             severity=msg.severity,
             message=f"{msg.anomaly_type}: {msg.recommended_action}",
+            alarm_type=getattr(msg, 'anomaly_type', ''),
             timestamp=msg.timestamp.sec + msg.timestamp.nanosec * 1e-9,
         )
 
+        # Run alarm through escalation engine
+        esc_result = self._escalation_engine.process_alarm(alarm)
+
         with self._alarms_lock:
+            if esc_result.action_type == EscalationEngine.SUPPRESS:
+                self.get_logger().debug(
+                    f"Alarm suppressed (duplicate): [{alarm_id}] {alarm.message}"
+                )
+                return
             if len(self._active_alarms) < self._max_alarms:
                 self._active_alarms[alarm_id] = alarm
                 self.get_logger().info(

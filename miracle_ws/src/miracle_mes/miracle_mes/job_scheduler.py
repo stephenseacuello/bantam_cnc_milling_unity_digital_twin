@@ -12,6 +12,7 @@ automatically pauses or reassigns jobs on affected machines.
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import IntEnum
+import math
 import threading
 import time
 import uuid
@@ -58,6 +59,400 @@ class Job:
     material_batch: str = field(compare=False, default='')
     part_serial: str = field(compare=False, default='')
     tool_id: str = field(compare=False, default='')
+    due_date: float = field(compare=False, default=0.0)  # unix timestamp, 0 = no deadline
+    fixture_type: str = field(compare=False, default='')
+    required_tools: List[str] = field(compare=False, default_factory=list)
+    estimated_duration_sec: float = field(compare=False, default=3600.0)
+    material_status: str = field(compare=False, default='LOADED')  # LOADED, QUEUED, NOT_AVAILABLE
+    compatible_machines: List[str] = field(compare=False, default_factory=list)
+
+
+@dataclass
+class JobPriority:
+    """Computed priority score for intelligent queue optimization."""
+    base_priority: int  # 1=highest (RUSH), maps from Priority enum
+    due_date_urgency: float  # 0-1, exponential as deadline approaches
+    setup_affinity: float  # 0-1, how well job matches current setup
+    tool_availability: float  # 0-1, based on RUL of required tools
+    material_readiness: float  # 0-1, is material loaded?
+    machine_suitability: float  # 0-1, best machine for this job
+    composite_score: float  # weighted sum (higher = schedule sooner)
+
+
+class JobQueueOptimizer:
+    """Intelligent job queue priority optimizer.
+
+    Computes composite priority scores considering urgency, setup affinity,
+    tool availability, material readiness, and machine suitability.  Groups
+    jobs with the same fixture/tooling to minimise setup changes.
+    """
+
+    def __init__(
+        self,
+        urgency_weight: float = 0.30,
+        setup_weight: float = 0.25,
+        tool_weight: float = 0.20,
+        material_weight: float = 0.15,
+        machine_weight: float = 0.10,
+    ) -> None:
+        self.urgency_weight = urgency_weight
+        self.setup_weight = setup_weight
+        self.tool_weight = tool_weight
+        self.material_weight = material_weight
+        self.machine_weight = machine_weight
+
+    # ------------------------------------------------------------------
+    # Priority computation
+    # ------------------------------------------------------------------
+
+    def compute_priority(
+        self,
+        job: 'Job',
+        current_setup: Dict[str, Any],
+        tool_states: Dict[str, float],
+        current_time: float,
+    ) -> JobPriority:
+        """Compute a composite priority for a single job.
+
+        Args:
+            job: The job to evaluate.
+            current_setup: Dict with keys like 'fixture_type', 'tooling',
+                           'machine_id' describing the current machine setup.
+            tool_states: Mapping of tool_id -> remaining useful life (minutes).
+            current_time: Current unix timestamp.
+
+        Returns:
+            A JobPriority with all factor scores and the composite.
+        """
+        base_priority = max(1, job.priority + 1)  # Priority enum 0-3 -> 1-4
+
+        # --- Due-date urgency (exponential as deadline approaches) ---
+        due_date_urgency = self._compute_due_date_urgency(job, current_time)
+
+        # --- Setup affinity ---
+        setup_affinity = self._compute_setup_affinity(job, current_setup)
+
+        # --- Tool availability ---
+        tool_availability = self._compute_tool_availability(job, tool_states)
+
+        # --- Material readiness ---
+        material_readiness = self._compute_material_readiness(job)
+
+        # --- Machine suitability ---
+        machine_suitability = self._compute_machine_suitability(job, current_setup)
+
+        # --- Composite score (higher = schedule sooner) ---
+        # Base priority contribution: RUSH(1)->1.0, HIGH(2)->0.75, NORMAL(3)->0.5, LOW(4)->0.25
+        base_score = max(0.0, 1.0 - (base_priority - 1) * 0.25)
+
+        composite_score = (
+            base_score * 0.5  # base priority always has significant weight
+            + due_date_urgency * self.urgency_weight
+            + setup_affinity * self.setup_weight
+            + tool_availability * self.tool_weight
+            + material_readiness * self.material_weight
+            + machine_suitability * self.machine_weight
+        )
+
+        return JobPriority(
+            base_priority=base_priority,
+            due_date_urgency=due_date_urgency,
+            setup_affinity=setup_affinity,
+            tool_availability=tool_availability,
+            material_readiness=material_readiness,
+            machine_suitability=machine_suitability,
+            composite_score=composite_score,
+        )
+
+    def _compute_due_date_urgency(self, job: 'Job', current_time: float) -> float:
+        """Exponential urgency as deadline approaches. Overdue -> 1.0."""
+        if job.due_date <= 0:
+            return 0.0  # no deadline
+        time_remaining = job.due_date - current_time
+        if time_remaining <= 0:
+            return 1.0  # overdue
+        # Exponential decay: urgency increases as deadline nears
+        # At 24h out ~ 0.0, at 1h out ~ 0.63, at 0h -> 1.0
+        hours_remaining = time_remaining / 3600.0
+        return min(1.0, 1.0 - math.exp(-1.0 / max(hours_remaining, 0.001)))
+
+    def _compute_setup_affinity(
+        self, job: 'Job', current_setup: Dict[str, Any],
+    ) -> float:
+        """1.0 if same fixture/tooling, decreasing with setup changes needed."""
+        if not current_setup:
+            return 0.5  # neutral when no setup info
+        score = 0.0
+        checks = 0
+
+        # Fixture match
+        current_fixture = current_setup.get('fixture_type', '')
+        if current_fixture and job.fixture_type:
+            checks += 1
+            if job.fixture_type == current_fixture:
+                score += 1.0
+            else:
+                score += 0.0
+
+        # Tooling overlap
+        current_tools = set(current_setup.get('tooling', []))
+        if current_tools and job.required_tools:
+            checks += 1
+            required = set(job.required_tools)
+            overlap = len(current_tools & required) / max(len(required), 1)
+            score += overlap
+
+        if checks == 0:
+            return 0.5
+        return score / checks
+
+    def _compute_tool_availability(
+        self, job: 'Job', tool_states: Dict[str, float],
+    ) -> float:
+        """Based on RUL of required tools.  Low RUL -> low score."""
+        if not job.required_tools:
+            return 1.0  # no specific tools needed
+        if not tool_states:
+            return 0.5  # unknown state
+
+        scores: List[float] = []
+        for tool_id in job.required_tools:
+            rul = tool_states.get(tool_id)
+            if rul is None:
+                scores.append(0.5)  # unknown
+            elif rul <= 0:
+                scores.append(0.0)  # tool dead
+            elif rul >= 60:
+                scores.append(1.0)  # plenty of life
+            else:
+                scores.append(rul / 60.0)  # linear scale 0-60 min
+        return sum(scores) / len(scores)
+
+    def _compute_material_readiness(self, job: 'Job') -> float:
+        """1.0 if loaded, 0.5 if queued, 0.0 if not available."""
+        status = getattr(job, 'material_status', 'LOADED')
+        mapping = {'LOADED': 1.0, 'QUEUED': 0.5, 'NOT_AVAILABLE': 0.0}
+        return mapping.get(status, 0.0)
+
+    def _compute_machine_suitability(
+        self, job: 'Job', current_setup: Dict[str, Any],
+    ) -> float:
+        """1.0 if the current machine is in the job's compatible list."""
+        if not job.compatible_machines:
+            return 1.0  # no preference
+        machine_id = current_setup.get('machine_id', '')
+        if not machine_id:
+            return 0.5
+        return 1.0 if machine_id in job.compatible_machines else 0.3
+
+    # ------------------------------------------------------------------
+    # Queue optimization
+    # ------------------------------------------------------------------
+
+    def optimize_queue(
+        self,
+        jobs: List['Job'],
+        current_setup: Dict[str, Any],
+        tool_states: Dict[str, float],
+        current_time: float,
+    ) -> List['Job']:
+        """Reorder jobs by composite priority with setup batching.
+
+        Args:
+            jobs: Unordered list of queued jobs.
+            current_setup: Current machine setup context.
+            tool_states: tool_id -> RUL mapping.
+            current_time: Unix timestamp.
+
+        Returns:
+            Reordered list (highest priority first).
+        """
+        if not jobs:
+            return []
+
+        # Compute priorities
+        scored: List[Tuple[float, int, 'Job', JobPriority]] = []
+        for idx, job in enumerate(jobs):
+            jp = self.compute_priority(job, current_setup, tool_states, current_time)
+            # Negate composite so highest score sorts first; idx for stability
+            scored.append((-jp.composite_score, idx, job, jp))
+
+        scored.sort()
+
+        # --- Setup batching ---
+        # Group jobs with the same fixture together, keeping priority order
+        # within each group, then interleave groups starting with the one
+        # matching the current setup.
+        fixture_groups: Dict[str, List[Tuple[float, int, 'Job', JobPriority]]] = {}
+        no_fixture: List[Tuple[float, int, 'Job', JobPriority]] = []
+        for entry in scored:
+            fixture = entry[2].fixture_type
+            if fixture:
+                fixture_groups.setdefault(fixture, []).append(entry)
+            else:
+                no_fixture.append(entry)
+
+        result: List['Job'] = []
+        current_fixture = current_setup.get('fixture_type', '')
+
+        # Start with current fixture group
+        if current_fixture and current_fixture in fixture_groups:
+            for entry in fixture_groups.pop(current_fixture):
+                result.append(entry[2])
+
+        # Then remaining fixture groups in priority order
+        remaining_groups = sorted(
+            fixture_groups.values(),
+            key=lambda g: g[0][0],  # sort by best score in group
+        )
+        for group in remaining_groups:
+            for entry in group:
+                result.append(entry[2])
+
+        # Finally jobs with no fixture preference
+        for entry in no_fixture:
+            result.append(entry[2])
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Completion time estimation
+    # ------------------------------------------------------------------
+
+    def estimate_completion_times(
+        self,
+        ordered_jobs: List['Job'],
+        current_time: float,
+    ) -> Dict[str, float]:
+        """Estimate completion timestamps for an ordered job list.
+
+        Args:
+            ordered_jobs: Jobs in execution order.
+            current_time: Start time (unix timestamp).
+
+        Returns:
+            Mapping of job_id -> estimated completion timestamp.
+        """
+        estimates: Dict[str, float] = {}
+        clock = current_time
+        prev_fixture = ''
+        for job in ordered_jobs:
+            # Setup change penalty: 15 minutes if fixture changes
+            if job.fixture_type and prev_fixture and job.fixture_type != prev_fixture:
+                clock += 15 * 60  # 15 min setup change
+            clock += job.estimated_duration_sec
+            estimates[job.job_id] = clock
+            if job.fixture_type:
+                prev_fixture = job.fixture_type
+        return estimates
+
+    # ------------------------------------------------------------------
+    # Bottleneck identification
+    # ------------------------------------------------------------------
+
+    def identify_bottlenecks(
+        self,
+        jobs: List['Job'],
+        machines: List[str],
+    ) -> List[Tuple[str, int, float]]:
+        """Identify resource bottlenecks (machines with high contention).
+
+        Args:
+            jobs: All queued/active jobs.
+            machines: Available machine IDs.
+
+        Returns:
+            List of (resource, contention_count, delay_impact_sec) sorted
+            by delay impact descending.
+        """
+        if not jobs or not machines:
+            return []
+
+        # Count how many jobs target each machine
+        machine_contention: Dict[str, int] = {m: 0 for m in machines}
+        machine_load: Dict[str, float] = {m: 0.0 for m in machines}
+
+        for job in jobs:
+            targets = job.compatible_machines if job.compatible_machines else machines
+            for m in targets:
+                if m in machine_contention:
+                    machine_contention[m] += 1
+                    machine_load[m] += job.estimated_duration_sec
+
+        # Also track tool contention
+        tool_demand: Dict[str, int] = {}
+        tool_load: Dict[str, float] = {}
+        for job in jobs:
+            for tool_id in job.required_tools:
+                tool_demand[tool_id] = tool_demand.get(tool_id, 0) + 1
+                tool_load[tool_id] = tool_load.get(tool_id, 0.0) + job.estimated_duration_sec
+
+        bottlenecks: List[Tuple[str, int, float]] = []
+
+        for m in machines:
+            if machine_contention[m] > 1:
+                # Delay impact = total load beyond first job
+                delay = max(0.0, machine_load[m] - (
+                    machine_load[m] / machine_contention[m]
+                ))
+                bottlenecks.append((m, machine_contention[m], delay))
+
+        for tool_id, count in tool_demand.items():
+            if count > 1:
+                delay = max(0.0, tool_load[tool_id] - (
+                    tool_load[tool_id] / count
+                ))
+                bottlenecks.append((tool_id, count, delay))
+
+        bottlenecks.sort(key=lambda x: x[2], reverse=True)
+        return bottlenecks
+
+    # ------------------------------------------------------------------
+    # Parallel job suggestion
+    # ------------------------------------------------------------------
+
+    def suggest_parallel_jobs(
+        self,
+        jobs: List['Job'],
+        available_machines: List[str],
+    ) -> List[Tuple[str, str]]:
+        """Suggest (machine_id, job_id) assignments for parallel execution.
+
+        Assigns the highest-priority unassigned job to each available
+        machine, respecting machine compatibility constraints.
+
+        Args:
+            jobs: Candidate jobs (should be priority-sorted).
+            available_machines: Machines currently idle.
+
+        Returns:
+            List of (machine_id, job_id) tuples.
+        """
+        if not jobs or not available_machines:
+            return []
+
+        assignments: List[Tuple[str, str]] = []
+        assigned_jobs: Set[str] = set()
+        used_machines: Set[str] = set()
+
+        for job in jobs:
+            if job.job_id in assigned_jobs:
+                continue
+            compatible = (
+                [m for m in available_machines
+                 if m not in used_machines and m in job.compatible_machines]
+                if job.compatible_machines
+                else [m for m in available_machines if m not in used_machines]
+            )
+            if compatible:
+                machine = compatible[0]
+                assignments.append((machine, job.job_id))
+                assigned_jobs.add(job.job_id)
+                used_machines.add(machine)
+            if len(used_machines) >= len(available_machines):
+                break
+
+        return assignments
 
 
 @dataclass
@@ -425,6 +820,9 @@ class JobSchedulerNode(MiracleLifecycleNode):
         # Predictive maintenance scheduler
         self.maintenance_scheduler = MaintenanceScheduler()
         self.maintenance_scheduler._node = self
+
+        # Intelligent queue optimizer
+        self._queue_optimizer = JobQueueOptimizer()
 
     def _do_configure(self) -> TransitionCallbackReturn:
         """Configure job scheduler."""
@@ -883,6 +1281,48 @@ class JobSchedulerNode(MiracleLifecycleNode):
                 metadata=meta,
             )
         return True
+
+    # ------------------------------------------------------------------
+    # Queue re-optimization
+    # ------------------------------------------------------------------
+
+    def _reoptimize_queue(self) -> None:
+        """Re-optimize the job queue using the intelligent optimizer.
+
+        Called when new jobs arrive, tool states change, or conditions
+        change that might affect scheduling priorities.
+        """
+        with self._queue_lock:
+            if not self._job_queue:
+                return
+
+            # Build current setup context from machine states
+            current_setup: Dict[str, Any] = {}
+            for mid, state in self._machine_states.items():
+                if getattr(state, 'status', '') in ('IDLE', 'READY'):
+                    current_setup['machine_id'] = mid
+                    current_setup['fixture_type'] = getattr(state, 'fixture_type', '')
+                    current_setup['tooling'] = getattr(state, 'current_tools', [])
+                    break
+
+            # Build tool state mapping from maintenance scheduler data
+            tool_states: Dict[str, float] = {}
+            for _machine_id, tools in self.maintenance_scheduler._last_rul.items():
+                for tool_id, rul in tools.items():
+                    tool_states[tool_id] = rul
+
+            current_time = self.get_clock().now().nanoseconds / 1e9
+
+            # Extract all queued jobs
+            all_jobs = list(self._job_queue)
+            self._job_queue.clear()
+
+            # Optimize and rebuild queue
+            optimized = self._queue_optimizer.optimize_queue(
+                all_jobs, current_setup, tool_states, current_time,
+            )
+
+            self._job_queue = optimized
 
     # ------------------------------------------------------------------
     # Predictive maintenance trigger checks

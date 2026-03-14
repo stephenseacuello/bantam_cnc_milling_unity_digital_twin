@@ -1184,3 +1184,123 @@
 .force-stats-overlay .stats-stddev {
     color: rgb(180, 200, 230);
 }
+
+/* ── Utilization Heatmap ─────────────────────────────────────── */
+
+.heatmap-container {
+    margin-top: 8px;
+    padding: 6px;
+    background-color: rgba(25, 28, 45, 0.8);
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: rgba(80, 140, 220, 0.3);
+}
+
+.heatmap-row {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 3px;
+    min-height: 22px;
+}
+
+.heatmap-machine-label {
+    font-size: 10px;
+    color: rgb(180, 190, 210);
+    -unity-font-style: bold;
+    min-width: 48px;
+    margin-right: 6px;
+}
+
+.heatmap-cells {
+    flex-direction: row;
+    flex-grow: 1;
+    height: 18px;
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.heatmap-cell {
+    flex-grow: 1;
+    min-width: 6px;
+    height: 18px;
+    border-right-width: 1px;
+    border-right-color: rgba(0, 0, 0, 0.25);
+}
+
+.heatmap-cell:hover {
+    opacity: 0.8;
+    border-width: 1px;
+    border-color: rgba(255, 255, 255, 0.6);
+}
+
+.heatmap-summary-label {
+    font-size: 9px;
+    color: rgb(150, 160, 180);
+    min-width: 120px;
+    margin-left: 6px;
+    -unity-text-align: middle-left;
+}
+
+.heatmap-legend-title {
+    font-size: 9px;
+    color: rgb(150, 160, 180);
+    -unity-font-style: bold;
+    margin-right: 6px;
+}
+
+.heatmap-legend-item {
+    flex-direction: row;
+    align-items: center;
+    margin-right: 8px;
+}
+
+.heatmap-legend-label {
+    font-size: 9px;
+    color: rgb(150, 160, 180);
+    margin-left: 3px;
+}
+
+/* ── State Timeline ──────────────────────────────────────────── */
+
+.state-timeline {
+    margin-top: 6px;
+    padding: 6px;
+    background-color: rgba(25, 28, 45, 0.8);
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: rgba(80, 140, 220, 0.3);
+}
+
+.state-timeline-label {
+    font-size: 11px;
+    color: rgb(200, 210, 230);
+    -unity-font-style: bold;
+    margin-bottom: 4px;
+}
+
+.state-timeline-bar {
+    flex-direction: row;
+    height: 20px;
+    border-radius: 3px;
+    overflow: hidden;
+    background-color: rgba(40, 40, 60, 0.6);
+    margin-bottom: 4px;
+}
+
+.state-timeline-segment {
+    height: 100%;
+}
+
+.state-timeline-segment:hover {
+    opacity: 0.8;
+}
+
+/* ── Utilization Legend (shared by heatmap & timeline) ────────── */
+
+.utilization-legend {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 4px;
+    padding: 3px 0;
+}

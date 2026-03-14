@@ -759,6 +759,256 @@ class ThermalModel:
         return remaining_temp / dT_dt
 
 
+@dataclass
+class WorkholdingSetup:
+    """Workholding configuration for force analysis."""
+    setup_type: str  # VISE, CHUCK_3JAW, CHUCK_4JAW, VACUUM, FIXTURE_PLATE, MAGNETIC
+    clamping_force_n: float
+    friction_coefficient: float  # steel-on-steel ~0.15, soft jaws ~0.3
+    num_clamp_points: int
+    workpiece_mass_kg: float
+    workpiece_dimensions_mm: tuple  # (L, W, H)
+    safety_factor: float = 2.0
+
+    VALID_TYPES = {'VISE', 'CHUCK_3JAW', 'CHUCK_4JAW', 'VACUUM', 'FIXTURE_PLATE', 'MAGNETIC'}
+
+
+@dataclass
+class WorkholdingAnalysis:
+    """Result of workholding force analysis."""
+    is_secure: bool
+    safety_margin: float  # ratio of holding force to cutting force
+    required_clamping_force_n: float
+    actual_holding_force_n: float
+    critical_direction: str  # X, Y, or Z
+    max_cutting_force_n: float
+    lift_off_risk: bool
+    rotation_risk: bool
+    recommendations: List[str] = field(default_factory=list)
+
+
+class WorkholdingAnalyzer:
+    """Analyzes workholding adequacy against cutting forces."""
+
+    GRAVITY = 9.81  # m/s^2
+
+    def analyze(self, setup: WorkholdingSetup, cutting_forces: dict) -> WorkholdingAnalysis:
+        """Analyze whether workholding is adequate for given cutting forces.
+
+        Args:
+            setup: Workholding configuration.
+            cutting_forces: dict with keys 'Fx', 'Fy', 'Fz' (Newtons).
+                Fz is axial (vertical), Fx/Fy are lateral.
+
+        Returns:
+            WorkholdingAnalysis with security assessment.
+        """
+        fx = abs(cutting_forces.get('Fx', 0.0))
+        fy = abs(cutting_forces.get('Fy', 0.0))
+        fz = abs(cutting_forces.get('Fz', 0.0))
+
+        # Gravity contribution (holds workpiece down)
+        gravity_force = setup.workpiece_mass_kg * self.GRAVITY
+
+        # Effective holding force from clamps (friction-based lateral restraint)
+        holding_force_lateral = (
+            setup.clamping_force_n * setup.friction_coefficient * setup.num_clamp_points
+        )
+
+        # Vertical holding: clamping force directly opposes lift + gravity helps
+        holding_force_vertical = (
+            setup.clamping_force_n * setup.num_clamp_points + gravity_force
+        )
+
+        # For vacuum and magnetic, holding is purely normal (vertical)
+        # and lateral resistance comes from friction
+        if setup.setup_type in ('VACUUM', 'MAGNETIC'):
+            holding_force_vertical = (
+                setup.clamping_force_n * setup.num_clamp_points + gravity_force
+            )
+            holding_force_lateral = (
+                setup.clamping_force_n * setup.friction_coefficient
+                * setup.num_clamp_points
+            )
+
+        # Find critical direction
+        force_vs_holding = {
+            'X': fx / max(holding_force_lateral, 1e-9),
+            'Y': fy / max(holding_force_lateral, 1e-9),
+            'Z': fz / max(holding_force_vertical, 1e-9),
+        }
+        critical_direction = max(force_vs_holding, key=force_vs_holding.get)
+        max_cutting_force = max(fx, fy, fz)
+
+        # Effective holding force in critical direction
+        if critical_direction == 'Z':
+            actual_holding = holding_force_vertical
+        else:
+            actual_holding = holding_force_lateral
+
+        # Safety margin
+        if max_cutting_force < 1e-9:
+            safety_margin = float('inf')
+        else:
+            safety_margin = actual_holding / max_cutting_force
+
+        is_secure = safety_margin >= setup.safety_factor
+
+        # Lift-off risk: axial force exceeds vertical hold
+        lift_off_risk = fz > holding_force_vertical
+
+        # Rotation risk: torque from lateral forces exceeds friction torque
+        # Torque from cutting = max(Fx, Fy) * moment_arm (half workpiece dimension)
+        moment_arm_m = max(
+            setup.workpiece_dimensions_mm[0],
+            setup.workpiece_dimensions_mm[1],
+        ) / 2000.0  # mm → m, half-length
+        cutting_torque = max(fx, fy) * moment_arm_m
+
+        # Friction torque from clamps: clamping_force * friction * clamp_spread
+        clamp_spread_m = min(
+            setup.workpiece_dimensions_mm[0],
+            setup.workpiece_dimensions_mm[1],
+        ) / 2000.0  # mm → m
+        friction_torque = (
+            setup.clamping_force_n * setup.friction_coefficient
+            * setup.num_clamp_points * clamp_spread_m
+        )
+        rotation_risk = cutting_torque > friction_torque
+
+        # Required clamping force (to achieve safety_factor margin)
+        if max_cutting_force < 1e-9:
+            required_clamping = 0.0
+        else:
+            # In the critical direction, solve for clamping_force
+            if critical_direction == 'Z':
+                # clamping_force * num_clamps + gravity >= max_force * safety_factor
+                required_total = max_cutting_force * setup.safety_factor - gravity_force
+                required_clamping = max(0.0, required_total / max(setup.num_clamp_points, 1))
+            else:
+                # clamping_force * friction * num_clamps >= max_force * safety_factor
+                denom = setup.friction_coefficient * max(setup.num_clamp_points, 1)
+                required_clamping = max_cutting_force * setup.safety_factor / max(denom, 1e-9)
+
+        # Recommendations
+        recommendations: List[str] = []
+        if not is_secure:
+            recommendations.append(
+                f"Increase clamping force to at least {required_clamping:.0f} N"
+            )
+        if lift_off_risk:
+            recommendations.append(
+                "Lift-off risk detected — add top clamps or reduce axial depth of cut"
+            )
+        if rotation_risk:
+            recommendations.append(
+                "Rotation risk detected — add additional clamp points or use fixture plate"
+            )
+        if setup.setup_type == 'VACUUM' and max_cutting_force > 500:
+            recommendations.append(
+                "Vacuum holding may be insufficient for high cutting forces — consider vise"
+            )
+        if safety_margin < 1.5 and is_secure:
+            recommendations.append(
+                "Safety margin is low — consider increasing clamping force"
+            )
+
+        return WorkholdingAnalysis(
+            is_secure=is_secure,
+            safety_margin=safety_margin,
+            required_clamping_force_n=required_clamping,
+            actual_holding_force_n=actual_holding,
+            critical_direction=critical_direction,
+            max_cutting_force_n=max_cutting_force,
+            lift_off_risk=lift_off_risk,
+            rotation_risk=rotation_risk,
+            recommendations=recommendations,
+        )
+
+    def recommend_setup(
+        self, cutting_forces: dict, workpiece_mass_kg: float,
+        workpiece_dimensions_mm: tuple = (100.0, 100.0, 50.0),
+    ) -> WorkholdingSetup:
+        """Suggest a workholding setup for given cutting forces.
+
+        Args:
+            cutting_forces: dict with 'Fx', 'Fy', 'Fz' in Newtons.
+            workpiece_mass_kg: workpiece mass.
+            workpiece_dimensions_mm: (L, W, H) tuple.
+
+        Returns:
+            Recommended WorkholdingSetup.
+        """
+        fx = abs(cutting_forces.get('Fx', 0.0))
+        fy = abs(cutting_forces.get('Fy', 0.0))
+        fz = abs(cutting_forces.get('Fz', 0.0))
+        max_force = max(fx, fy, fz, 1e-9)
+        safety_factor = 2.5  # conservative default
+
+        # Choose setup type based on force magnitude
+        if max_force < 200:
+            setup_type = 'VACUUM'
+            friction = 0.4
+            num_clamps = 1
+        elif max_force < 2000:
+            setup_type = 'VISE'
+            friction = 0.15
+            num_clamps = 2
+        else:
+            setup_type = 'FIXTURE_PLATE'
+            friction = 0.25
+            num_clamps = 4
+
+        # Compute minimum clamping force for lateral security
+        required_lateral = max_force * safety_factor / (friction * num_clamps)
+        # Compute minimum for vertical security
+        gravity = workpiece_mass_kg * self.GRAVITY
+        required_vertical = max(0.0, (fz * safety_factor - gravity) / num_clamps)
+
+        clamping_force = max(required_lateral, required_vertical)
+
+        return WorkholdingSetup(
+            setup_type=setup_type,
+            clamping_force_n=clamping_force,
+            friction_coefficient=friction,
+            num_clamp_points=num_clamps,
+            workpiece_mass_kg=workpiece_mass_kg,
+            workpiece_dimensions_mm=workpiece_dimensions_mm,
+            safety_factor=safety_factor,
+        )
+
+    def get_max_safe_depth(
+        self, setup: WorkholdingSetup, feed_mm_per_tooth: float,
+        speed_rpm: float, material_kc: float = 2000.0,
+    ) -> float:
+        """Compute maximum depth of cut before workpiece becomes insecure.
+
+        Uses a simplified Kienzle force model: F = kc * ap * f
+        where kc = specific cutting force (N/mm^2), ap = depth (mm), f = feed (mm).
+
+        Args:
+            setup: Workholding configuration.
+            feed_mm_per_tooth: feed per tooth in mm.
+            speed_rpm: spindle speed (used for context, not directly in simplified model).
+            material_kc: specific cutting force in N/mm^2 (default 2000 for steel).
+
+        Returns:
+            Maximum safe depth of cut in mm.
+        """
+        # Holding force (lateral, which is typically the limiting case)
+        holding_force = (
+            setup.clamping_force_n * setup.friction_coefficient * setup.num_clamp_points
+        )
+        safe_holding = holding_force / setup.safety_factor
+
+        # F = kc * ap * f  →  ap = F / (kc * f)
+        if feed_mm_per_tooth < 1e-9 or material_kc < 1e-9:
+            return 0.0
+
+        max_depth = safe_holding / (material_kc * feed_mm_per_tooth)
+        return max(0.0, max_depth)
+
+
 class CuttingSimProxy:
     """Python proxy for cutting force + wear simulation.
 

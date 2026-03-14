@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.UIElements;
 using MiracleTwin.Core;
@@ -20,6 +21,359 @@ namespace MiracleTwin.UI
         public float overallHealthScore;     // 0.0 (critical) to 1.0 (perfect)
         public float oeeScore;              // Current OEE 0-100
         public string trendDirection;       // "improving", "stable", "degrading"
+    }
+
+    // ─── Machine Utilization Types ──────────────────────────────────
+
+    /// <summary>Discrete machine operating states for utilization tracking.</summary>
+    public enum MachineState
+    {
+        RUNNING,
+        IDLE,
+        SETUP,
+        MAINTENANCE,
+        ALARM,
+        OFFLINE
+    }
+
+    /// <summary>
+    /// A single timestamped snapshot of machine state, used to build
+    /// utilization heatmaps and state-distribution analyses.
+    /// </summary>
+    [System.Serializable]
+    public class MachineUtilizationRecord
+    {
+        public double timestamp;       // Time.realtimeSinceStartupAsDouble
+        public string machineId;
+        public MachineState state;
+        public string programName;
+        public float spindleLoad;      // 0-100 %
+        public float feedOverride;     // 0-200 %
+    }
+
+    /// <summary>
+    /// Pre-computed heatmap data for one machine: an array of per-slot
+    /// utilization percentages plus summary statistics.
+    /// </summary>
+    [System.Serializable]
+    public class UtilizationHeatmapData
+    {
+        public string machineId;
+        public List<float> timeSlots;          // utilization % per slot
+        public float slotDurationMinutes;
+        public float totalHours;
+        public float averageUtilization;
+        public float peakUtilization;
+        public float idleTimeMinutes;
+    }
+
+    /// <summary>
+    /// Idle-analysis result tuple returned by
+    /// <see cref="UtilizationTracker.GetIdleAnalysis"/>.
+    /// </summary>
+    public struct IdleAnalysis
+    {
+        public float totalIdleMin;
+        public float longestIdleMin;
+        public int idleCount;
+        public float avgIdleMin;
+    }
+
+    /// <summary>
+    /// Records machine state transitions over time and computes
+    /// utilization heatmaps, state distributions, and idle analyses.
+    /// </summary>
+    public class UtilizationTracker
+    {
+        /// <summary>Per-machine ring buffer of utilization records.</summary>
+        public readonly Dictionary<string, List<MachineUtilizationRecord>> recordBuffer = new();
+
+        /// <summary>
+        /// Append a timestamped state record for the given machine.
+        /// </summary>
+        public void RecordState(string machineId, MachineState state, float spindleLoad, string program)
+        {
+            if (!recordBuffer.TryGetValue(machineId, out var list))
+            {
+                list = new List<MachineUtilizationRecord>();
+                recordBuffer[machineId] = list;
+            }
+
+            list.Add(new MachineUtilizationRecord
+            {
+                timestamp = Time.realtimeSinceStartupAsDouble,
+                machineId = machineId,
+                state = state,
+                programName = program ?? "",
+                spindleLoad = Mathf.Clamp(spindleLoad, 0f, 100f),
+                feedOverride = 100f
+            });
+        }
+
+        /// <summary>
+        /// Compute a heatmap for a single machine by dividing the last
+        /// <paramref name="hoursBack"/> hours into slots of
+        /// <paramref name="slotMinutes"/> minutes and calculating the
+        /// percentage of each slot spent in <see cref="MachineState.RUNNING"/>.
+        /// </summary>
+        public UtilizationHeatmapData ComputeHeatmap(string machineId, float hoursBack, float slotMinutes)
+        {
+            var heatmap = new UtilizationHeatmapData
+            {
+                machineId = machineId,
+                slotDurationMinutes = slotMinutes,
+                totalHours = hoursBack,
+                timeSlots = new List<float>()
+            };
+
+            double now = Time.realtimeSinceStartupAsDouble;
+            double windowStart = now - hoursBack * 3600.0;
+            double slotSeconds = slotMinutes * 60.0;
+            int slotCount = Mathf.Max(1, Mathf.CeilToInt((float)(hoursBack * 60f / slotMinutes)));
+
+            // Gather records in the time window
+            List<MachineUtilizationRecord> records;
+            if (!recordBuffer.TryGetValue(machineId, out records) || records.Count == 0)
+            {
+                for (int i = 0; i < slotCount; i++)
+                    heatmap.timeSlots.Add(0f);
+                heatmap.averageUtilization = 0f;
+                heatmap.peakUtilization = 0f;
+                heatmap.idleTimeMinutes = hoursBack * 60f;
+                return heatmap;
+            }
+
+            // Filter to window and sort by timestamp
+            var windowRecords = records
+                .Where(r => r.timestamp >= windowStart)
+                .OrderBy(r => r.timestamp)
+                .ToList();
+
+            float totalRunning = 0f;
+            float totalIdle = 0f;
+            float peak = 0f;
+
+            for (int s = 0; s < slotCount; s++)
+            {
+                double slotStart = windowStart + s * slotSeconds;
+                double slotEnd = slotStart + slotSeconds;
+
+                // Find records that overlap this slot
+                float runningSeconds = 0f;
+                float slotDuration = (float)slotSeconds;
+
+                // Get the state at slotStart (last record before slotStart)
+                MachineState activeState = MachineState.IDLE;
+                for (int r = windowRecords.Count - 1; r >= 0; r--)
+                {
+                    if (windowRecords[r].timestamp <= slotStart)
+                    {
+                        activeState = windowRecords[r].state;
+                        break;
+                    }
+                }
+
+                // Walk through transitions within the slot
+                double cursor = slotStart;
+                foreach (var rec in windowRecords)
+                {
+                    if (rec.timestamp >= slotEnd) break;
+                    if (rec.timestamp <= slotStart) continue;
+
+                    // Time from cursor to this transition
+                    double segDuration = rec.timestamp - cursor;
+                    if (activeState == MachineState.RUNNING)
+                        runningSeconds += (float)segDuration;
+
+                    activeState = rec.state;
+                    cursor = rec.timestamp;
+                }
+
+                // Remaining time from last transition to slot end
+                double remaining = slotEnd - cursor;
+                if (remaining > 0 && activeState == MachineState.RUNNING)
+                    runningSeconds += (float)remaining;
+
+                float utilPct = (slotDuration > 0f) ? (runningSeconds / slotDuration) * 100f : 0f;
+                utilPct = Mathf.Clamp(utilPct, 0f, 100f);
+                heatmap.timeSlots.Add(utilPct);
+
+                totalRunning += runningSeconds;
+                float idleSec = slotDuration - runningSeconds;
+                totalIdle += Mathf.Max(0f, idleSec);
+                if (utilPct > peak) peak = utilPct;
+            }
+
+            float totalSeconds = slotCount * (float)slotSeconds;
+            heatmap.averageUtilization = (totalSeconds > 0f) ? (totalRunning / totalSeconds) * 100f : 0f;
+            heatmap.peakUtilization = peak;
+            heatmap.idleTimeMinutes = totalIdle / 60f;
+
+            return heatmap;
+        }
+
+        /// <summary>
+        /// Compute heatmaps for every tracked machine.
+        /// </summary>
+        public List<UtilizationHeatmapData> ComputeFleetHeatmap(float hoursBack, float slotMinutes)
+        {
+            var result = new List<UtilizationHeatmapData>();
+            foreach (var machineId in recordBuffer.Keys)
+                result.Add(ComputeHeatmap(machineId, hoursBack, slotMinutes));
+            return result;
+        }
+
+        /// <summary>
+        /// Return the percentage of time spent in each <see cref="MachineState"/>
+        /// over the last <paramref name="hoursBack"/> hours.
+        /// </summary>
+        public Dictionary<MachineState, float> GetStateDistribution(string machineId, float hoursBack)
+        {
+            var distribution = new Dictionary<MachineState, float>();
+            foreach (MachineState s in Enum.GetValues(typeof(MachineState)))
+                distribution[s] = 0f;
+
+            double now = Time.realtimeSinceStartupAsDouble;
+            double windowStart = now - hoursBack * 3600.0;
+            double windowEnd = now;
+
+            if (!recordBuffer.TryGetValue(machineId, out var records) || records.Count == 0)
+            {
+                distribution[MachineState.IDLE] = 100f;
+                return distribution;
+            }
+
+            var windowRecords = records
+                .Where(r => r.timestamp >= windowStart)
+                .OrderBy(r => r.timestamp)
+                .ToList();
+
+            // Determine state at window start
+            MachineState activeState = MachineState.IDLE;
+            for (int r = records.Count - 1; r >= 0; r--)
+            {
+                if (records[r].timestamp <= windowStart)
+                {
+                    activeState = records[r].state;
+                    break;
+                }
+            }
+
+            var durations = new Dictionary<MachineState, double>();
+            foreach (MachineState s in Enum.GetValues(typeof(MachineState)))
+                durations[s] = 0.0;
+
+            double cursor = windowStart;
+            foreach (var rec in windowRecords)
+            {
+                if (rec.timestamp > windowEnd) break;
+                double segDuration = rec.timestamp - cursor;
+                if (segDuration > 0)
+                    durations[activeState] += segDuration;
+                activeState = rec.state;
+                cursor = rec.timestamp;
+            }
+
+            // Trailing segment
+            double trailing = windowEnd - cursor;
+            if (trailing > 0)
+                durations[activeState] += trailing;
+
+            double totalDuration = windowEnd - windowStart;
+            if (totalDuration > 0)
+            {
+                foreach (MachineState s in Enum.GetValues(typeof(MachineState)))
+                    distribution[s] = (float)(durations[s] / totalDuration * 100.0);
+            }
+
+            return distribution;
+        }
+
+        /// <summary>
+        /// Analyse idle periods for a machine over the last
+        /// <paramref name="hoursBack"/> hours.
+        /// </summary>
+        public IdleAnalysis GetIdleAnalysis(string machineId, float hoursBack)
+        {
+            var result = new IdleAnalysis();
+
+            double now = Time.realtimeSinceStartupAsDouble;
+            double windowStart = now - hoursBack * 3600.0;
+            double windowEnd = now;
+
+            if (!recordBuffer.TryGetValue(machineId, out var records) || records.Count == 0)
+            {
+                result.totalIdleMin = hoursBack * 60f;
+                result.longestIdleMin = hoursBack * 60f;
+                result.idleCount = 1;
+                result.avgIdleMin = hoursBack * 60f;
+                return result;
+            }
+
+            var windowRecords = records
+                .Where(r => r.timestamp >= windowStart)
+                .OrderBy(r => r.timestamp)
+                .ToList();
+
+            // State at window start
+            MachineState activeState = MachineState.IDLE;
+            for (int r = records.Count - 1; r >= 0; r--)
+            {
+                if (records[r].timestamp <= windowStart)
+                {
+                    activeState = records[r].state;
+                    break;
+                }
+            }
+
+            float totalIdleSec = 0f;
+            float longestIdleSec = 0f;
+            float currentIdleSec = 0f;
+            int idleCount = 0;
+            bool wasIdle = (activeState == MachineState.IDLE);
+            if (wasIdle) idleCount = 1;
+
+            double cursor = windowStart;
+            foreach (var rec in windowRecords)
+            {
+                if (rec.timestamp > windowEnd) break;
+                float seg = (float)(rec.timestamp - cursor);
+
+                if (activeState == MachineState.IDLE)
+                {
+                    currentIdleSec += seg;
+                    totalIdleSec += seg;
+                }
+                else
+                {
+                    if (currentIdleSec > longestIdleSec)
+                        longestIdleSec = currentIdleSec;
+                    currentIdleSec = 0f;
+                }
+
+                if (rec.state == MachineState.IDLE && activeState != MachineState.IDLE)
+                    idleCount++;
+
+                activeState = rec.state;
+                cursor = rec.timestamp;
+            }
+
+            // Trailing segment
+            float trailingSeg = (float)(windowEnd - cursor);
+            if (activeState == MachineState.IDLE)
+            {
+                currentIdleSec += trailingSeg;
+                totalIdleSec += trailingSeg;
+            }
+            if (currentIdleSec > longestIdleSec)
+                longestIdleSec = currentIdleSec;
+
+            result.totalIdleMin = totalIdleSec / 60f;
+            result.longestIdleMin = longestIdleSec / 60f;
+            result.idleCount = idleCount;
+            result.avgIdleMin = (idleCount > 0) ? (totalIdleSec / 60f) / idleCount : 0f;
+            return result;
+        }
     }
 
     /// <summary>
@@ -56,6 +410,9 @@ namespace MiracleTwin.UI
         private readonly Dictionary<string, MachineCardData> cardData = new();
         private readonly Dictionary<string, VisualElement> cardElements = new();
         private readonly Dictionary<string, PredictiveHealthData> _machineHealth = new();
+
+        /// <summary>Tracks machine state transitions for utilization heatmap and timeline.</summary>
+        private readonly UtilizationTracker _utilizationTracker = new();
 
         /// <summary>Which metric(s) to display on the sparkline.</summary>
         public enum SparklineMode
@@ -927,6 +1284,211 @@ namespace MiracleTwin.UI
                 anomalyLabel.text = $"Anomalies <5m: {upcomingAnomalies}";
                 anomalyLabel.style.color = upcomingAnomalies > 0 ? StatusYellow : StatusGreen;
             }
+        }
+
+        // ─── Utilization Heatmap & Timeline Rendering ─────────────────
+
+        /// <summary>Color mapping for each MachineState used in timeline bars.</summary>
+        private static readonly Dictionary<MachineState, Color> StateColors = new()
+        {
+            { MachineState.RUNNING,     new Color(0.2f, 0.8f, 0.3f) },     // green
+            { MachineState.IDLE,        new Color(0.5f, 0.5f, 0.6f) },     // gray
+            { MachineState.SETUP,       new Color(0.3f, 0.6f, 1.0f) },     // blue
+            { MachineState.MAINTENANCE, new Color(0.9f, 0.7f, 0.1f) },     // yellow
+            { MachineState.ALARM,       new Color(0.9f, 0.2f, 0.2f) },     // red
+            { MachineState.OFFLINE,     new Color(0.3f, 0.3f, 0.35f) }     // dark gray
+        };
+
+        /// <summary>Expose the utilization tracker so external systems can record states.</summary>
+        public UtilizationTracker UtilizationTracker => _utilizationTracker;
+
+        /// <summary>
+        /// Map a utilization percentage (0-100) to a color on a red-yellow-green
+        /// gradient.  Red = low/idle, yellow = medium, green = high utilization.
+        /// </summary>
+        public static Color GetUtilizationColor(float pct)
+        {
+            pct = Mathf.Clamp(pct, 0f, 100f);
+            // 0-40 → red to yellow, 40-75 → yellow to green, 75-100 → green
+            if (pct <= 40f)
+                return Color.Lerp(
+                    new Color(0.9f, 0.2f, 0.2f),   // red
+                    new Color(0.9f, 0.7f, 0.1f),   // yellow
+                    pct / 40f);
+            if (pct <= 75f)
+                return Color.Lerp(
+                    new Color(0.9f, 0.7f, 0.1f),   // yellow
+                    new Color(0.2f, 0.8f, 0.3f),   // green
+                    (pct - 40f) / 35f);
+            return new Color(0.2f, 0.8f, 0.3f);    // green
+        }
+
+        /// <summary>
+        /// Build a color-coded heatmap grid from fleet utilization data and
+        /// insert it into the fleet panel.  Each row is a machine, each cell
+        /// is a time slot colored by utilization percentage.
+        /// </summary>
+        public void DrawUtilizationHeatmap(List<UtilizationHeatmapData> data)
+        {
+            if (fleetPanel == null || data == null) return;
+
+            // Remove any previous heatmap
+            var existing = fleetPanel.Q<VisualElement>("utilization-heatmap-container");
+            existing?.RemoveFromHierarchy();
+
+            var container = new VisualElement();
+            container.name = "utilization-heatmap-container";
+            container.AddToClassList("heatmap-container");
+
+            // Title
+            var title = new Label("Utilization Heatmap");
+            title.AddToClassList("panel-title");
+            container.Add(title);
+
+            foreach (var machineData in data)
+            {
+                var row = new VisualElement();
+                row.AddToClassList("heatmap-row");
+
+                // Machine label
+                var idLabel = new Label(machineData.machineId.ToUpper());
+                idLabel.AddToClassList("heatmap-machine-label");
+                row.Add(idLabel);
+
+                // Cells container
+                var cellsContainer = new VisualElement();
+                cellsContainer.AddToClassList("heatmap-cells");
+
+                foreach (float slotPct in machineData.timeSlots)
+                {
+                    var cell = new VisualElement();
+                    cell.AddToClassList("heatmap-cell");
+                    cell.style.backgroundColor = GetUtilizationColor(slotPct);
+                    cell.tooltip = $"{slotPct:F1}%";
+                    cellsContainer.Add(cell);
+                }
+
+                row.Add(cellsContainer);
+
+                // Summary label
+                var summary = new Label($"Avg: {machineData.averageUtilization:F1}%  Peak: {machineData.peakUtilization:F1}%");
+                summary.AddToClassList("heatmap-summary-label");
+                row.Add(summary);
+
+                container.Add(row);
+            }
+
+            // Legend
+            var legend = new VisualElement();
+            legend.AddToClassList("utilization-legend");
+
+            var legendTitle = new Label("Legend:");
+            legendTitle.AddToClassList("heatmap-legend-title");
+            legend.Add(legendTitle);
+
+            float[] legendPcts = { 0f, 25f, 50f, 75f, 100f };
+            foreach (float p in legendPcts)
+            {
+                var item = new VisualElement();
+                item.AddToClassList("heatmap-legend-item");
+
+                var swatch = new VisualElement();
+                swatch.AddToClassList("heatmap-cell");
+                swatch.style.backgroundColor = GetUtilizationColor(p);
+                item.Add(swatch);
+
+                var lbl = new Label($"{p:F0}%");
+                lbl.AddToClassList("heatmap-legend-label");
+                item.Add(lbl);
+
+                legend.Add(item);
+            }
+
+            container.Add(legend);
+            fleetPanel.Add(container);
+        }
+
+        /// <summary>
+        /// Draw a horizontal state-timeline bar for a single machine
+        /// showing colored segments for each state transition over time.
+        /// </summary>
+        public void DrawStateTimeline(string machineId)
+        {
+            if (fleetPanel == null) return;
+
+            // Remove previous timeline for this machine
+            string timelineName = $"state-timeline-{machineId}";
+            var existing = fleetPanel.Q<VisualElement>(timelineName);
+            existing?.RemoveFromHierarchy();
+
+            if (!_utilizationTracker.recordBuffer.TryGetValue(machineId, out var records)
+                || records.Count == 0)
+                return;
+
+            var sorted = records.OrderBy(r => r.timestamp).ToList();
+
+            double earliest = sorted[0].timestamp;
+            double latest = Time.realtimeSinceStartupAsDouble;
+            double totalSpan = latest - earliest;
+            if (totalSpan <= 0) return;
+
+            var container = new VisualElement();
+            container.name = timelineName;
+            container.AddToClassList("state-timeline");
+
+            // Machine label
+            var idLabel = new Label(machineId.ToUpper());
+            idLabel.AddToClassList("state-timeline-label");
+            container.Add(idLabel);
+
+            // Timeline bar
+            var bar = new VisualElement();
+            bar.AddToClassList("state-timeline-bar");
+
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                double segStart = sorted[i].timestamp;
+                double segEnd = (i + 1 < sorted.Count) ? sorted[i + 1].timestamp : latest;
+                float pct = (float)((segEnd - segStart) / totalSpan) * 100f;
+                if (pct < 0.1f) continue;
+
+                var segment = new VisualElement();
+                segment.AddToClassList("state-timeline-segment");
+                segment.style.width = new Length(pct, LengthUnit.Percent);
+
+                Color segColor;
+                if (!StateColors.TryGetValue(sorted[i].state, out segColor))
+                    segColor = new Color(0.5f, 0.5f, 0.6f);
+                segment.style.backgroundColor = segColor;
+                segment.tooltip = $"{sorted[i].state}";
+
+                bar.Add(segment);
+            }
+
+            container.Add(bar);
+
+            // State legend
+            var legend = new VisualElement();
+            legend.AddToClassList("utilization-legend");
+            foreach (var kvp in StateColors)
+            {
+                var item = new VisualElement();
+                item.AddToClassList("heatmap-legend-item");
+
+                var swatch = new VisualElement();
+                swatch.AddToClassList("heatmap-cell");
+                swatch.style.backgroundColor = kvp.Value;
+                item.Add(swatch);
+
+                var lbl = new Label(kvp.Key.ToString());
+                lbl.AddToClassList("heatmap-legend-label");
+                item.Add(lbl);
+
+                legend.Add(item);
+            }
+            container.Add(legend);
+
+            fleetPanel.Add(container);
         }
 
         void Update()

@@ -138,6 +138,8 @@ class TestCausalChainBuilding:
         node._feedback_ratings = {}
         node._feedback_detail_overrides = {}
         node._gcode_contexts = {}
+        from miracle_cognitive.interface.explanation_generator import RootCauseAnalyzer
+        node._root_cause_analyzer = RootCauseAnalyzer()
         node._causal_links = {
             'ToolWear': ('HighFeedRate', 0.7),
             'SurfaceRoughnessIncrease': ('ToolWear', 0.8),

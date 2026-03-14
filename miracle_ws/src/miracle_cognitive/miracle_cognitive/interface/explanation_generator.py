@@ -31,6 +31,373 @@ except ImportError:
 
 
 @dataclass
+class EvidenceItem:
+    """A single piece of evidence for or against a root cause hypothesis."""
+    source: str  # 'sensor', 'model', 'history', 'operator'
+    description: str
+    strength: float  # 0-1, how strongly this evidence bears on the cause
+    supports: bool  # True = supports the hypothesis, False = contradicts it
+    timestamp: float
+
+
+@dataclass
+class RootCauseCandidate:
+    """A ranked root cause hypothesis with supporting/contradicting evidence."""
+    cause_id: str
+    description: str
+    probability: float  # 0-1
+    evidence: List['EvidenceItem'] = field(default_factory=list)
+    supporting_count: int = 0
+    contradicting_count: int = 0
+    net_score: float = 0.0  # supporting - contradicting, weighted by strength
+    mechanism: str = ''  # causal chain explanation
+    verification_steps: List[str] = field(default_factory=list)
+
+
+class RootCauseAnalyzer:
+    """Analyzes anomaly data to produce ranked root cause hypotheses.
+
+    Uses cause templates for common CNC failure modes, matches incoming
+    anomaly evidence against them, and applies Bayesian-style scoring.
+    """
+
+    # Each template maps a cause_id to:
+    #   prior        – base probability before evidence
+    #   indicators   – dict of anomaly_data field -> expected condition
+    #   mechanism    – human-readable causal chain
+    #   verification – steps an operator can take to confirm
+    CAUSE_TEMPLATES: Dict[str, dict] = {
+        'TOOL_WEAR': {
+            'prior': 0.15,
+            'description': 'Progressive tool wear causing degraded cutting performance',
+            'indicators': {
+                'force_trend': 'increasing',
+                'vibration_trend': 'increasing',
+                'tool_wear_vb': 'high',
+            },
+            'mechanism': (
+                'Flank wear increases cutting edge radius -> higher specific cutting '
+                'force -> elevated vibration from ploughing -> surface finish degradation'
+            ),
+            'verification': [
+                'Measure flank wear VB under toolmakers microscope',
+                'Compare cutting forces at start vs current values',
+                'Inspect chip morphology for signs of built-up edge',
+                'Check surface roughness Ra on most recent cut',
+            ],
+        },
+        'CHATTER': {
+            'prior': 0.10,
+            'description': 'Regenerative chatter causing periodic vibration',
+            'indicators': {
+                'vibration_pattern': 'periodic',
+                'frequency_type': 'non_harmonic',
+                'vibration_amplitude': 'high',
+            },
+            'mechanism': (
+                'Undulations on previously cut surface modulate chip thickness -> '
+                'variable cutting force at chatter frequency -> phase shift causes '
+                'regenerative growth -> self-excited vibration at non-tooth-passing frequency'
+            ),
+            'verification': [
+                'Perform FFT analysis on vibration signal',
+                'Check if dominant frequency is a non-integer multiple of tooth passing frequency',
+                'Inspect workpiece surface for chatter marks (regular waviness)',
+                'Tap-test the tool assembly to find natural frequencies',
+            ],
+        },
+        'THERMAL_DRIFT': {
+            'prior': 0.10,
+            'description': 'Thermal expansion causing gradual positional drift',
+            'indicators': {
+                'position_drift': 'gradual',
+                'temperature_correlation': 'positive',
+                'temperature_trend': 'increasing',
+            },
+            'mechanism': (
+                'Heat from cutting and spindle bearings -> thermal expansion of '
+                'spindle housing and column -> gradual shift in tool center point -> '
+                'dimensional errors that grow over time'
+            ),
+            'verification': [
+                'Measure part dimensions at start vs end of operation',
+                'Monitor spindle temperature with contact thermometer',
+                'Check dimensional drift direction against thermal growth model',
+                'Compare error magnitude with thermal expansion coefficient',
+            ],
+        },
+        'COOLANT_FAILURE': {
+            'prior': 0.05,
+            'description': 'Coolant system failure causing thermal damage',
+            'indicators': {
+                'temperature_spike': 'sudden',
+                'coolant_flow': 'low',
+                'tool_wear_rate': 'accelerating',
+            },
+            'mechanism': (
+                'Loss of coolant flow -> inadequate heat removal from cutting zone -> '
+                'rapid temperature rise at tool-chip interface -> accelerated diffusion '
+                'wear and potential thermal cracking of tool'
+            ),
+            'verification': [
+                'Check coolant pump operation and flow rate',
+                'Inspect coolant nozzle for blockage',
+                'Verify coolant concentration and condition',
+                'Examine tool for thermal discoloration',
+            ],
+        },
+        'SPINDLE_BEARING': {
+            'prior': 0.05,
+            'description': 'Spindle bearing degradation causing runout',
+            'indicators': {
+                'vibration_frequency': 'high',
+                'runout': 'increasing',
+                'vibration_pattern': 'periodic',
+            },
+            'mechanism': (
+                'Bearing surface degradation -> increased radial play -> higher '
+                'runout at tool tip -> high-frequency vibration at bearing defect '
+                'frequencies (BPFO/BPFI) -> poor surface finish and dimensional errors'
+            ),
+            'verification': [
+                'Measure spindle runout with dial indicator at tool tip',
+                'Perform vibration spectrum analysis for bearing defect frequencies',
+                'Check spindle bearing preload',
+                'Listen for abnormal spindle noise at various RPMs',
+            ],
+        },
+        'MATERIAL_DEFECT': {
+            'prior': 0.05,
+            'description': 'Material inclusion or hard spot causing force spike',
+            'indicators': {
+                'force_spike': 'sudden',
+                'location_specific': 'true',
+                'force_pattern': 'localized',
+            },
+            'mechanism': (
+                'Hard inclusion or void in workpiece material -> sudden change in '
+                'specific cutting force when tool encounters defect -> force spike '
+                'at specific workpiece coordinates -> potential tool damage'
+            ),
+            'verification': [
+                'Note exact workpiece coordinates of the force spike',
+                'Inspect workpiece material at that location',
+                'Check material certification for composition',
+                'Run a light finishing pass over the area to confirm',
+            ],
+        },
+        'PROGRAMMING_ERROR': {
+            'prior': 0.08,
+            'description': 'G-code programming error causing consistent anomaly',
+            'indicators': {
+                'block_consistency': 'true',
+                'gcode_block': 'repeating',
+                'anomaly_recurrence': 'same_location',
+            },
+            'mechanism': (
+                'Incorrect feed rate, speed, or toolpath in specific G-code block -> '
+                'anomaly occurs at same program location on every cycle -> consistent '
+                'and repeatable error pattern'
+            ),
+            'verification': [
+                'Identify the G-code block number where anomaly occurs',
+                'Review the G-code for that block and surrounding blocks',
+                'Verify feed rate and spindle speed are appropriate for the operation',
+                'Run the program in single-block mode through the affected section',
+            ],
+        },
+        'FIXTURING_ISSUE': {
+            'prior': 0.07,
+            'description': 'Workholding problem causing intermittent vibration',
+            'indicators': {
+                'vibration_pattern': 'intermittent',
+                'position_variation': 'high',
+                'vibration_amplitude': 'variable',
+            },
+            'mechanism': (
+                'Insufficient clamping force or worn fixture -> workpiece micro-movement '
+                'under cutting forces -> intermittent vibration when cutting forces '
+                'exceed friction -> position variation between parts'
+            ),
+            'verification': [
+                'Check fixture clamping force with torque wrench',
+                'Inspect fixture contact surfaces for wear',
+                'Verify workpiece seating with feeler gauge',
+                'Try increasing clamping pressure and re-running',
+            ],
+        },
+    }
+
+    def __init__(self) -> None:
+        # Operator-supplied evidence keyed by cause_id
+        self._operator_evidence: Dict[str, List[EvidenceItem]] = {}
+
+    def analyze_root_cause(
+        self, anomaly_data: dict, history: list,
+    ) -> List[RootCauseCandidate]:
+        """Produce a ranked list of root cause candidates for an anomaly.
+
+        Args:
+            anomaly_data: Dict with sensor readings and anomaly metadata.
+                          Keys may include force_trend, vibration_trend,
+                          vibration_pattern, temperature_spike, etc.
+            history: List of past ExplanationRecord objects.
+
+        Returns:
+            List of RootCauseCandidate sorted by probability (descending).
+        """
+        candidates: List[RootCauseCandidate] = []
+
+        for cause_id, template in self.CAUSE_TEMPLATES.items():
+            evidence_items: List[EvidenceItem] = []
+            now = time.time()
+
+            # --- Collect evidence from anomaly data fields ---
+            for indicator_field, expected_value in template['indicators'].items():
+                actual = anomaly_data.get(indicator_field)
+                if actual is not None:
+                    matches = self._value_matches(actual, expected_value)
+                    strength = self._compute_evidence_strength(
+                        actual, expected_value,
+                    )
+                    evidence_items.append(EvidenceItem(
+                        source='sensor',
+                        description=(
+                            f'{indicator_field} is {actual} '
+                            f'(expected {expected_value} for {cause_id})'
+                        ),
+                        strength=strength,
+                        supports=matches,
+                        timestamp=now,
+                    ))
+
+            # --- History evidence: recurring cause boosts probability ---
+            history_count = self._count_history_matches(cause_id, history)
+            if history_count > 0:
+                hist_strength = min(1.0, history_count * 0.15)
+                evidence_items.append(EvidenceItem(
+                    source='history',
+                    description=(
+                        f'{cause_id} has occurred {history_count} times '
+                        f'in recent history'
+                    ),
+                    strength=hist_strength,
+                    supports=True,
+                    timestamp=now,
+                ))
+
+            # --- Operator-supplied evidence ---
+            operator_ev = self._operator_evidence.get(cause_id, [])
+            evidence_items.extend(operator_ev)
+
+            # --- Score the candidate ---
+            supporting = [e for e in evidence_items if e.supports]
+            contradicting = [e for e in evidence_items if not e.supports]
+            sup_score = sum(e.strength for e in supporting)
+            con_score = sum(e.strength for e in contradicting)
+            net = sup_score - con_score
+
+            # Bayesian-style update: prior × likelihood
+            prior = template['prior']
+            # Likelihood is a sigmoid-like function of the net evidence score
+            likelihood = 1.0 / (1.0 + math.exp(-2.0 * net))
+            probability = prior * likelihood
+            # Normalize will happen after all candidates are scored
+
+            candidates.append(RootCauseCandidate(
+                cause_id=cause_id,
+                description=template['description'],
+                probability=probability,
+                evidence=evidence_items,
+                supporting_count=len(supporting),
+                contradicting_count=len(contradicting),
+                net_score=net,
+                mechanism=template['mechanism'],
+                verification_steps=list(template['verification']),
+            ))
+
+        # Normalize probabilities so they sum to 1
+        total_prob = sum(c.probability for c in candidates)
+        if total_prob > 0:
+            for c in candidates:
+                c.probability = c.probability / total_prob
+
+        # Sort by probability descending
+        candidates.sort(key=lambda c: c.probability, reverse=True)
+        return candidates
+
+    def add_operator_evidence(
+        self, cause_id: str, evidence: 'EvidenceItem',
+    ) -> None:
+        """Add operator-supplied evidence for a specific cause."""
+        self._operator_evidence.setdefault(cause_id, []).append(evidence)
+
+    def get_verification_plan(self, cause_id: str) -> List[str]:
+        """Return verification steps for a given cause."""
+        template = self.CAUSE_TEMPLATES.get(cause_id)
+        if template is None:
+            return []
+        return list(template['verification'])
+
+    # -- Private helpers ---------------------------------------------------
+
+    @staticmethod
+    def _value_matches(actual: Any, expected: str) -> bool:
+        """Check whether an actual anomaly data value matches the expected condition."""
+        if isinstance(actual, str):
+            return actual.lower() == expected.lower()
+        if isinstance(actual, (int, float)):
+            # Numeric: 'high' means > 0.7, 'low' means < 0.3, etc.
+            thresholds = {
+                'high': lambda v: v > 0.7,
+                'low': lambda v: v < 0.3,
+                'increasing': lambda v: v > 0,
+                'accelerating': lambda v: v > 0.5,
+            }
+            fn = thresholds.get(expected.lower())
+            if fn is not None:
+                return fn(actual)
+        # Boolean-like
+        if isinstance(actual, bool):
+            return actual == (expected.lower() == 'true')
+        return str(actual).lower() == expected.lower()
+
+    @staticmethod
+    def _compute_evidence_strength(actual: Any, expected: str) -> float:
+        """Compute how strongly the actual value bears on the hypothesis."""
+        if isinstance(actual, (int, float)):
+            # Strength proportional to magnitude for numeric values
+            return min(1.0, max(0.1, abs(float(actual))))
+        # For string/bool matches, moderate fixed strength
+        return 0.6
+
+    @staticmethod
+    def _count_history_matches(cause_id: str, history: list) -> int:
+        """Count how many historical records relate to this cause template."""
+        # Map cause_ids to the anomaly types they are most associated with
+        cause_to_anomaly = {
+            'TOOL_WEAR': 'tool_wear_anomaly',
+            'CHATTER': 'vibration_anomaly',
+            'THERMAL_DRIFT': 'thermal_anomaly',
+            'COOLANT_FAILURE': 'thermal_anomaly',
+            'SPINDLE_BEARING': 'vibration_anomaly',
+            'MATERIAL_DEFECT': 'force_anomaly',
+            'PROGRAMMING_ERROR': None,  # matches any repeating anomaly
+            'FIXTURING_ISSUE': 'vibration_anomaly',
+        }
+        target_type = cause_to_anomaly.get(cause_id)
+        count = 0
+        for record in history:
+            rec_type = getattr(record, 'anomaly_type', None)
+            if target_type is None:
+                # PROGRAMMING_ERROR: count any record
+                count += 1
+            elif rec_type == target_type:
+                count += 1
+        return count
+
+
+@dataclass
 class FeatureContribution:
     """A single feature's contribution to a decision."""
     feature_name: str
@@ -151,6 +518,9 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
         self._feedback_confidence: Dict[str, float] = {}
         self._feedback_ratings: Dict[str, List[float]] = {}
         self._feedback_detail_overrides: Dict[str, str] = {}
+
+        # Root cause analyzer for evidence-based ranking
+        self._root_cause_analyzer = RootCauseAnalyzer()
 
         # G-code context per machine for enriching explanations
         self._gcode_contexts: Dict[str, Dict[str, Any]] = {}
@@ -456,10 +826,50 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
 
         return chain, confidence
 
+    def _generate_detail_explanation(
+        self, anomaly_type: str, machine_id: str, severity: float,
+        anomaly_data: Optional[dict] = None,
+    ) -> str:
+        """Generate root-cause-ranked detail section using the RootCauseAnalyzer."""
+        if anomaly_data is None:
+            anomaly_data = {}
+
+        with self._history_lock:
+            history = list(self._history)
+
+        candidates = self._root_cause_analyzer.analyze_root_cause(
+            anomaly_data, history,
+        )
+
+        if not candidates:
+            return ''
+
+        lines = ['\nRoot cause analysis (ranked by probability):']
+        for i, candidate in enumerate(candidates[:5], 1):
+            lines.append(
+                f'  {i}. [{candidate.cause_id}] {candidate.description} '
+                f'(probability: {candidate.probability:.1%})'
+            )
+            lines.append(
+                f'     Evidence: {candidate.supporting_count} supporting, '
+                f'{candidate.contradicting_count} contradicting '
+                f'(net score: {candidate.net_score:+.2f})'
+            )
+            lines.append(f'     Mechanism: {candidate.mechanism}')
+
+        # Top candidate verification steps
+        top = candidates[0]
+        lines.append(f'\nVerification plan for top cause ({top.cause_id}):')
+        for step in top.verification_steps:
+            lines.append(f'  - {step}')
+
+        return '\n'.join(lines)
+
     def _build_detail(
         self, prefix: str, features: List[FeatureContribution],
         severity: float, recommended_action: str,
         machine_id: str, anomaly_type: str,
+        anomaly_data: Optional[dict] = None,
     ) -> str:
         lines = [prefix]
 
@@ -491,6 +901,13 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
                     link_details.append(f'{src}\u2192{dst} ({strength:.0%})')
             if link_details:
                 lines.append(f'  Link strengths: {", ".join(link_details)}')
+
+        # Root cause ranking section
+        root_cause_detail = self._generate_detail_explanation(
+            anomaly_type, machine_id, severity, anomaly_data,
+        )
+        if root_cause_detail:
+            lines.append(root_cause_detail)
 
         # G-code execution context
         gcode_ctx = self._gcode_contexts.get(machine_id)

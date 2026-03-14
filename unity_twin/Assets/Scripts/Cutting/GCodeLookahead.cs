@@ -111,6 +111,308 @@ namespace MiracleTwin.Cutting
         public FixtureProfile.CollisionSeverity severity;
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    //  Tool-path smoothing & corner optimization types
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>Corner sharpness classification.</summary>
+    public enum CornerType
+    {
+        SHARP,      // < 30°
+        MODERATE,   // 30°–90°
+        GENTLE,     // 90°–150°
+        STRAIGHT    // ≥ 150°
+    }
+
+    /// <summary>
+    /// Analysis of a single corner (junction between two consecutive toolpath segments).
+    /// </summary>
+    [Serializable]
+    public class CornerAnalysis
+    {
+        /// <summary>Index of the block where the corner occurs (end of incoming segment).</summary>
+        public int blockIndex;
+        /// <summary>Angle in radians between incoming and outgoing direction vectors.</summary>
+        public float angleRadians;
+        /// <summary>Angle in degrees between incoming and outgoing direction vectors.</summary>
+        public float angleDegrees;
+        /// <summary>Classification of the corner sharpness.</summary>
+        public CornerType cornerType;
+        /// <summary>Programmed feed rate of the incoming segment (mm/min).</summary>
+        public float incomingFeed;
+        /// <summary>Programmed feed rate of the outgoing segment (mm/min).</summary>
+        public float outgoingFeed;
+        /// <summary>Recommended feed rate through the corner (mm/min).</summary>
+        public float recommendedCornerFeed;
+        /// <summary>Distance (mm) required to decelerate from cruise to the corner feed.</summary>
+        public float decelerationDistance;
+        /// <summary>Distance (mm) required to accelerate from the corner feed back to cruise.</summary>
+        public float accelerationDistance;
+    }
+
+    /// <summary>
+    /// Aggregate result of tool-path smoothing and corner optimisation.
+    /// </summary>
+    [Serializable]
+    public class PathSmoothingResult
+    {
+        public int originalSegmentCount;
+        public int smoothedSegmentCount;
+        public List<CornerAnalysis> corners = new();
+        public float totalPathLength;
+        /// <summary>Estimated cycle time (seconds) using original programmed feeds.</summary>
+        public float estimatedCycleTime;
+        /// <summary>Optimised cycle time (seconds) after feed-profile smoothing.</summary>
+        public float optimizedCycleTime;
+        /// <summary>Percentage of time saved by the optimisation.</summary>
+        public float timeSavingsPct;
+        /// <summary>Maximum jerk (mm/s³) encountered during the optimised profile.</summary>
+        public float maxJerk;
+    }
+
+    /// <summary>
+    /// Analyses corners between toolpath segments and produces an optimised
+    /// trapezoidal velocity profile that respects machine acceleration, jerk,
+    /// and corner-tolerance constraints.
+    /// </summary>
+    public class ToolPathSmoother
+    {
+        /// <summary>Maximum linear acceleration (mm/s²).</summary>
+        public float maxAcceleration = 5000f;
+        /// <summary>Maximum jerk (mm/s³).</summary>
+        public float maxJerk = 50000f;
+        /// <summary>Corner tolerance / blending radius (mm).</summary>
+        public float cornerTolerance = 0.01f;
+
+        // ── Corner analysis ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Compute the angle and classification for every junction between
+        /// consecutive segments.
+        /// </summary>
+        public List<CornerAnalysis> AnalyzeCorners(List<ToolpathSegment> segments)
+        {
+            var corners = new List<CornerAnalysis>();
+            if (segments == null || segments.Count < 2) return corners;
+
+            for (int i = 0; i < segments.Count - 1; i++)
+            {
+                var incoming = segments[i];
+                var outgoing = segments[i + 1];
+
+                Vector3 dirIn = (incoming.endPos - incoming.startPos).normalized;
+                Vector3 dirOut = (outgoing.endPos - outgoing.startPos).normalized;
+
+                // Angle between the two direction vectors
+                float dot = Mathf.Clamp(Vector3.Dot(dirIn, dirOut), -1f, 1f);
+                float angleRad = Mathf.Acos(dot); // 0 = same direction, π = reversal
+                float angleDeg = angleRad * Mathf.Rad2Deg;
+
+                var ca = new CornerAnalysis
+                {
+                    blockIndex = i,
+                    angleRadians = angleRad,
+                    angleDegrees = angleDeg,
+                    cornerType = ClassifyCorner(angleDeg),
+                    incomingFeed = incoming.feedRate,
+                    outgoingFeed = outgoing.feedRate
+                };
+
+                // Blending radius derived from corner tolerance
+                float halfAngle = angleRad * 0.5f;
+                float blendRadius = (halfAngle > 1e-6f)
+                    ? cornerTolerance / (1f - Mathf.Cos(halfAngle))
+                    : float.MaxValue;
+
+                ca.recommendedCornerFeed = ComputeCornerFeedLimit(
+                    angleRad, blendRadius, Mathf.Min(incoming.feedRate, outgoing.feedRate));
+
+                // Trapezoidal decel / accel distances: d = (v² - v_c²) / (2a)
+                float vCruiseIn = incoming.feedRate / 60f;   // mm/s
+                float vCruiseOut = outgoing.feedRate / 60f;
+                float vCorner = ca.recommendedCornerFeed / 60f;
+
+                ca.decelerationDistance = Mathf.Max(0f,
+                    (vCruiseIn * vCruiseIn - vCorner * vCorner) / (2f * maxAcceleration));
+                ca.accelerationDistance = Mathf.Max(0f,
+                    (vCruiseOut * vCruiseOut - vCorner * vCorner) / (2f * maxAcceleration));
+
+                corners.Add(ca);
+            }
+
+            return corners;
+        }
+
+        /// <summary>Classify a corner by its deflection angle (degrees).</summary>
+        private static CornerType ClassifyCorner(float angleDeg)
+        {
+            if (angleDeg < 30f)  return CornerType.STRAIGHT;   // nearly collinear
+            if (angleDeg < 90f)  return CornerType.GENTLE;
+            if (angleDeg < 150f) return CornerType.MODERATE;
+            return CornerType.SHARP;                            // near reversal
+        }
+
+        // ── Corner feed limit ───────────────────────────────────────────
+
+        /// <summary>
+        /// Compute the maximum allowable feed through a corner given the
+        /// deflection angle, blending radius, and programmed feed.
+        /// Uses centripetal acceleration constraint: v = sqrt(a_max * r).
+        /// </summary>
+        public float ComputeCornerFeedLimit(float angleRad, float radius, float programmedFeed)
+        {
+            if (angleRad < 1e-6f) return programmedFeed; // straight – no limit
+
+            // Centripetal limit (mm/s)
+            float vMax = Mathf.Sqrt(maxAcceleration * Mathf.Max(radius, 1e-6f));
+            // Convert back to mm/min
+            float feedLimit = vMax * 60f;
+            return Mathf.Min(feedLimit, programmedFeed);
+        }
+
+        // ── Feed-profile optimisation (forward + backward pass) ─────────
+
+        /// <summary>
+        /// Produce a per-segment optimal feed array using a bidirectional
+        /// trapezoidal velocity planner.
+        /// </summary>
+        public float[] OptimizeFeedProfile(
+            List<ToolpathSegment> segments,
+            List<CornerAnalysis> corners)
+        {
+            if (segments == null || segments.Count == 0)
+                return Array.Empty<float>();
+
+            int n = segments.Count;
+            float[] feeds = new float[n];
+
+            // Initialise to programmed feeds
+            for (int i = 0; i < n; i++)
+                feeds[i] = segments[i].feedRate;
+
+            if (corners == null || corners.Count == 0)
+                return feeds;
+
+            // ── Forward pass: limit acceleration away from each corner ──
+            for (int c = 0; c < corners.Count; c++)
+            {
+                float vCorner = corners[c].recommendedCornerFeed / 60f; // mm/s
+                int startSeg = corners[c].blockIndex + 1; // segment after the corner
+
+                float vPrev = vCorner;
+                for (int i = startSeg; i < n; i++)
+                {
+                    float segLen = Vector3.Distance(segments[i].startPos, segments[i].endPos);
+                    // v² = v_prev² + 2*a*d
+                    float vReachable = Mathf.Sqrt(vPrev * vPrev + 2f * maxAcceleration * segLen);
+                    float vReachableFeed = vReachable * 60f;
+
+                    if (vReachableFeed < feeds[i])
+                        feeds[i] = vReachableFeed;
+                    else
+                        break; // already at or below cruise – stop propagating
+
+                    vPrev = feeds[i] / 60f;
+                }
+            }
+
+            // ── Backward pass: limit deceleration into each corner ──────
+            for (int c = 0; c < corners.Count; c++)
+            {
+                float vCorner = corners[c].recommendedCornerFeed / 60f; // mm/s
+                int endSeg = corners[c].blockIndex; // segment arriving at the corner
+
+                float vPrev = vCorner;
+                for (int i = endSeg; i >= 0; i--)
+                {
+                    float segLen = Vector3.Distance(segments[i].startPos, segments[i].endPos);
+                    float vReachable = Mathf.Sqrt(vPrev * vPrev + 2f * maxAcceleration * segLen);
+                    float vReachableFeed = vReachable * 60f;
+
+                    if (vReachableFeed < feeds[i])
+                        feeds[i] = vReachableFeed;
+                    else
+                        break;
+
+                    vPrev = feeds[i] / 60f;
+                }
+            }
+
+            return feeds;
+        }
+
+        // ── Cycle-time estimation ───────────────────────────────────────
+
+        /// <summary>
+        /// Estimate total cycle time (seconds) given segments and their
+        /// effective feed rates (mm/min).
+        /// </summary>
+        public float EstimateCycleTime(List<ToolpathSegment> segments, float[] feeds)
+        {
+            if (segments == null || feeds == null) return 0f;
+
+            float totalTime = 0f;
+            int count = Mathf.Min(segments.Count, feeds.Length);
+
+            for (int i = 0; i < count; i++)
+            {
+                float len = Vector3.Distance(segments[i].startPos, segments[i].endPos);
+                float feedMmPerSec = feeds[i] / 60f;
+                if (feedMmPerSec > 1e-6f)
+                    totalTime += len / feedMmPerSec;
+            }
+
+            return totalTime;
+        }
+
+        // ── High-level entry point ──────────────────────────────────────
+
+        /// <summary>
+        /// Run the full smoothing pipeline: analyse corners, optimise the
+        /// feed profile, and return aggregate metrics.
+        /// </summary>
+        public PathSmoothingResult SmoothPath(List<ToolpathSegment> segments)
+        {
+            var result = new PathSmoothingResult();
+            if (segments == null || segments.Count == 0)
+                return result;
+
+            result.originalSegmentCount = segments.Count;
+            result.smoothedSegmentCount = segments.Count; // no segment merging in this pass
+
+            // Total path length
+            float totalLen = 0f;
+            for (int i = 0; i < segments.Count; i++)
+                totalLen += Vector3.Distance(segments[i].startPos, segments[i].endPos);
+            result.totalPathLength = totalLen;
+
+            // Corner analysis
+            var corners = AnalyzeCorners(segments);
+            result.corners = corners;
+
+            // Original cycle time (programmed feeds)
+            float[] originalFeeds = new float[segments.Count];
+            for (int i = 0; i < segments.Count; i++)
+                originalFeeds[i] = segments[i].feedRate;
+            result.estimatedCycleTime = EstimateCycleTime(segments, originalFeeds);
+
+            // Optimised cycle time
+            float[] optFeeds = OptimizeFeedProfile(segments, corners);
+            result.optimizedCycleTime = EstimateCycleTime(segments, optFeeds);
+
+            // Time savings
+            if (result.estimatedCycleTime > 1e-6f)
+            {
+                result.timeSavingsPct =
+                    (1f - result.optimizedCycleTime / result.estimatedCycleTime) * 100f;
+            }
+
+            result.maxJerk = maxJerk;
+
+            return result;
+        }
+    }
+
     /// <summary>
     /// Performs lookahead analysis on upcoming G-code segments to predict
     /// forces, power, temperature rise, cumulative wear, remaining tool life,

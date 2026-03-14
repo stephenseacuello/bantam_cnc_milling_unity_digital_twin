@@ -6,7 +6,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-14
+
 ### Added
+
+**Predictive Digital Twin**
+- Real cutting simulation proxy (Altintas force model, Taylor wear, Python port)
+- G-code lookahead engine with collision detection and path smoothing
+- Chatter prediction via ZOA stability lobe theory with wear adjustment
+- Tool deflection model (cantilever beam) and surface roughness prediction
+- Multi-zone thermal model (5 zones: spindle, workpiece, tool_holder, coolant, ambient)
+- Block telemetry tracking with drift detection and auto-calibration
+- Predictive anomaly markers with force/thermal/wear/chatter/surface risk identification
+- Program-level optimization with per-block feed/speed suggestions
+- Chip load monitoring with thinning correction, MRR, and recutting risk
+- Workholding force analysis with lift-off and rotation risk detection
+- Tool path corner analysis with trapezoidal feed profiling
+- Spindle vibration spectrum analysis with DFT-based chatter detection
+
+**Situational Awareness**
+- Alert correlation engine with YAML-configurable rules and G-code context
+- Anomaly pattern library with learned failure signatures and JSONL persistence
+- Root cause analyzer with Bayesian evidence scoring across 8 CNC failure modes
+- Fleet overview panel with predictive health data, RUL bars, and OEE trending
+- Decision support panel with causal trajectory preview and what-if simulation
+- Machine utilization heatmap with state timeline and idle analysis
+- Operator shift handoff reports with OEE summary and recommendations
+- Multi-channel notification dispatcher (dashboard, email, SMS, MQTT, webhook)
+- Alarm escalation policy engine with configurable multi-level escalation
+- Explainable AI with 3-level explanations and feature contribution ranking
+- Action ranking with multi-criteria cost-benefit scoring
+
+**Closed-Loop Control**
+- Adaptive feedrate controller with hysteresis state machine and debounce
+- Preemptive control from anomaly markers (N blocks ahead)
+- Forward causal simulation with physics-based transfer functions
+- Coolant optimization advisory with material-aware recommendations
+- G-code macro expansion engine (M98/G65 with parameter substitution)
+
+**Manufacturing Intelligence**
+- Process capability profiler (Cp/Cpk/Pp/Ppk) with Western Electric rules
+- Predictive OEE with anomaly-driven quality/scrap prediction
+- Energy consumption tracker with carbon footprint and idle waste detection
+- Material genealogy in digital thread (batch traceability)
+- Predictive maintenance scheduler with RUL-triggered auto-scheduling
+- Job queue priority optimizer with setup batching and bottleneck identification
+- Workpiece material database (10 pre-loaded materials with cutting parameters)
+- Tool calibration data with EMA learning and per-machine JSON persistence
+- Prediction tracking in digital thread with accuracy trending
+- Geometric tolerance (GD&T) analysis for 10 tolerance types
+
+**Security & Resiliency**
+- G-code Ed25519 signing and verification
+- Secure audit storage with AES-256-GCM encryption and hash chain verification
+- Network partition detector with heartbeat-based classification
+- Recovery orchestrator with real lifecycle transitions
+- Key rotation and chain compaction for audit logs
+- Operator feedback loop with acceptance/effectiveness tracking
+
+**Knowledge & Reasoning**
+- Knowledge graph with JSONL persistence and atomic writes
+- Causal inference with temporal evidence decay and threading safety (RLock)
+- Reasoning engine with simulated actions and physics-based outcomes
+
+**Testing & Infrastructure**
+- Test suite grown from 547 to 2739 tests (5x increase)
+- miracle_core/test conftest for mock pollution prevention
+- miracle_security/test conftest for submodule restoration
 - GitHub Actions CI/CD pipeline (test, lint, Docker build)
 - Root README with architecture overview and quick start
 - Pinned Python dependencies (requirements.txt, requirements-dev.txt)

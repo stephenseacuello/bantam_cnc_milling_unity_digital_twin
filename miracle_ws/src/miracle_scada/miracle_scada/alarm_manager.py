@@ -515,6 +515,298 @@ class EscalationEngine:
             return template
 
 
+# ---------------------------------------------------------------------------
+# Multi-channel operator notification dispatcher
+# ---------------------------------------------------------------------------
+
+SEVERITY_ORDER = {'INFO': 0, 'WARNING': 1, 'CRITICAL': 2}
+
+
+@dataclass
+class NotificationChannel:
+    """Configuration for a single notification channel."""
+    channel_type: str  # DASHBOARD, AUDIO, EMAIL, SMS, MQTT, WEBHOOK
+    enabled: bool = True
+    config: Dict[str, Any] = field(default_factory=dict)
+    min_severity: str = 'INFO'  # INFO, WARNING, CRITICAL
+    quiet_hours: Optional[Tuple[int, int]] = None  # (start_hour, end_hour) or None
+    rate_limit_per_min: int = 10
+
+
+@dataclass
+class Notification:
+    """Record of a dispatched notification."""
+    notification_id: str
+    timestamp: float
+    channel: str
+    recipient: str
+    subject: str
+    body: str
+    severity: str
+    alarm_id: str
+    delivered: bool = False
+    delivery_attempts: int = 0
+    acknowledged: bool = False
+
+
+class NotificationDispatcher:
+    """Multi-channel notification dispatcher for operator alerts.
+
+    Manages multiple notification channels (DASHBOARD, AUDIO, EMAIL, SMS,
+    MQTT, WEBHOOK) with per-channel severity filtering, quiet hours,
+    rate limiting, and temporary suppression.
+    """
+
+    def __init__(self) -> None:
+        self._channels: Dict[str, NotificationChannel] = {}
+        self._history: List[Notification] = []
+        self._rate_counters: Dict[str, List[float]] = {}  # channel -> list of timestamps
+        self._suppressed_until: Dict[str, float] = {}  # channel -> resume_timestamp
+        self._lock = threading.Lock()
+
+        # Default: DASHBOARD always on
+        self.register_channel(NotificationChannel(
+            channel_type='DASHBOARD',
+            enabled=True,
+            min_severity='INFO',
+            rate_limit_per_min=60,
+        ))
+
+    def register_channel(self, channel: NotificationChannel) -> None:
+        """Register or replace a notification channel."""
+        with self._lock:
+            self._channels[channel.channel_type] = channel
+            if channel.channel_type not in self._rate_counters:
+                self._rate_counters[channel.channel_type] = []
+
+    def dispatch(
+        self,
+        alarm_id: str,
+        severity: str,
+        subject: str,
+        body: str,
+        recipients: Optional[List[str]] = None,
+        current_time: Optional[float] = None,
+        current_hour: Optional[int] = None,
+    ) -> List[Notification]:
+        """Dispatch notifications across all eligible channels.
+
+        Args:
+            alarm_id: The alarm that triggered this notification.
+            severity: One of INFO, WARNING, CRITICAL.
+            subject: Notification subject line.
+            body: Notification body text.
+            recipients: Optional list of recipients. Defaults to ['operator'].
+            current_time: Override for current timestamp (for testing).
+            current_hour: Override for current hour (for testing quiet hours).
+
+        Returns:
+            List of Notification objects created (one per channel per recipient).
+        """
+        import time as _time
+        now = current_time if current_time is not None else _time.time()
+        hour = current_hour if current_hour is not None else int((_time.localtime(now).tm_hour))
+        if recipients is None:
+            recipients = ['operator']
+
+        notifications: List[Notification] = []
+        sev_level = SEVERITY_ORDER.get(severity, 0)
+
+        with self._lock:
+            for ch_type, channel in self._channels.items():
+                if not channel.enabled:
+                    continue
+
+                # Severity filter
+                ch_min = SEVERITY_ORDER.get(channel.min_severity, 0)
+                if sev_level < ch_min:
+                    continue
+
+                # Suppression check
+                suppressed_until = self._suppressed_until.get(ch_type, 0.0)
+                if now < suppressed_until:
+                    continue
+
+                # Quiet hours check
+                if channel.quiet_hours is not None:
+                    start_h, end_h = channel.quiet_hours
+                    if start_h <= end_h:
+                        if start_h <= hour < end_h:
+                            continue
+                    else:
+                        # Wraps midnight, e.g. (22, 6)
+                        if hour >= start_h or hour < end_h:
+                            continue
+
+                # Rate limit check
+                timestamps = self._rate_counters.get(ch_type, [])
+                window_start = now - 60.0
+                timestamps = [t for t in timestamps if t > window_start]
+                self._rate_counters[ch_type] = timestamps
+                if len(timestamps) >= channel.rate_limit_per_min:
+                    continue
+
+                # Format subject/body per channel
+                formatted_subject, formatted_body = self.format_notification(
+                    {'alarm_id': alarm_id, 'severity': severity,
+                     'subject': subject, 'body': body},
+                    ch_type,
+                )
+
+                for recipient in recipients:
+                    notif = Notification(
+                        notification_id=str(uuid.uuid4())[:12],
+                        timestamp=now,
+                        channel=ch_type,
+                        recipient=recipient,
+                        subject=formatted_subject,
+                        body=formatted_body,
+                        severity=severity,
+                        alarm_id=alarm_id,
+                        delivered=True,
+                        delivery_attempts=1,
+                        acknowledged=False,
+                    )
+                    self._history.append(notif)
+                    timestamps.append(now)
+                    notifications.append(notif)
+
+        return notifications
+
+    def get_notification_history(
+        self,
+        alarm_id: Optional[str] = None,
+        channel: Optional[str] = None,
+        last_n: int = 50,
+    ) -> List[Notification]:
+        """Return recent notification history, optionally filtered."""
+        with self._lock:
+            result = list(self._history)
+        if alarm_id is not None:
+            result = [n for n in result if n.alarm_id == alarm_id]
+        if channel is not None:
+            result = [n for n in result if n.channel == channel]
+        return result[-last_n:]
+
+    def acknowledge_notification(self, notification_id: str) -> bool:
+        """Acknowledge a notification by ID. Returns True if found."""
+        with self._lock:
+            for notif in self._history:
+                if notif.notification_id == notification_id:
+                    notif.acknowledged = True
+                    return True
+        return False
+
+    def get_unacknowledged(
+        self, channel: Optional[str] = None,
+    ) -> List[Notification]:
+        """Return unacknowledged notifications, optionally filtered by channel."""
+        with self._lock:
+            result = [n for n in self._history if not n.acknowledged]
+        if channel is not None:
+            result = [n for n in result if n.channel == channel]
+        return result
+
+    def set_quiet_hours(
+        self, channel_type: str, start_hour: int, end_hour: int,
+    ) -> None:
+        """Set quiet hours for a channel."""
+        with self._lock:
+            ch = self._channels.get(channel_type)
+            if ch is not None:
+                ch.quiet_hours = (start_hour, end_hour)
+
+    def get_delivery_stats(self) -> Dict[str, Any]:
+        """Return delivery statistics.
+
+        Returns:
+            Dict with total_sent, by_channel, by_severity, failed_count,
+            avg_delivery_time.
+        """
+        with self._lock:
+            history = list(self._history)
+
+        total_sent = len(history)
+        by_channel: Dict[str, int] = {}
+        by_severity: Dict[str, int] = {}
+        failed_count = 0
+
+        for n in history:
+            by_channel[n.channel] = by_channel.get(n.channel, 0) + 1
+            by_severity[n.severity] = by_severity.get(n.severity, 0) + 1
+            if not n.delivered:
+                failed_count += 1
+
+        return {
+            'total_sent': total_sent,
+            'by_channel': by_channel,
+            'by_severity': by_severity,
+            'failed_count': failed_count,
+            'avg_delivery_time': 0.0,  # simulated — instant delivery
+        }
+
+    def suppress_channel(self, channel_type: str, duration_sec: float,
+                         current_time: Optional[float] = None) -> None:
+        """Temporarily suppress a channel for a given duration."""
+        import time as _time
+        now = current_time if current_time is not None else _time.time()
+        with self._lock:
+            self._suppressed_until[channel_type] = now + duration_sec
+
+    def format_notification(
+        self,
+        alarm: Dict[str, Any],
+        channel_type: str,
+    ) -> Tuple[str, str]:
+        """Format a notification for the given channel type.
+
+        Args:
+            alarm: Dict with keys alarm_id, severity, subject, body.
+            channel_type: The target channel.
+
+        Returns:
+            (subject, body) tuple with channel-appropriate formatting.
+        """
+        alarm_id = alarm.get('alarm_id', '')
+        severity = alarm.get('severity', '')
+        subject = alarm.get('subject', '')
+        body = alarm.get('body', '')
+
+        if channel_type == 'DASHBOARD':
+            # Short text
+            dash_subject = f"[{severity}] {subject}"
+            dash_body = body[:200] if len(body) > 200 else body
+            return dash_subject, dash_body
+
+        elif channel_type == 'EMAIL':
+            # Full detail with context
+            email_subject = f"[{severity}] Alarm {alarm_id}: {subject}"
+            email_body = (
+                f"Alarm ID: {alarm_id}\n"
+                f"Severity: {severity}\n"
+                f"Subject: {subject}\n\n"
+                f"{body}\n\n"
+                f"Please take appropriate action."
+            )
+            return email_subject, email_body
+
+        elif channel_type == 'SMS':
+            # 160-char summary
+            sms_text = f"[{severity}] {alarm_id}: {subject} - {body}"
+            if len(sms_text) > 160:
+                sms_text = sms_text[:157] + '...'
+            return sms_text, sms_text
+
+        elif channel_type == 'AUDIO':
+            # Spoken text
+            spoken = f"Attention. {severity} alarm. {subject}. {body}"
+            return subject, spoken
+
+        else:
+            # Generic (MQTT, WEBHOOK, etc.)
+            return f"[{severity}] {subject}", body
+
+
 class AlarmManagerNode(MiracleLifecycleNode):
     """Centralizes alarm management with ISA-18.2 compliance.
 

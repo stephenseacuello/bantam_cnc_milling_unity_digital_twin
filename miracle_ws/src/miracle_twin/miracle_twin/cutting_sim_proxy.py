@@ -1009,6 +1009,258 @@ class WorkholdingAnalyzer:
         return max(0.0, max_depth)
 
 
+@dataclass
+class ChipLoadMetrics:
+    """Metrics from chip load analysis for a single cutting condition."""
+    chip_load_mm: float = 0.0              # feed per tooth (mm/tooth)
+    chip_thinning_factor: float = 1.0      # radial engagement correction
+    effective_chip_load_mm: float = 0.0    # actual chip thickness after thinning
+    chip_volume_rate_mm3_per_min: float = 0.0
+    mrr_cm3_per_min: float = 0.0          # material removal rate
+    specific_energy_j_per_mm3: float = 0.0
+    is_optimal: bool = False
+    deviation_from_optimal_pct: float = 0.0
+    recommendation: str = ''
+
+
+class ChipLoadMonitor:
+    """Monitors and optimizes chip load for CNC milling operations.
+
+    Tracks feed-per-tooth against material-specific optimal ranges,
+    computes chip thinning corrections for partial radial engagement,
+    and provides trend analysis for process stability monitoring.
+    """
+
+    # Optimal chip load ranges (mm/tooth) by material and tool diameter category.
+    # Keys: material name -> (min_chip_load, max_chip_load) for standard diameters.
+    OPTIMAL_RANGES: Dict[str, tuple] = {
+        '6061-T6':  (0.05, 0.15),
+        '7075-T6':  (0.04, 0.12),
+        '304-SS':   (0.02, 0.08),
+        'Ti-6Al-4V': (0.01, 0.05),
+    }
+
+    # Specific cutting energy (J/mm^3) by material.
+    SPECIFIC_ENERGY: Dict[str, float] = {
+        '6061-T6':  0.9,
+        '7075-T6':  1.1,
+        '304-SS':   2.8,
+        'Ti-6Al-4V': 3.5,
+    }
+
+    def __init__(
+        self,
+        material: str = '6061-T6',
+        num_flutes: int = 2,
+        tool_diameter_mm: float = 6.35,
+    ):
+        self.material = material
+        self.num_flutes = num_flutes
+        self.tool_diameter_mm = tool_diameter_mm
+        # Default radial and axial engagement (can be overridden per call)
+        self._default_ae_mm = tool_diameter_mm * 0.5  # 50% radial engagement
+        self._default_ap_mm = 1.5
+
+    # ----- helpers -----
+
+    def _get_range(self) -> tuple:
+        """Return (min, max) optimal chip load for current material."""
+        return self.OPTIMAL_RANGES.get(self.material, (0.05, 0.15))
+
+    def _get_specific_energy(self) -> float:
+        return self.SPECIFIC_ENERGY.get(self.material, 1.0)
+
+    # ----- core API -----
+
+    def compute_chip_load(
+        self,
+        feed_rate_mmpm: float,
+        rpm: float,
+        ae_mm: Optional[float] = None,
+        ap_mm: Optional[float] = None,
+    ) -> ChipLoadMetrics:
+        """Compute chip load metrics for given cutting conditions.
+
+        Args:
+            feed_rate_mmpm: Table feed rate in mm/min.
+            rpm: Spindle speed in rev/min.
+            ae_mm: Radial depth of cut (width). Defaults to 50% of tool diameter.
+            ap_mm: Axial depth of cut. Defaults to 1.5 mm.
+
+        Returns:
+            ChipLoadMetrics with all computed values.
+        """
+        if rpm <= 0 or self.num_flutes <= 0:
+            return ChipLoadMetrics(
+                recommendation='Invalid parameters: RPM and flutes must be > 0',
+            )
+
+        ae = ae_mm if ae_mm is not None else self._default_ae_mm
+        ap = ap_mm if ap_mm is not None else self._default_ap_mm
+        d = self.tool_diameter_mm
+
+        # Basic chip load (feed per tooth)
+        chip_load = feed_rate_mmpm / (rpm * self.num_flutes)
+
+        # Chip thinning factor for partial radial engagement
+        # When ae < d, the actual chip is thinner than the programmed feed/tooth.
+        # thinning = sqrt(1 - (1 - 2*ae/d)^2)
+        ratio_ae_d = min(ae / d, 1.0) if d > 0 else 1.0
+        inner_term = 1.0 - 2.0 * ratio_ae_d
+        thinning_arg = 1.0 - inner_term ** 2
+        chip_thinning_factor = math.sqrt(max(0.0, thinning_arg))
+        # Guard against zero thinning (full slotting gives thinning = 1.0)
+        if chip_thinning_factor < 1e-9:
+            chip_thinning_factor = 1.0
+
+        effective_chip_load = chip_load / chip_thinning_factor
+
+        # Material removal rate
+        mrr_mm3 = ap * ae * feed_rate_mmpm   # mm^3/min
+        mrr_cm3 = mrr_mm3 / 1000.0           # cm^3/min
+
+        # Chip volume rate (per tooth)
+        chip_volume_rate = mrr_mm3  # total volumetric rate
+
+        # Specific energy
+        se = self._get_specific_energy()
+
+        # Optimal range check
+        rng_min, rng_max = self._get_range()
+        mid_optimal = (rng_min + rng_max) / 2.0
+        is_optimal = rng_min <= chip_load <= rng_max
+
+        if mid_optimal > 0:
+            deviation_pct = ((chip_load - mid_optimal) / mid_optimal) * 100.0
+        else:
+            deviation_pct = 0.0
+
+        # Recommendation
+        if chip_load < rng_min:
+            recommendation = (
+                f'Chip load {chip_load:.4f} mm is below optimal range '
+                f'[{rng_min:.3f}, {rng_max:.3f}]. Increase feed rate to avoid '
+                f'recutting and accelerated wear.'
+            )
+        elif chip_load > rng_max:
+            recommendation = (
+                f'Chip load {chip_load:.4f} mm exceeds optimal range '
+                f'[{rng_min:.3f}, {rng_max:.3f}]. Reduce feed rate to prevent '
+                f'excessive tool loading.'
+            )
+        else:
+            recommendation = (
+                f'Chip load {chip_load:.4f} mm is within optimal range '
+                f'[{rng_min:.3f}, {rng_max:.3f}].'
+            )
+
+        return ChipLoadMetrics(
+            chip_load_mm=chip_load,
+            chip_thinning_factor=chip_thinning_factor,
+            effective_chip_load_mm=effective_chip_load,
+            chip_volume_rate_mm3_per_min=chip_volume_rate,
+            mrr_cm3_per_min=mrr_cm3,
+            specific_energy_j_per_mm3=se,
+            is_optimal=is_optimal,
+            deviation_from_optimal_pct=deviation_pct,
+            recommendation=recommendation,
+        )
+
+    def get_optimal_feed(
+        self,
+        rpm: float,
+        depth_mm: float = 1.5,
+        width_mm: Optional[float] = None,
+    ) -> float:
+        """Compute the feed rate (mm/min) that achieves the midpoint optimal chip load.
+
+        Args:
+            rpm: Spindle speed in rev/min.
+            depth_mm: Axial depth of cut (not used in feed calc, kept for API symmetry).
+            width_mm: Radial engagement. Defaults to 50% of tool diameter.
+
+        Returns:
+            Optimal feed rate in mm/min, or 0.0 if parameters are invalid.
+        """
+        if rpm <= 0 or self.num_flutes <= 0:
+            return 0.0
+
+        rng_min, rng_max = self._get_range()
+        target_chip_load = (rng_min + rng_max) / 2.0
+
+        # feed = chip_load * rpm * flutes
+        return target_chip_load * rpm * self.num_flutes
+
+    def analyze_trend(self, history: List[ChipLoadMetrics]) -> dict:
+        """Analyze a history of chip load metrics for trends and stability.
+
+        Args:
+            history: Ordered list of ChipLoadMetrics (oldest first).
+
+        Returns:
+            Dict with keys: trend ('stable', 'increasing', 'decreasing'),
+            avg_chip_load, std_chip_load, stability_score (0-1, higher = more stable).
+        """
+        if not history:
+            return {
+                'trend': 'stable',
+                'avg_chip_load': 0.0,
+                'std_chip_load': 0.0,
+                'stability_score': 1.0,
+            }
+
+        loads = [m.chip_load_mm for m in history]
+        n = len(loads)
+        avg = sum(loads) / n
+        variance = sum((x - avg) ** 2 for x in loads) / n if n > 0 else 0.0
+        std = math.sqrt(variance)
+
+        # Trend detection via simple linear regression slope
+        if n >= 2:
+            x_mean = (n - 1) / 2.0
+            y_mean = avg
+            num = sum((i - x_mean) * (loads[i] - y_mean) for i in range(n))
+            den = sum((i - x_mean) ** 2 for i in range(n))
+            slope = num / den if den > 0 else 0.0
+
+            # Normalise slope relative to mean
+            rel_slope = slope / avg if avg > 0 else 0.0
+            if rel_slope > 0.02:
+                trend = 'increasing'
+            elif rel_slope < -0.02:
+                trend = 'decreasing'
+            else:
+                trend = 'stable'
+        else:
+            trend = 'stable'
+
+        # Stability score: 1.0 when std is 0, decreasing as variation grows
+        cv = std / avg if avg > 0 else 0.0
+        stability_score = max(0.0, min(1.0, 1.0 - cv * 5.0))
+
+        return {
+            'trend': trend,
+            'avg_chip_load': avg,
+            'std_chip_load': std,
+            'stability_score': stability_score,
+        }
+
+    def check_recutting_risk(self, chip_load_mm: float) -> bool:
+        """Check whether the chip load is too thin, risking chip recutting.
+
+        Recutting occurs when chips are too thin to curl away from the cutter
+        and instead get re-cut, accelerating flank wear.
+
+        Args:
+            chip_load_mm: Current feed per tooth in mm.
+
+        Returns:
+            True if recutting risk is present (chip load below minimum).
+        """
+        rng_min, _ = self._get_range()
+        return chip_load_mm < rng_min
+
+
 class CuttingSimProxy:
     """Python proxy for cutting force + wear simulation.
 
@@ -2019,6 +2271,36 @@ class CuttingSimProxy:
             'chatter_risk_score': chatter,
             'surface_ra_um': surface_ra,
         }
+
+    def get_chip_load_analysis(
+        self,
+        block: 'GCodeBlock',
+        tool_state: Optional['ToolState'] = None,
+    ) -> 'ChipLoadMetrics':
+        """Analyze chip load for a G-code block.
+
+        Creates a ChipLoadMonitor using the current tool state (or defaults)
+        and computes chip load metrics for the block's cutting conditions.
+
+        Args:
+            block: G-code block with feed, RPM, depths.
+            tool_state: Optional tool state for diameter/flute info.
+
+        Returns:
+            ChipLoadMetrics with chip load analysis.
+        """
+        tool = tool_state or ToolState()
+        monitor = ChipLoadMonitor(
+            material='6061-T6',
+            num_flutes=tool.flute_count,
+            tool_diameter_mm=tool.diameter_mm,
+        )
+        return monitor.compute_chip_load(
+            feed_rate_mmpm=block.feed_rate_mmpm,
+            rpm=block.spindle_rpm,
+            ae_mm=block.radial_depth_mm,
+            ap_mm=block.axial_depth_mm,
+        )
 
     # ------------------------------------------------------------------
     # Program-level optimization

@@ -6,12 +6,268 @@ from design to production. Implements a blockchain-like chain of
 entries with hash links for tamper evidence.
 """
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import hashlib
 import json
 import threading
 import time
 import uuid
+
+
+# ------------------------------------------------------------------
+# Energy consumption tracking
+# ------------------------------------------------------------------
+
+@dataclass
+class EnergyProfile:
+    """Energy consumption profile for a machining operation or time window."""
+
+    total_kwh: float = 0.0
+    spindle_kwh: float = 0.0
+    axis_kwh: float = 0.0
+    coolant_kwh: float = 0.0
+    auxiliary_kwh: float = 0.0
+    idle_kwh: float = 0.0
+    peak_power_kw: float = 0.0
+    avg_power_kw: float = 0.0
+    energy_per_part_kwh: float = 0.0
+    energy_per_cm3_wh: float = 0.0
+    carbon_footprint_kg: float = 0.0
+
+
+class EnergyTracker:
+    """Tracks and analyses energy consumption across CNC subsystems.
+
+    Collects timestamped power samples and provides methods for
+    computing energy profiles, trends, idle waste, and program
+    comparisons.
+    """
+
+    def __init__(self, grid_emission_factor_kg_per_kwh: float = 0.4) -> None:
+        self._grid_emission_factor = grid_emission_factor_kg_per_kwh
+        self._power_log: List[Dict[str, float]] = []
+        self._log_lock = threading.Lock()
+
+    # -- recording ---------------------------------------------------
+
+    def record_power(
+        self,
+        timestamp: float,
+        spindle_kw: float,
+        axis_kw: float,
+        coolant_kw: float,
+        auxiliary_kw: float,
+    ) -> None:
+        """Record a timestamped power sample."""
+        sample = {
+            'timestamp': timestamp,
+            'spindle_kw': spindle_kw,
+            'axis_kw': axis_kw,
+            'coolant_kw': coolant_kw,
+            'auxiliary_kw': auxiliary_kw,
+            'total_kw': spindle_kw + axis_kw + coolant_kw + auxiliary_kw,
+        }
+        with self._log_lock:
+            self._power_log.append(sample)
+
+    # -- computation -------------------------------------------------
+
+    def compute_energy_profile(
+        self,
+        start_time: float,
+        end_time: float,
+        parts_produced: int = 1,
+        volume_removed_cm3: float = 0.0,
+    ) -> EnergyProfile:
+        """Compute an *EnergyProfile* from recorded power samples.
+
+        Uses the trapezoidal rule to integrate power over time for each
+        subsystem.  Idle energy is computed as the sum of auxiliary
+        power samples that fall below a 0.5 kW total threshold.
+        """
+        with self._log_lock:
+            samples = [
+                s for s in self._power_log
+                if start_time <= s['timestamp'] <= end_time
+            ]
+
+        if len(samples) < 2:
+            # Not enough data points for integration
+            profile = EnergyProfile()
+            if len(samples) == 1:
+                profile.peak_power_kw = samples[0]['total_kw']
+                profile.avg_power_kw = samples[0]['total_kw']
+            return profile
+
+        samples.sort(key=lambda s: s['timestamp'])
+
+        spindle_kwh = 0.0
+        axis_kwh = 0.0
+        coolant_kwh = 0.0
+        auxiliary_kwh = 0.0
+        idle_kwh = 0.0
+        peak_kw = 0.0
+
+        for i in range(1, len(samples)):
+            dt_h = (samples[i]['timestamp'] - samples[i - 1]['timestamp']) / 3600.0
+            # Trapezoidal rule per subsystem
+            spindle_kwh += 0.5 * (samples[i - 1]['spindle_kw'] + samples[i]['spindle_kw']) * dt_h
+            axis_kwh += 0.5 * (samples[i - 1]['axis_kw'] + samples[i]['axis_kw']) * dt_h
+            coolant_kwh += 0.5 * (samples[i - 1]['coolant_kw'] + samples[i]['coolant_kw']) * dt_h
+            auxiliary_kwh += 0.5 * (samples[i - 1]['auxiliary_kw'] + samples[i]['auxiliary_kw']) * dt_h
+
+            # Idle energy: intervals where both endpoints are below idle threshold
+            idle_threshold = 0.5
+            if samples[i - 1]['total_kw'] < idle_threshold and samples[i]['total_kw'] < idle_threshold:
+                idle_kwh += 0.5 * (samples[i - 1]['total_kw'] + samples[i]['total_kw']) * dt_h
+
+            for s in (samples[i - 1], samples[i]):
+                if s['total_kw'] > peak_kw:
+                    peak_kw = s['total_kw']
+
+        total_kwh = spindle_kwh + axis_kwh + coolant_kwh + auxiliary_kwh
+        duration_h = (samples[-1]['timestamp'] - samples[0]['timestamp']) / 3600.0
+        avg_kw = total_kwh / duration_h if duration_h > 0 else 0.0
+
+        parts = max(parts_produced, 1)
+        energy_per_part = total_kwh / parts
+        energy_per_cm3 = (total_kwh * 1000.0 / volume_removed_cm3) if volume_removed_cm3 > 0 else 0.0
+        carbon = total_kwh * self._grid_emission_factor
+
+        return EnergyProfile(
+            total_kwh=total_kwh,
+            spindle_kwh=spindle_kwh,
+            axis_kwh=axis_kwh,
+            coolant_kwh=coolant_kwh,
+            auxiliary_kwh=auxiliary_kwh,
+            idle_kwh=idle_kwh,
+            peak_power_kw=peak_kw,
+            avg_power_kw=avg_kw,
+            energy_per_part_kwh=energy_per_part,
+            energy_per_cm3_wh=energy_per_cm3,
+            carbon_footprint_kg=carbon,
+        )
+
+    # -- breakdown ---------------------------------------------------
+
+    def get_power_breakdown(
+        self, start_time: float, end_time: float,
+    ) -> Dict[str, float]:
+        """Return subsystem energy as a percentage of total."""
+        profile = self.compute_energy_profile(start_time, end_time)
+        total = profile.total_kwh
+        if total <= 0:
+            return {
+                'spindle_pct': 0.0,
+                'axis_pct': 0.0,
+                'coolant_pct': 0.0,
+                'auxiliary_pct': 0.0,
+            }
+        return {
+            'spindle_pct': profile.spindle_kwh / total * 100.0,
+            'axis_pct': profile.axis_kwh / total * 100.0,
+            'coolant_pct': profile.coolant_kwh / total * 100.0,
+            'auxiliary_pct': profile.auxiliary_kwh / total * 100.0,
+        }
+
+    # -- trend -------------------------------------------------------
+
+    def get_energy_trend(
+        self, hours_back: float = 24, slot_hours: float = 1,
+    ) -> List[Tuple[float, float]]:
+        """Return energy per time slot over the last *hours_back* hours.
+
+        Returns a list of ``(slot_start_timestamp, total_kwh)`` tuples.
+        """
+        now = time.time()
+        start = now - hours_back * 3600.0
+        slots: List[Tuple[float, float]] = []
+        cursor = start
+        while cursor < now:
+            slot_end = min(cursor + slot_hours * 3600.0, now)
+            profile = self.compute_energy_profile(cursor, slot_end)
+            slots.append((cursor, profile.total_kwh))
+            cursor = slot_end
+        return slots
+
+    # -- estimation --------------------------------------------------
+
+    def estimate_job_energy(
+        self,
+        duration_min: float,
+        avg_spindle_load_pct: float,
+        spindle_power_kw: float = 5.5,
+    ) -> float:
+        """Estimate total energy (kWh) for a job based on spindle load."""
+        duration_h = duration_min / 60.0
+        spindle_kwh = spindle_power_kw * (avg_spindle_load_pct / 100.0) * duration_h
+        # Assume axis ~15 %, coolant ~10 %, auxiliary ~5 % of spindle power
+        axis_kwh = spindle_power_kw * 0.15 * duration_h
+        coolant_kwh = spindle_power_kw * 0.10 * duration_h
+        aux_kwh = spindle_power_kw * 0.05 * duration_h
+        return spindle_kwh + axis_kwh + coolant_kwh + aux_kwh
+
+    # -- idle waste --------------------------------------------------
+
+    def get_idle_energy_waste(
+        self,
+        start_time: float,
+        end_time: float,
+        idle_threshold_kw: float = 0.5,
+    ) -> Tuple[float, float, float]:
+        """Compute idle energy waste.
+
+        Returns ``(idle_kwh, idle_pct, idle_cost_estimate)`` where
+        cost is estimated at $0.12/kWh.
+        """
+        with self._log_lock:
+            samples = [
+                s for s in self._power_log
+                if start_time <= s['timestamp'] <= end_time
+            ]
+        if len(samples) < 2:
+            return (0.0, 0.0, 0.0)
+
+        samples.sort(key=lambda s: s['timestamp'])
+
+        total_kwh = 0.0
+        idle_kwh = 0.0
+        for i in range(1, len(samples)):
+            dt_h = (samples[i]['timestamp'] - samples[i - 1]['timestamp']) / 3600.0
+            seg_kwh = 0.5 * (samples[i - 1]['total_kw'] + samples[i]['total_kw']) * dt_h
+            total_kwh += seg_kwh
+            if samples[i - 1]['total_kw'] < idle_threshold_kw and samples[i]['total_kw'] < idle_threshold_kw:
+                idle_kwh += seg_kwh
+
+        idle_pct = (idle_kwh / total_kwh * 100.0) if total_kwh > 0 else 0.0
+        cost_per_kwh = 0.12
+        return (idle_kwh, idle_pct, idle_kwh * cost_per_kwh)
+
+    # -- program comparison ------------------------------------------
+
+    @staticmethod
+    def compare_programs(
+        program_a_profile: EnergyProfile,
+        program_b_profile: EnergyProfile,
+    ) -> Dict[str, float]:
+        """Compare two program energy profiles.
+
+        Returns a dict with relative differences (positive means B uses
+        more energy than A).
+        """
+        def _pct_diff(a: float, b: float) -> float:
+            if a == 0:
+                return 0.0 if b == 0 else 100.0
+            return (b - a) / a * 100.0
+
+        return {
+            'total_kwh_diff_pct': _pct_diff(program_a_profile.total_kwh, program_b_profile.total_kwh),
+            'spindle_kwh_diff_pct': _pct_diff(program_a_profile.spindle_kwh, program_b_profile.spindle_kwh),
+            'peak_power_diff_pct': _pct_diff(program_a_profile.peak_power_kw, program_b_profile.peak_power_kw),
+            'energy_per_part_diff_pct': _pct_diff(program_a_profile.energy_per_part_kwh, program_b_profile.energy_per_part_kwh),
+            'carbon_diff_pct': _pct_diff(program_a_profile.carbon_footprint_kg, program_b_profile.carbon_footprint_kg),
+        }
 
 from rclpy.lifecycle import TransitionCallbackReturn
 
@@ -57,6 +313,10 @@ class DigitalThreadNode(MiracleLifecycleNode):
     PREDICTION_COMPARED = 'PREDICTION_COMPARED'
     CALIBRATION_APPLIED = 'CALIBRATION_APPLIED'
     CALIBRATION_REVERTED = 'CALIBRATION_REVERTED'
+
+    # Energy tracking entry types
+    ENERGY_RECORDED = 'energy_recorded'
+    ENERGY_OPTIMIZATION = 'energy_optimization'
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(
@@ -674,6 +934,43 @@ class DigitalThreadNode(MiracleLifecycleNode):
         elif ratio > 1.15:
             return 'degrading'
         return 'stable'
+
+    # ------------------------------------------------------------------
+    # Energy tracking
+    # ------------------------------------------------------------------
+
+    def record_energy_profile(
+        self,
+        machine_id: str,
+        program_id: str,
+        profile: 'EnergyProfile',
+    ) -> None:
+        """Record an energy profile entry in the digital thread."""
+        from dataclasses import asdict
+        entry = {
+            'entry_type': self.ENERGY_RECORDED,
+            'machine_id': machine_id,
+            'program_id': program_id,
+            'timestamp': time.time(),
+        }
+        entry.update(asdict(profile))
+        self._record_entry(entry)
+
+    def get_energy_history(
+        self,
+        machine_id: Optional[str] = None,
+        last_n: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return recent energy profile entries from the digital thread."""
+        with self._thread_lock:
+            results = [
+                e for e in self._entries
+                if e.get('entry_type') == self.ENERGY_RECORDED
+            ]
+            if machine_id is not None:
+                results = [e for e in results if e.get('machine_id') == machine_id]
+            results.sort(key=lambda e: e.get('timestamp', 0))
+            return results[-last_n:]
 
     def verify_chain_integrity(self) -> bool:
         """Verify the integrity of the digital thread chain.

@@ -1304,3 +1304,128 @@
     margin-top: 4px;
     padding: 3px 0;
 }
+
+/* ── GD&T Tolerance Indicators ───────────────────────────────── */
+
+.tolerance-indicator {
+    flex-direction: row;
+    align-items: center;
+    padding: 3px 8px;
+    margin-bottom: 3px;
+    background-color: rgba(25, 30, 50, 0.8);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: rgba(80, 140, 220, 0.3);
+    min-height: 24px;
+}
+
+.tolerance-indicator Label {
+    font-size: 11px;
+    color: rgb(200, 210, 230);
+}
+
+.tolerance-indicator .tolerance-feature-id {
+    -unity-font-style: bold;
+    min-width: 60px;
+    margin-right: 8px;
+}
+
+.tolerance-indicator .tolerance-value {
+    color: rgb(100, 200, 255);
+    -unity-font-style: bold;
+    min-width: 50px;
+    -unity-text-align: middle-right;
+    margin-right: 8px;
+}
+
+.tolerance-indicator .tolerance-risk-low {
+    color: rgb(80, 220, 120);
+}
+
+.tolerance-indicator .tolerance-risk-medium {
+    color: rgb(240, 210, 40);
+}
+
+.tolerance-indicator .tolerance-risk-high {
+    color: rgb(255, 150, 40);
+}
+
+.tolerance-indicator .tolerance-risk-out {
+    color: rgb(255, 60, 40);
+    -unity-font-style: bold;
+}
+
+.tolerance-bar {
+    flex-grow: 1;
+    height: 8px;
+    background-color: rgba(40, 40, 60, 0.8);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 0 4px;
+}
+
+.tolerance-bar .tolerance-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition-property: width, background-color;
+    transition-duration: 400ms;
+}
+
+.tolerance-critical {
+    background-color: rgba(255, 40, 30, 0.15);
+    border-color: rgba(255, 80, 60, 0.6);
+    border-width: 1px;
+    border-radius: 4px;
+}
+
+.tolerance-critical Label {
+    color: rgb(255, 120, 100);
+}
+
+.tolerance-critical .tolerance-feature-id {
+    color: rgb(255, 100, 80);
+}
+
+.tolerance-critical .tolerance-bar {
+    background-color: rgba(255, 40, 30, 0.25);
+}
+
+/* ── Spindle Load Balancing ────────────────────────────────────── */
+
+.load-bar {
+    min-width: 3px;
+    border-top-left-radius: 2px;
+    border-top-right-radius: 2px;
+    transition-property: height, background-color;
+    transition-duration: 300ms;
+}
+
+.load-bar:hover {
+    opacity: 0.85;
+    border-width: 1px;
+    border-color: rgba(255, 255, 255, 0.5);
+}
+
+.load-overloaded {
+    background-color: rgba(240, 60, 50, 0.9);
+    border-width: 1px;
+    border-color: rgba(255, 100, 80, 0.6);
+}
+
+.load-underloaded {
+    background-color: rgba(70, 130, 240, 0.7);
+    border-width: 1px;
+    border-color: rgba(100, 160, 255, 0.5);
+}
+
+.load-balance-score {
+    font-size: 13px;
+    -unity-font-style: bold;
+    margin-bottom: 4px;
+    padding: 2px 6px;
+    background-color: rgba(25, 30, 50, 0.7);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: rgba(80, 140, 220, 0.3);
+    -unity-text-align: middle-left;
+}

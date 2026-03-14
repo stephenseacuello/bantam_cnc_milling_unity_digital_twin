@@ -1,3 +1,6 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using MiracleTwin.Core;
 using MiracleTwin.CNC;
@@ -6,6 +9,185 @@ using RosMessageTypes.Miracle;
 
 namespace MiracleTwin.Cutting
 {
+    // ── GD&T Enums & Data Classes ──────────────────────────────────────
+
+    /// <summary>
+    /// Geometric tolerance types per ASME Y14.5 / ISO 1101.
+    /// </summary>
+    public enum ToleranceType
+    {
+        POSITION,
+        FLATNESS,
+        PARALLELISM,
+        PERPENDICULARITY,
+        CONCENTRICITY,
+        CIRCULARITY,
+        CYLINDRICITY,
+        PROFILE,
+        RUNOUT,
+        TOTAL_RUNOUT
+    }
+
+    /// <summary>
+    /// Defines a single GD&amp;T tolerance specification for a machined feature.
+    /// </summary>
+    [Serializable]
+    public class ToleranceSpec
+    {
+        public ToleranceType toleranceType;
+        public string featureId;
+        public float nominalValue;       // mm
+        public float toleranceZone;      // mm  (total tolerance band)
+        public string datumReference;    // e.g. "A", "A|B"
+        public string materialCondition; // MMC, LMC, RFS
+    }
+
+    /// <summary>
+    /// Result of analyzing a feature against its tolerance specification.
+    /// </summary>
+    [Serializable]
+    public class ToleranceResult
+    {
+        public ToleranceSpec spec;
+        public float actualDeviation;        // mm
+        public bool isInTolerance;
+        public float percentOfTolerance;     // 0-100
+        public string riskLevel;             // LOW, MEDIUM, HIGH, OUT_OF_SPEC
+        public List<string> contributingFactors;
+        public float predictedDriftPerHour;
+    }
+
+    /// <summary>
+    /// Analyzes geometric tolerances for machined features based on
+    /// tool deflection, thermal expansion, and wear compensation.
+    /// </summary>
+    public class GeometricToleranceAnalyzer
+    {
+        /// <summary>Registered tolerance specifications.</summary>
+        public List<ToleranceSpec> specs { get; private set; } = new List<ToleranceSpec>();
+
+        /// <summary>Coefficient of thermal expansion for 6061-T6 aluminum (1/K).</summary>
+        private const float AluminumCTE = 11.7e-6f;
+
+        /// <summary>Reference / ambient temperature in Celsius.</summary>
+        private const float ReferenceTemp = 20f;
+
+        /// <summary>Default feature length used when nominal value is available (mm).</summary>
+        private const float DefaultFeatureLength = 50f;
+
+        /// <summary>Add a tolerance specification to be tracked.</summary>
+        public void AddSpec(ToleranceSpec spec)
+        {
+            if (spec == null) throw new ArgumentNullException(nameof(spec));
+            specs.Add(spec);
+        }
+
+        /// <summary>
+        /// Analyze a single feature given current deviation sources.
+        /// Total deviation = toolDeflection + thermalExpansion − wearCompensation
+        /// </summary>
+        public ToleranceResult AnalyzeFeature(
+            string featureId,
+            float toolDeflection,
+            float thermalExpansion,
+            float wearCompensation)
+        {
+            var spec = specs.Find(s => s.featureId == featureId);
+            if (spec == null)
+                throw new ArgumentException($"No spec found for feature '{featureId}'");
+
+            float totalDeviation = toolDeflection + thermalExpansion - wearCompensation;
+            float absDeviation = Mathf.Abs(totalDeviation);
+
+            float halfZone = spec.toleranceZone / 2f;
+            float percent = halfZone > 0f ? (absDeviation / halfZone) * 100f : (absDeviation > 0f ? float.MaxValue : 0f);
+
+            string risk;
+            if (percent < 50f) risk = "LOW";
+            else if (percent < 80f) risk = "MEDIUM";
+            else if (percent < 100f) risk = "HIGH";
+            else risk = "OUT_OF_SPEC";
+
+            var factors = new List<string>();
+            if (Mathf.Abs(toolDeflection) > 0.001f)
+                factors.Add($"tool_deflection:{toolDeflection:F4}mm");
+            if (Mathf.Abs(thermalExpansion) > 0.001f)
+                factors.Add($"thermal_expansion:{thermalExpansion:F4}mm");
+            if (Mathf.Abs(wearCompensation) > 0.001f)
+                factors.Add($"wear_compensation:{wearCompensation:F4}mm");
+
+            return new ToleranceResult
+            {
+                spec = spec,
+                actualDeviation = totalDeviation,
+                isInTolerance = percent <= 100f,
+                percentOfTolerance = percent,
+                riskLevel = risk,
+                contributingFactors = factors,
+                predictedDriftPerHour = 0f
+            };
+        }
+
+        /// <summary>
+        /// Predict tolerance risk for every registered spec given current machine state.
+        /// Uses aluminum CTE for thermal expansion: deltaL = CTE * deltaT * featureLength.
+        /// </summary>
+        public List<ToleranceResult> PredictToleranceRisk(
+            float currentTemp,
+            float toolWearMM,
+            float spindleRunout)
+        {
+            var results = new List<ToleranceResult>();
+            float deltaT = currentTemp - ReferenceTemp;
+
+            foreach (var spec in specs)
+            {
+                float featureLength = spec.nominalValue > 0f ? spec.nominalValue : DefaultFeatureLength;
+                float thermalExpansion = AluminumCTE * deltaT * featureLength;
+                float toolDeflection = spindleRunout + toolWearMM * 0.1f;
+                float wearCompensation = 0f; // no active compensation in prediction
+
+                var result = AnalyzeFeature(spec.featureId, toolDeflection, thermalExpansion, wearCompensation);
+                // Estimate drift per hour based on thermal trend and wear rate
+                float driftPerHour = Mathf.Abs(AluminumCTE * 2f * featureLength) + toolWearMM * 0.05f;
+                result.predictedDriftPerHour = driftPerHour;
+                results.Add(result);
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// Returns all features whose tolerance utilisation is above 70 %.
+        /// </summary>
+        public List<ToleranceResult> GetCriticalFeatures()
+        {
+            // Re-evaluate every spec with zero inputs to get baseline;
+            // callers should use PredictToleranceRisk and filter instead.
+            // This convenience method returns specs previously evaluated
+            // through PredictToleranceRisk at the default machine state.
+            return PredictToleranceRisk(ReferenceTemp, 0f, 0f)
+                .Where(r => r.percentOfTolerance >= 70f)
+                .ToList();
+        }
+
+        /// <summary>
+        /// Estimate a tool-path compensation offset for the given feature (mm).
+        /// Returns half the current predicted deviation so the controller can
+        /// shift the tool path to centre the error band.
+        /// </summary>
+        public float EstimateCompensation(string featureId)
+        {
+            var spec = specs.Find(s => s.featureId == featureId);
+            if (spec == null)
+                throw new ArgumentException($"No spec found for feature '{featureId}'");
+
+            // Predict at a mild elevated state to give a useful offset
+            float featureLength = spec.nominalValue > 0f ? spec.nominalValue : DefaultFeatureLength;
+            float estimatedThermal = AluminumCTE * 5f * featureLength; // assume 5 °C rise
+            return estimatedThermal / 2f;
+        }
+    }
     /// <summary>
     /// Master orchestrator for the cutting simulation.
     /// Coordinates: VoxelWorkpiece, CuttingForceEngine, ThermalModel,

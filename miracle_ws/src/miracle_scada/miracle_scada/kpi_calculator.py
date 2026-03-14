@@ -1367,6 +1367,364 @@ class ShiftReportGenerator:
         )
 
 
+# ---------------------------------------------------------------------------
+# Process Capability Analysis (Cp / Cpk)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MeasurementSample:
+    """A single dimensional measurement from a machined part."""
+    value: float
+    timestamp: float
+    feature_id: str       # e.g. "diameter_A", "length_B"
+    machine_id: str
+    program_id: str
+
+
+@dataclass
+class ProcessCapability:
+    """Statistical process capability indices for a feature."""
+    feature_id: str
+    sample_count: int
+    mean: float
+    std_dev: float
+    usl: float            # upper specification limit
+    lsl: float            # lower specification limit
+    cp: float             # (USL - LSL) / (6 * sigma)
+    cpk: float            # min(Cpu, Cpl)
+    cpu: float            # (USL - mean) / (3 * sigma)
+    cpl: float            # (mean - LSL) / (3 * sigma)
+    pp: float             # process performance (overall std dev)
+    ppk: float
+    is_capable: bool      # True when Cpk >= 1.33
+    trend: str            # STABLE, IMPROVING, DEGRADING
+    out_of_spec_pct: float
+
+
+def _normal_cdf(x: float) -> float:
+    """Approximate the standard normal CDF using the error function."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+class CapabilityProfiler:
+    """Collects measurement samples and computes SPC capability indices."""
+
+    _MIN_SAMPLES = 30
+
+    def __init__(self) -> None:
+        # feature_id -> list of MeasurementSample (ordered by insertion)
+        self._samples: Dict[str, List[MeasurementSample]] = {}
+
+    # -- sample ingestion ---------------------------------------------------
+
+    def add_sample(self, sample: MeasurementSample) -> None:
+        """Append a measurement sample."""
+        self._samples.setdefault(sample.feature_id, []).append(sample)
+
+    # -- capability computation ---------------------------------------------
+
+    def compute_capability(
+        self, feature_id: str, usl: float, lsl: float,
+    ) -> ProcessCapability:
+        """Compute Cp/Cpk and related indices for *feature_id*.
+
+        Raises ``ValueError`` if fewer than 30 samples are available.
+        """
+        samples = self._samples.get(feature_id, [])
+        n = len(samples)
+        if n < self._MIN_SAMPLES:
+            raise ValueError(
+                f"Need >= {self._MIN_SAMPLES} samples for capability "
+                f"analysis, got {n}"
+            )
+
+        values = [s.value for s in samples]
+        mean = sum(values) / n
+        variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+        std_dev = math.sqrt(variance) if variance > 0 else 0.0
+
+        if std_dev == 0.0:
+            # Perfectly repeatable process — capability is infinite
+            cp = float('inf')
+            cpk = float('inf')
+            cpu = float('inf')
+            cpl = float('inf')
+            pp = float('inf')
+            ppk = float('inf')
+        else:
+            cp = (usl - lsl) / (6.0 * std_dev)
+            cpu = (usl - mean) / (3.0 * std_dev)
+            cpl = (mean - lsl) / (3.0 * std_dev)
+            cpk = min(cpu, cpl)
+
+            # Pp / Ppk use overall (population) std dev
+            overall_var = sum((v - mean) ** 2 for v in values) / n
+            overall_std = math.sqrt(overall_var) if overall_var > 0 else 0.0
+            pp = (usl - lsl) / (6.0 * overall_std)
+            ppu = (usl - mean) / (3.0 * overall_std)
+            ppl = (mean - lsl) / (3.0 * overall_std)
+            ppk = min(ppu, ppl)
+
+        # Trend: compare first-half mean vs second-half mean
+        trend = self._compute_trend(values)
+
+        # Out-of-spec percentage
+        out_of_spec_pct = self._out_of_spec_pct(values, usl, lsl)
+
+        return ProcessCapability(
+            feature_id=feature_id,
+            sample_count=n,
+            mean=mean,
+            std_dev=std_dev,
+            usl=usl,
+            lsl=lsl,
+            cp=cp,
+            cpk=cpk,
+            cpu=cpu,
+            cpl=cpl,
+            pp=pp,
+            ppk=ppk,
+            is_capable=(cpk >= 1.33),
+            trend=trend,
+            out_of_spec_pct=out_of_spec_pct,
+        )
+
+    # -- control chart ------------------------------------------------------
+
+    def get_control_chart_data(self, feature_id: str) -> Dict[str, Any]:
+        """Return X-bar control chart data with Western Electric rules.
+
+        Returns a dict with keys: values, ucl, lcl, center_line,
+        out_of_control_points.
+        """
+        samples = self._samples.get(feature_id, [])
+        values = [s.value for s in samples]
+        n = len(values)
+
+        if n == 0:
+            return {
+                'values': [],
+                'ucl': 0.0,
+                'lcl': 0.0,
+                'center_line': 0.0,
+                'out_of_control_points': [],
+            }
+
+        mean = sum(values) / n
+        if n > 1:
+            variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+            sigma = math.sqrt(variance) if variance > 0 else 0.0
+        else:
+            sigma = 0.0
+
+        ucl = mean + 3.0 * sigma
+        lcl = mean - 3.0 * sigma
+
+        ooc = self._western_electric(values, mean, sigma)
+
+        return {
+            'values': values,
+            'ucl': ucl,
+            'lcl': lcl,
+            'center_line': mean,
+            'out_of_control_points': ooc,
+        }
+
+    # -- machine summaries --------------------------------------------------
+
+    def get_machine_capability_summary(
+        self,
+        machine_id: str,
+    ) -> Dict[str, List[MeasurementSample]]:
+        """Return all feature samples produced by *machine_id*.
+
+        The caller should supply USL/LSL per feature to compute capability
+        via :meth:`compute_capability`.  This method returns a dict of
+        ``feature_id -> [MeasurementSample, ...]`` filtered to *machine_id*.
+        """
+        result: Dict[str, List[MeasurementSample]] = {}
+        for fid, samples in self._samples.items():
+            filtered = [s for s in samples if s.machine_id == machine_id]
+            if filtered:
+                result[fid] = filtered
+        return result
+
+    # -- machine comparison -------------------------------------------------
+
+    def compare_machines(
+        self,
+        machine_id_1: str,
+        machine_id_2: str,
+        feature_id: str,
+        usl: float,
+        lsl: float,
+    ) -> Dict[str, Any]:
+        """Compare Cpk between two machines for a given feature.
+
+        Returns a dict with cpk_1, cpk_2, better_machine, and delta.
+        """
+        # Build per-machine profilers on the fly
+        def _machine_cpk(mid: str) -> Optional[float]:
+            samples = [
+                s for s in self._samples.get(feature_id, [])
+                if s.machine_id == mid
+            ]
+            if len(samples) < self._MIN_SAMPLES:
+                return None
+            tmp = CapabilityProfiler()
+            for s in samples:
+                tmp.add_sample(s)
+            cap = tmp.compute_capability(feature_id, usl, lsl)
+            return cap.cpk
+
+        cpk1 = _machine_cpk(machine_id_1)
+        cpk2 = _machine_cpk(machine_id_2)
+
+        better: Optional[str] = None
+        delta = 0.0
+        if cpk1 is not None and cpk2 is not None:
+            delta = cpk1 - cpk2
+            better = machine_id_1 if cpk1 >= cpk2 else machine_id_2
+
+        return {
+            'feature_id': feature_id,
+            'machine_id_1': machine_id_1,
+            'cpk_1': cpk1,
+            'machine_id_2': machine_id_2,
+            'cpk_2': cpk2,
+            'better_machine': better,
+            'delta': delta,
+        }
+
+    # -- scrap rate prediction ----------------------------------------------
+
+    def predict_scrap_rate(
+        self, feature_id: str, usl: float, lsl: float,
+    ) -> float:
+        """Estimate scrap percentage from a fitted normal distribution.
+
+        Returns fraction (0-1) of parts predicted to fall outside [LSL, USL].
+        """
+        samples = self._samples.get(feature_id, [])
+        n = len(samples)
+        if n < 2:
+            return 0.0
+
+        values = [s.value for s in samples]
+        mean = sum(values) / n
+        variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+        std_dev = math.sqrt(variance) if variance > 0 else 0.0
+
+        if std_dev == 0.0:
+            # All identical — if within spec, 0 scrap; else 100%
+            if lsl <= mean <= usl:
+                return 0.0
+            return 1.0
+
+        p_below_lsl = _normal_cdf((lsl - mean) / std_dev)
+        p_above_usl = 1.0 - _normal_cdf((usl - mean) / std_dev)
+        return p_below_lsl + p_above_usl
+
+    # -- internal helpers ---------------------------------------------------
+
+    @staticmethod
+    def _compute_trend(values: List[float]) -> str:
+        """Compare first-half vs second-half std deviation to detect trend."""
+        n = len(values)
+        if n < 10:
+            return 'STABLE'
+        mid = n // 2
+        first_half = values[:mid]
+        second_half = values[mid:]
+
+        def _std(v: List[float]) -> float:
+            m = sum(v) / len(v)
+            var = sum((x - m) ** 2 for x in v) / len(v)
+            return math.sqrt(var)
+
+        std1 = _std(first_half)
+        std2 = _std(second_half)
+
+        if std1 == 0.0 and std2 == 0.0:
+            return 'STABLE'
+        if std1 == 0.0:
+            return 'DEGRADING'
+
+        ratio = std2 / std1
+        if ratio > 1.25:
+            return 'DEGRADING'
+        if ratio < 0.75:
+            return 'IMPROVING'
+        return 'STABLE'
+
+    @staticmethod
+    def _out_of_spec_pct(
+        values: List[float], usl: float, lsl: float,
+    ) -> float:
+        """Compute observed out-of-spec percentage."""
+        if not values:
+            return 0.0
+        ooc = sum(1 for v in values if v < lsl or v > usl)
+        return ooc / len(values) * 100.0
+
+    @staticmethod
+    def _western_electric(
+        values: List[float], mean: float, sigma: float,
+    ) -> List[int]:
+        """Detect out-of-control points using Western Electric rules.
+
+        Rules applied:
+          1. Any single point beyond 3-sigma.
+          2. Two of three consecutive points beyond 2-sigma (same side).
+          3. Four of five consecutive points beyond 1-sigma (same side).
+          4. Eight consecutive points on the same side of the centre line.
+
+        Returns a sorted list of unique indices that violate any rule.
+        """
+        n = len(values)
+        if n == 0 or sigma == 0.0:
+            return []
+
+        flagged: set = set()
+
+        for i in range(n):
+            z = (values[i] - mean) / sigma
+
+            # Rule 1: beyond 3-sigma
+            if abs(z) > 3.0:
+                flagged.add(i)
+
+        # Rule 2: 2 of 3 beyond 2-sigma on same side
+        for i in range(2, n):
+            window = [values[i - 2], values[i - 1], values[i]]
+            above = sum(1 for v in window if (v - mean) > 2.0 * sigma)
+            below = sum(1 for v in window if (mean - v) > 2.0 * sigma)
+            if above >= 2:
+                flagged.update([i - 2, i - 1, i])
+            if below >= 2:
+                flagged.update([i - 2, i - 1, i])
+
+        # Rule 3: 4 of 5 beyond 1-sigma on same side
+        for i in range(4, n):
+            window = [values[j] for j in range(i - 4, i + 1)]
+            above = sum(1 for v in window if (v - mean) > 1.0 * sigma)
+            below = sum(1 for v in window if (mean - v) > 1.0 * sigma)
+            if above >= 4:
+                flagged.update(range(i - 4, i + 1))
+            if below >= 4:
+                flagged.update(range(i - 4, i + 1))
+
+        # Rule 4: 8 consecutive on same side
+        for i in range(7, n):
+            window = values[i - 7: i + 1]
+            all_above = all(v > mean for v in window)
+            all_below = all(v < mean for v in window)
+            if all_above or all_below:
+                flagged.update(range(i - 7, i + 1))
+
+        return sorted(flagged)
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------

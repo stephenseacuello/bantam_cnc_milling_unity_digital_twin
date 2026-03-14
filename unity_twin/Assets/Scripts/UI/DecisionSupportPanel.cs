@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.UIElements;
 using MiracleTwin.Core;
@@ -1740,6 +1741,517 @@ namespace MiracleTwin.UI
                         fill.style.backgroundColor = new Color(0.2f, 0.8f, 0.3f);
                 }
             }
+        }
+
+        // ── Spindle Load Balancing Data Models ──────────────────────────
+
+        /// <summary>
+        /// Load profile for a single G-code block describing spindle utilization.
+        /// </summary>
+        [Serializable]
+        public class SpindleLoadProfile
+        {
+            public int blockIndex;
+            public float loadPercent;   // 0-100
+            public float powerKW;
+            public float torqueNm;
+            public bool isOverloaded;
+            public bool isUnderloaded;
+        }
+
+        /// <summary>
+        /// Aggregated result of spindle load balancing analysis across a program.
+        /// </summary>
+        [Serializable]
+        public class LoadBalancingResult
+        {
+            public string programName;
+            public int totalBlocks;
+            public float avgLoadPercent;
+            public float peakLoadPercent;
+            public float minLoadPercent;
+            public float loadVariance;
+            public float balanceScore;          // 0-1, 1 = perfectly balanced
+            public int overloadedBlocks;
+            public int underloadedBlocks;
+            public List<string> recommendations;
+            public List<SpindleLoadProfile> optimizedProfiles;  // suggested balanced profile
+        }
+
+        // ── Spindle Load Balancer ───────────────────────────────────────
+
+        /// <summary>
+        /// Analyzes and optimizes spindle load distribution across G-code blocks.
+        /// Identifies overloaded / underloaded regions and produces feed-rate
+        /// adjustment recommendations to flatten the load profile.
+        /// </summary>
+        public class SpindleLoadBalancer
+        {
+            public float overloadThreshold = 85f;
+            public float underloadThreshold = 20f;
+            public float targetLoadPercent = 65f;
+
+            /// <summary>
+            /// Analyze a raw spindle load profile and return statistics plus recommendations.
+            /// </summary>
+            public LoadBalancingResult AnalyzeLoadProfile(List<SpindleLoadProfile> profile)
+            {
+                var result = new LoadBalancingResult
+                {
+                    totalBlocks = profile.Count,
+                    recommendations = new List<string>(),
+                    optimizedProfiles = new List<SpindleLoadProfile>()
+                };
+
+                if (profile.Count == 0)
+                {
+                    result.balanceScore = 1f;
+                    return result;
+                }
+
+                // Tag each block
+                foreach (var block in profile)
+                {
+                    block.isOverloaded = block.loadPercent > overloadThreshold;
+                    block.isUnderloaded = block.loadPercent < underloadThreshold;
+                }
+
+                // Compute statistics
+                float sum = 0f;
+                float peak = float.MinValue;
+                float min = float.MaxValue;
+                int overCount = 0;
+                int underCount = 0;
+
+                foreach (var b in profile)
+                {
+                    sum += b.loadPercent;
+                    if (b.loadPercent > peak) peak = b.loadPercent;
+                    if (b.loadPercent < min) min = b.loadPercent;
+                    if (b.isOverloaded) overCount++;
+                    if (b.isUnderloaded) underCount++;
+                }
+
+                float avg = sum / profile.Count;
+                float varianceSum = 0f;
+                foreach (var b in profile)
+                {
+                    float diff = b.loadPercent - avg;
+                    varianceSum += diff * diff;
+                }
+                float variance = varianceSum / profile.Count;
+
+                result.avgLoadPercent = avg;
+                result.peakLoadPercent = peak;
+                result.minLoadPercent = min;
+                result.loadVariance = variance;
+                result.overloadedBlocks = overCount;
+                result.underloadedBlocks = underCount;
+
+                // Balance score: 1 - (variance / maxVariance)
+                // Max theoretical variance is when half blocks are at 100 and half at 0
+                float maxVariance = 2500f; // (100-50)^2 for half the blocks
+                result.balanceScore = Mathf.Clamp01(1f - (variance / maxVariance));
+
+                // Generate optimized profile
+                result.optimizedProfiles = OptimizeProfile(profile);
+
+                // Generate recommendations
+                result.recommendations = GenerateRecommendations(result, profile);
+
+                return result;
+            }
+
+            /// <summary>
+            /// Produce a smoothed, balanced copy of the load profile by adjusting feed rates.
+            /// Overloaded blocks get feed reduction; underloaded blocks get a conservative increase.
+            /// Adjacent blocks are smoothed to avoid abrupt transitions.
+            /// </summary>
+            public List<SpindleLoadProfile> OptimizeProfile(List<SpindleLoadProfile> profile)
+            {
+                if (profile.Count == 0) return new List<SpindleLoadProfile>();
+
+                var optimized = new List<SpindleLoadProfile>(profile.Count);
+
+                // First pass: adjust individual blocks toward target
+                foreach (var src in profile)
+                {
+                    var opt = new SpindleLoadProfile
+                    {
+                        blockIndex = src.blockIndex,
+                        loadPercent = src.loadPercent,
+                        powerKW = src.powerKW,
+                        torqueNm = src.torqueNm,
+                    };
+
+                    if (src.loadPercent > overloadThreshold)
+                    {
+                        // Reduce proportionally to how far above the threshold
+                        float excessRatio = (src.loadPercent - targetLoadPercent) / src.loadPercent;
+                        opt.loadPercent = src.loadPercent * (1f - excessRatio);
+                        opt.powerKW = src.powerKW * (1f - excessRatio);
+                        opt.torqueNm = src.torqueNm * (1f - excessRatio);
+                    }
+                    else if (src.loadPercent < underloadThreshold)
+                    {
+                        // Conservative increase, capped at 30%
+                        float increaseRatio = Mathf.Min(0.30f,
+                            (targetLoadPercent - src.loadPercent) / targetLoadPercent);
+                        opt.loadPercent = src.loadPercent * (1f + increaseRatio);
+                        opt.powerKW = src.powerKW * (1f + increaseRatio);
+                        opt.torqueNm = src.torqueNm * (1f + increaseRatio);
+                    }
+
+                    opt.isOverloaded = opt.loadPercent > overloadThreshold;
+                    opt.isUnderloaded = opt.loadPercent < underloadThreshold;
+                    optimized.Add(opt);
+                }
+
+                // Second pass: smooth transitions between adjacent blocks
+                if (optimized.Count >= 3)
+                {
+                    var smoothed = new float[optimized.Count];
+                    smoothed[0] = optimized[0].loadPercent;
+                    smoothed[optimized.Count - 1] = optimized[optimized.Count - 1].loadPercent;
+
+                    for (int i = 1; i < optimized.Count - 1; i++)
+                    {
+                        smoothed[i] = optimized[i].loadPercent * 0.6f
+                                    + optimized[i - 1].loadPercent * 0.2f
+                                    + optimized[i + 1].loadPercent * 0.2f;
+                    }
+
+                    for (int i = 0; i < optimized.Count; i++)
+                    {
+                        float scale = (optimized[i].loadPercent > 0f)
+                            ? smoothed[i] / optimized[i].loadPercent
+                            : 1f;
+                        optimized[i].loadPercent = smoothed[i];
+                        optimized[i].powerKW *= scale;
+                        optimized[i].torqueNm *= scale;
+                        optimized[i].isOverloaded = smoothed[i] > overloadThreshold;
+                        optimized[i].isUnderloaded = smoothed[i] < underloadThreshold;
+                    }
+                }
+
+                return optimized;
+            }
+
+            /// <summary>
+            /// Build human-readable recommendations from analysis results.
+            /// </summary>
+            public List<string> GenerateRecommendations(LoadBalancingResult result,
+                                                        List<SpindleLoadProfile> profile)
+            {
+                var recs = new List<string>();
+
+                // Find contiguous overloaded ranges
+                var overloadRanges = FindContiguousRanges(profile, b => b.isOverloaded);
+                foreach (var (start, end) in overloadRanges)
+                {
+                    float maxLoad = 0f;
+                    for (int i = start; i <= end; i++)
+                        if (profile[i].loadPercent > maxLoad) maxLoad = profile[i].loadPercent;
+
+                    float reductionPct = Mathf.RoundToInt((maxLoad - targetLoadPercent) / maxLoad * 100f);
+                    if (start == end)
+                        recs.Add($"Reduce feed at block {profile[start].blockIndex} by {reductionPct}% to avoid overload");
+                    else
+                        recs.Add($"Reduce feed at blocks {profile[start].blockIndex}-{profile[end].blockIndex} by {reductionPct}% to avoid overload");
+                }
+
+                // Find contiguous underloaded ranges
+                var underloadRanges = FindContiguousRanges(profile, b => b.isUnderloaded);
+                foreach (var (start, end) in underloadRanges)
+                {
+                    float minLoad = float.MaxValue;
+                    for (int i = start; i <= end; i++)
+                        if (profile[i].loadPercent < minLoad) minLoad = profile[i].loadPercent;
+
+                    float increasePct = Mathf.RoundToInt(
+                        Mathf.Min(30f, (targetLoadPercent - minLoad) / targetLoadPercent * 100f));
+                    if (start == end)
+                        recs.Add($"Increase feed at block {profile[start].blockIndex} by {increasePct}% to improve utilization");
+                    else
+                        recs.Add($"Increase feed at blocks {profile[start].blockIndex}-{profile[end].blockIndex} by {increasePct}% to improve utilization");
+                }
+
+                // Deep-cut split advisory for very high overloads
+                foreach (var b in profile)
+                {
+                    if (b.loadPercent > 95f)
+                    {
+                        recs.Add($"Consider splitting deep cut at block {b.blockIndex} into two passes");
+                    }
+                }
+
+                return recs;
+            }
+
+            /// <summary>
+            /// Compute optimal depth split for a block whose load is too high.
+            /// Returns two pass depths that together equal the original depth while
+            /// keeping each pass under the target load.
+            /// </summary>
+            public (float firstPass, float secondPass) ComputeOptimalDepthSplit(
+                float currentDepth, float currentLoad)
+            {
+                if (currentLoad <= targetLoadPercent || currentLoad <= 0f)
+                    return (currentDepth, 0f);
+
+                // Split proportionally so that load per pass approximates targetLoadPercent.
+                // Force scales roughly linearly with depth of cut.
+                float ratio = targetLoadPercent / currentLoad;
+                float firstDepth = currentDepth * ratio;
+                float secondDepth = currentDepth - firstDepth;
+                return (firstDepth, secondDepth);
+            }
+
+            // Utility: find contiguous index ranges matching a predicate
+            private List<(int start, int end)> FindContiguousRanges(
+                List<SpindleLoadProfile> profile, Func<SpindleLoadProfile, bool> predicate)
+            {
+                var ranges = new List<(int, int)>();
+                int i = 0;
+                while (i < profile.Count)
+                {
+                    if (predicate(profile[i]))
+                    {
+                        int start = i;
+                        while (i < profile.Count && predicate(profile[i])) i++;
+                        ranges.Add((start, i - 1));
+                    }
+                    else
+                    {
+                        i++;
+                    }
+                }
+                return ranges;
+            }
+        }
+
+        // ── Spindle Load Balancing UI ───────────────────────────────────
+
+        private SpindleLoadBalancer loadBalancer = new SpindleLoadBalancer();
+        private VisualElement loadChartContainer;
+        private VisualElement loadOptimizationOverlay;
+
+        /// <summary>
+        /// Draw a bar chart of the spindle load profile with color-coded bars.
+        /// Green = nominal, Yellow = approaching threshold, Red = overloaded, Blue = underloaded.
+        /// </summary>
+        public void DrawSpindleLoadChart(LoadBalancingResult result)
+        {
+            if (panelRoot == null) return;
+
+            // Remove previous chart if any
+            loadChartContainer?.RemoveFromHierarchy();
+
+            loadChartContainer = new VisualElement { name = "spindle-load-chart" };
+            loadChartContainer.AddToClassList("decision-section");
+
+            // Header
+            var title = new Label("Spindle Load Profile");
+            title.AddToClassList("decision-section-title");
+            loadChartContainer.Add(title);
+
+            // Balance score badge
+            var scoreBadge = new Label($"Balance Score: {result.balanceScore:F2}");
+            scoreBadge.AddToClassList("load-balance-score");
+            if (result.balanceScore >= 0.8f)
+                scoreBadge.style.color = new Color(0.3f, 0.85f, 0.45f);
+            else if (result.balanceScore >= 0.5f)
+                scoreBadge.style.color = new Color(0.9f, 0.78f, 0.2f);
+            else
+                scoreBadge.style.color = new Color(0.95f, 0.3f, 0.25f);
+            loadChartContainer.Add(scoreBadge);
+
+            // Stats row
+            var statsRow = new VisualElement();
+            statsRow.style.flexDirection = FlexDirection.Row;
+            statsRow.style.justifyContent = Justify.SpaceBetween;
+            statsRow.style.marginBottom = 4;
+            statsRow.Add(new Label($"Avg: {result.avgLoadPercent:F1}%") { style = { fontSize = 10, color = new Color(0.7f, 0.78f, 0.88f) } });
+            statsRow.Add(new Label($"Peak: {result.peakLoadPercent:F1}%") { style = { fontSize = 10, color = new Color(1f, 0.45f, 0.35f) } });
+            statsRow.Add(new Label($"Min: {result.minLoadPercent:F1}%") { style = { fontSize = 10, color = new Color(0.4f, 0.7f, 1f) } });
+            loadChartContainer.Add(statsRow);
+
+            // Bar chart area
+            var chartArea = new VisualElement { name = "load-chart-bars" };
+            chartArea.AddToClassList("chart-container");
+            chartArea.style.flexDirection = FlexDirection.Row;
+            chartArea.style.alignItems = Align.FlexEnd;
+            chartArea.style.paddingLeft = 2;
+            chartArea.style.paddingRight = 2;
+            chartArea.style.paddingBottom = 2;
+
+            int blockCount = result.optimizedProfiles != null ? result.optimizedProfiles.Count : 0;
+            // Use original profile blocks from totalBlocks if optimizedProfiles available
+            var profiles = result.optimizedProfiles ?? new List<SpindleLoadProfile>();
+
+            foreach (var block in profiles)
+            {
+                var bar = new VisualElement();
+                bar.AddToClassList("load-bar");
+
+                float heightPct = Mathf.Clamp(block.loadPercent, 0f, 100f);
+                bar.style.height = new StyleLength(new Length(heightPct, LengthUnit.Percent));
+                bar.style.flexGrow = 1;
+                bar.style.marginLeft = 1;
+                bar.style.marginRight = 1;
+                bar.style.borderBottomLeftRadius = 2;
+                bar.style.borderBottomRightRadius = 2;
+
+                // Color coding
+                if (block.isOverloaded)
+                {
+                    bar.AddToClassList("load-overloaded");
+                    bar.style.backgroundColor = new Color(0.95f, 0.25f, 0.2f, 0.9f);
+                }
+                else if (block.isUnderloaded)
+                {
+                    bar.AddToClassList("load-underloaded");
+                    bar.style.backgroundColor = new Color(0.3f, 0.55f, 0.95f, 0.7f);
+                }
+                else if (block.loadPercent > 70f)
+                {
+                    bar.style.backgroundColor = new Color(0.92f, 0.75f, 0.15f, 0.85f);
+                }
+                else
+                {
+                    bar.style.backgroundColor = new Color(0.2f, 0.78f, 0.4f, 0.85f);
+                }
+
+                bar.tooltip = $"Block {block.blockIndex}: {block.loadPercent:F1}%  |  {block.powerKW:F1} kW  |  {block.torqueNm:F1} Nm";
+                chartArea.Add(bar);
+            }
+
+            loadChartContainer.Add(chartArea);
+
+            // Recommendations list
+            if (result.recommendations != null && result.recommendations.Count > 0)
+            {
+                var recTitle = new Label("Recommendations");
+                recTitle.AddToClassList("decision-section-title");
+                recTitle.style.marginTop = 6;
+                loadChartContainer.Add(recTitle);
+
+                foreach (var rec in result.recommendations)
+                {
+                    var recItem = new VisualElement();
+                    recItem.AddToClassList("decision-action-item");
+                    var recLabel = new Label(rec);
+                    recLabel.AddToClassList("decision-action-text");
+                    recItem.Add(recLabel);
+                    loadChartContainer.Add(recItem);
+                }
+            }
+
+            panelRoot.Add(loadChartContainer);
+        }
+
+        /// <summary>
+        /// Draw a before/after comparison overlay showing original vs. optimized load profiles.
+        /// Original bars rendered semi-transparent behind solid optimized bars.
+        /// </summary>
+        public void DrawLoadOptimizationOverlay(List<SpindleLoadProfile> original,
+                                                 List<SpindleLoadProfile> optimized)
+        {
+            if (panelRoot == null) return;
+
+            loadOptimizationOverlay?.RemoveFromHierarchy();
+
+            loadOptimizationOverlay = new VisualElement { name = "load-optimization-overlay" };
+            loadOptimizationOverlay.AddToClassList("decision-section");
+
+            var title = new Label("Load Optimization: Before vs After");
+            title.AddToClassList("decision-section-title");
+            loadOptimizationOverlay.Add(title);
+
+            // Legend
+            var legend = new VisualElement();
+            legend.style.flexDirection = FlexDirection.Row;
+            legend.style.marginBottom = 4;
+
+            var origSwatch = new VisualElement();
+            origSwatch.style.width = 12;
+            origSwatch.style.height = 12;
+            origSwatch.style.backgroundColor = new Color(1f, 0.4f, 0.35f, 0.4f);
+            origSwatch.style.marginRight = 4;
+            origSwatch.style.borderTopLeftRadius = 2;
+            origSwatch.style.borderTopRightRadius = 2;
+            origSwatch.style.borderBottomLeftRadius = 2;
+            origSwatch.style.borderBottomRightRadius = 2;
+            legend.Add(origSwatch);
+            legend.Add(new Label("Original") { style = { fontSize = 10, color = new Color(0.75f, 0.78f, 0.85f), marginRight = 12 } });
+
+            var optSwatch = new VisualElement();
+            optSwatch.style.width = 12;
+            optSwatch.style.height = 12;
+            optSwatch.style.backgroundColor = new Color(0.2f, 0.78f, 0.4f, 0.9f);
+            optSwatch.style.marginRight = 4;
+            optSwatch.style.borderTopLeftRadius = 2;
+            optSwatch.style.borderTopRightRadius = 2;
+            optSwatch.style.borderBottomLeftRadius = 2;
+            optSwatch.style.borderBottomRightRadius = 2;
+            legend.Add(optSwatch);
+            legend.Add(new Label("Optimized") { style = { fontSize = 10, color = new Color(0.75f, 0.78f, 0.85f) } });
+            loadOptimizationOverlay.Add(legend);
+
+            // Comparison chart
+            var chartArea = new VisualElement { name = "load-compare-bars" };
+            chartArea.AddToClassList("chart-container");
+            chartArea.style.flexDirection = FlexDirection.Row;
+            chartArea.style.alignItems = Align.FlexEnd;
+            chartArea.style.paddingLeft = 2;
+            chartArea.style.paddingRight = 2;
+            chartArea.style.paddingBottom = 2;
+
+            int count = Mathf.Min(original.Count, optimized.Count);
+            for (int i = 0; i < count; i++)
+            {
+                // Each block gets a column container with stacked bars
+                var col = new VisualElement();
+                col.style.flexGrow = 1;
+                col.style.flexDirection = FlexDirection.Column;
+                col.style.justifyContent = Justify.FlexEnd;
+                col.style.alignItems = Align.Center;
+                col.style.height = new StyleLength(new Length(100, LengthUnit.Percent));
+
+                // Original bar (background, semi-transparent)
+                var origBar = new VisualElement();
+                origBar.AddToClassList("load-bar");
+                origBar.style.position = Position.Absolute;
+                origBar.style.bottom = 0;
+                origBar.style.left = 0;
+                origBar.style.right = 0;
+                float origH = Mathf.Clamp(original[i].loadPercent, 0f, 100f);
+                origBar.style.height = new StyleLength(new Length(origH, LengthUnit.Percent));
+                origBar.style.backgroundColor = new Color(1f, 0.4f, 0.35f, 0.35f);
+                origBar.style.borderBottomLeftRadius = 2;
+                origBar.style.borderBottomRightRadius = 2;
+
+                // Optimized bar (foreground)
+                var optBar = new VisualElement();
+                optBar.AddToClassList("load-bar");
+                optBar.style.position = Position.Absolute;
+                optBar.style.bottom = 0;
+                optBar.style.left = new StyleLength(new Length(20, LengthUnit.Percent));
+                optBar.style.right = new StyleLength(new Length(20, LengthUnit.Percent));
+                float optH = Mathf.Clamp(optimized[i].loadPercent, 0f, 100f);
+                optBar.style.height = new StyleLength(new Length(optH, LengthUnit.Percent));
+                optBar.style.backgroundColor = new Color(0.2f, 0.78f, 0.4f, 0.9f);
+                optBar.style.borderBottomLeftRadius = 2;
+                optBar.style.borderBottomRightRadius = 2;
+
+                col.Add(origBar);
+                col.Add(optBar);
+                col.tooltip = $"Block {original[i].blockIndex}: {original[i].loadPercent:F1}% -> {optimized[i].loadPercent:F1}%";
+                chartArea.Add(col);
+            }
+
+            loadOptimizationOverlay.Add(chartArea);
+            panelRoot.Add(loadOptimizationOverlay);
         }
     }
 }

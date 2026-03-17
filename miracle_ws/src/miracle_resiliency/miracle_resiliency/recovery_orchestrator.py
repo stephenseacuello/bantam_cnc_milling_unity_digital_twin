@@ -916,6 +916,223 @@ class OpcUaTagMapper:
         return count
 
 
+# ---------------------------------------------------------------------------
+# Network Topology Mapper
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NetworkNode:
+    """A node in the MIRACLE network topology."""
+    node_id: str
+    node_type: str  # 'ros2_node', 'plc', 'hmi', 'server', 'sensor'
+    ip_address: str
+    hostname: str
+    last_seen: float = 0.0
+    is_online: bool = True
+    latency_ms: float = 0.0
+    connections: List[str] = field(default_factory=list)
+
+
+@dataclass
+class NetworkLink:
+    """A communication link between two network nodes."""
+    source_id: str
+    target_id: str
+    protocol: str  # 'DDS', 'OPC-UA', 'MQTT', 'TCP'
+    bandwidth_mbps: float = 100.0
+    latency_ms: float = 1.0
+    packet_loss_pct: float = 0.0
+    is_healthy: bool = True
+
+
+@dataclass
+class TopologySnapshot:
+    """A point-in-time snapshot of the network topology."""
+    timestamp: float
+    nodes: Dict[str, NetworkNode]
+    links: List[NetworkLink]
+    total_nodes: int
+    online_nodes: int
+    unhealthy_links: int
+
+
+class NetworkTopologyMapper:
+    """Maps and monitors the network topology of MIRACLE system nodes.
+
+    Maintains a graph of :class:`NetworkNode` instances connected by
+    :class:`NetworkLink` edges.  Provides topology queries such as
+    shortest-path routing, articulation-point detection (critical nodes
+    whose removal would partition the network), and point-in-time
+    snapshots for dashboards and diagnostics.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: Dict[str, NetworkNode] = {}
+        self._links: List[NetworkLink] = []
+
+    # ------------------------------------------------------------------ #
+    #  Node / link management
+    # ------------------------------------------------------------------ #
+
+    def add_node(self, node: NetworkNode) -> None:
+        """Register a network node in the topology."""
+        self._nodes[node.node_id] = node
+
+    def add_link(self, link: NetworkLink) -> None:
+        """Register a communication link between two nodes."""
+        self._links.append(link)
+        # Keep the connection lists on each node in sync.
+        src = self._nodes.get(link.source_id)
+        tgt = self._nodes.get(link.target_id)
+        if src is not None and link.target_id not in src.connections:
+            src.connections.append(link.target_id)
+        if tgt is not None and link.source_id not in tgt.connections:
+            tgt.connections.append(link.source_id)
+
+    def remove_node(self, node_id: str) -> None:
+        """Remove a node and all links that reference it."""
+        self._nodes.pop(node_id, None)
+        self._links = [
+            lk for lk in self._links
+            if lk.source_id != node_id and lk.target_id != node_id
+        ]
+        # Scrub the node from remaining connection lists.
+        for n in self._nodes.values():
+            if node_id in n.connections:
+                n.connections.remove(node_id)
+
+    # ------------------------------------------------------------------ #
+    #  Status updates
+    # ------------------------------------------------------------------ #
+
+    def update_node_status(
+        self, node_id: str, is_online: bool, latency_ms: float,
+    ) -> None:
+        """Update liveness information for *node_id*."""
+        node = self._nodes.get(node_id)
+        if node is None:
+            return
+        node.is_online = is_online
+        node.latency_ms = latency_ms
+        if is_online:
+            node.last_seen = time.time()
+
+    # ------------------------------------------------------------------ #
+    #  Snapshot
+    # ------------------------------------------------------------------ #
+
+    def get_snapshot(self) -> TopologySnapshot:
+        """Return a :class:`TopologySnapshot` reflecting current state."""
+        online = sum(1 for n in self._nodes.values() if n.is_online)
+        unhealthy = sum(1 for lk in self._links if not lk.is_healthy)
+        return TopologySnapshot(
+            timestamp=time.time(),
+            nodes=dict(self._nodes),
+            links=list(self._links),
+            total_nodes=len(self._nodes),
+            online_nodes=online,
+            unhealthy_links=unhealthy,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Topology queries
+    # ------------------------------------------------------------------ #
+
+    def find_critical_nodes(self) -> List[str]:
+        """Return node IDs whose removal would partition the network.
+
+        These are the *articulation points* of the undirected topology
+        graph, computed via a standard DFS algorithm.
+        """
+        if not self._nodes:
+            return []
+
+        adj = self._build_adjacency()
+        visited: set = set()
+        disc: Dict[str, int] = {}
+        low: Dict[str, int] = {}
+        parent: Dict[str, Optional[str]] = {}
+        ap: set = set()
+        timer = [0]
+
+        def dfs(u: str) -> None:
+            visited.add(u)
+            disc[u] = low[u] = timer[0]
+            timer[0] += 1
+            child_count = 0
+
+            for v in adj.get(u, []):
+                if v not in visited:
+                    child_count += 1
+                    parent[v] = u
+                    dfs(v)
+                    low[u] = min(low[u], low[v])
+                    # u is an articulation point if:
+                    # 1) u is root with two or more children
+                    if parent[u] is None and child_count > 1:
+                        ap.add(u)
+                    # 2) u is not root and low[v] >= disc[u]
+                    if parent[u] is not None and low[v] >= disc[u]:
+                        ap.add(u)
+                elif v != parent.get(u):
+                    low[u] = min(low[u], disc[v])
+
+        for node_id in self._nodes:
+            if node_id not in visited:
+                parent[node_id] = None
+                dfs(node_id)
+
+        return sorted(ap)
+
+    def get_path(self, source_id: str, target_id: str) -> List[str]:
+        """Return the shortest path (list of node IDs) between two nodes.
+
+        Uses BFS over the undirected adjacency built from links.
+        Returns an empty list if no path exists.
+        """
+        if source_id not in self._nodes or target_id not in self._nodes:
+            return []
+        if source_id == target_id:
+            return [source_id]
+
+        adj = self._build_adjacency()
+        visited: set = {source_id}
+        queue: List[Tuple[str, List[str]]] = [(source_id, [source_id])]
+
+        while queue:
+            current, path = queue.pop(0)
+            for neighbour in adj.get(current, []):
+                if neighbour == target_id:
+                    return path + [neighbour]
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    queue.append((neighbour, path + [neighbour]))
+
+        return []
+
+    def get_node_dependencies(self, node_id: str) -> List[str]:
+        """Return all node IDs that *node_id* connects to directly."""
+        node = self._nodes.get(node_id)
+        if node is None:
+            return []
+        return list(node.connections)
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _build_adjacency(self) -> Dict[str, List[str]]:
+        """Build an undirected adjacency list from current links."""
+        adj: Dict[str, List[str]] = {nid: [] for nid in self._nodes}
+        for lk in self._links:
+            if lk.source_id in adj and lk.target_id in adj:
+                if lk.target_id not in adj[lk.source_id]:
+                    adj[lk.source_id].append(lk.target_id)
+                if lk.source_id not in adj[lk.target_id]:
+                    adj[lk.target_id].append(lk.source_id)
+        return adj
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

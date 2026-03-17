@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import deque
+from itertools import combinations
+from math import comb
 import threading
 import time
 
@@ -756,6 +758,276 @@ class ReasoningEngineNode(MiracleLifecycleNode):
         if template.startswith('?') and template in binding:
             return binding[template]
         return template
+
+
+# ---------------------------------------------------------------------------
+# Fault Tree Analysis
+# ---------------------------------------------------------------------------
+
+class FaultTreeNodeType(Enum):
+    """Type of a node in a fault tree."""
+    GATE = 'gate'
+    EVENT = 'event'
+
+
+class FaultTreeGateType(Enum):
+    """Gate types for fault tree intermediate nodes."""
+    AND = 'AND'
+    OR = 'OR'
+    VOTING = 'VOTING'
+
+
+@dataclass
+class FaultTreeNode:
+    """A node in a fault tree (either a gate or a basic event)."""
+    node_id: str
+    name: str
+    node_type: FaultTreeNodeType
+    gate_type: Optional[FaultTreeGateType] = None
+    probability: float = 0.0  # only meaningful for EVENT nodes
+    children: List[str] = field(default_factory=list)
+    description: str = ''
+    voting_k: int = 0  # k value for VOTING(k/n) gates
+
+
+@dataclass
+class FaultTree:
+    """A complete fault tree for failure analysis."""
+    root_id: str
+    nodes: Dict[str, FaultTreeNode] = field(default_factory=dict)
+    name: str = ''
+    description: str = ''
+
+
+class FaultTreeAnalyzer:
+    """Builds and evaluates fault trees for manufacturing failure analysis.
+
+    Supports AND, OR, and VOTING(k/n) gate logic, minimal cut set
+    identification, Birnbaum importance analysis, and critical path detection.
+    """
+
+    def build_tree(self, root_id: str, nodes: Dict[str, FaultTreeNode]) -> FaultTree:
+        """Construct and validate a fault tree from a root id and node dict.
+
+        Raises ValueError when the tree is structurally invalid.
+        """
+        if root_id not in nodes:
+            raise ValueError(f"Root node '{root_id}' not found in nodes")
+
+        # Validate all children references exist
+        for node in nodes.values():
+            for child_id in node.children:
+                if child_id not in nodes:
+                    raise ValueError(
+                        f"Child '{child_id}' of node '{node.node_id}' not found"
+                    )
+
+        # Gates must have children; events must not
+        for node in nodes.values():
+            if node.node_type == FaultTreeNodeType.GATE:
+                if not node.children:
+                    raise ValueError(
+                        f"Gate node '{node.node_id}' has no children"
+                    )
+                if node.gate_type is None:
+                    raise ValueError(
+                        f"Gate node '{node.node_id}' has no gate_type"
+                    )
+                if node.gate_type == FaultTreeGateType.VOTING:
+                    n_children = len(node.children)
+                    if node.voting_k < 1 or node.voting_k > n_children:
+                        raise ValueError(
+                            f"VOTING gate '{node.node_id}' has invalid k={node.voting_k} "
+                            f"for {n_children} children"
+                        )
+            elif node.node_type == FaultTreeNodeType.EVENT:
+                if node.children:
+                    raise ValueError(
+                        f"Event node '{node.node_id}' must not have children"
+                    )
+
+        # Cycle detection via DFS
+        visited: Set[str] = set()
+        in_stack: Set[str] = set()
+
+        def _dfs_cycle(nid: str) -> bool:
+            visited.add(nid)
+            in_stack.add(nid)
+            for child_id in nodes[nid].children:
+                if child_id in in_stack:
+                    return True
+                if child_id not in visited and _dfs_cycle(child_id):
+                    return True
+            in_stack.discard(nid)
+            return False
+
+        if _dfs_cycle(root_id):
+            raise ValueError("Fault tree contains a cycle")
+
+        return FaultTree(root_id=root_id, nodes=dict(nodes))
+
+    def evaluate(self, tree: FaultTree) -> float:
+        """Compute the top event probability by recursively evaluating gates."""
+        return self._evaluate_node(tree, tree.root_id)
+
+    def _evaluate_node(self, tree: FaultTree, node_id: str) -> float:
+        """Recursively compute probability for a single node."""
+        node = tree.nodes[node_id]
+
+        if node.node_type == FaultTreeNodeType.EVENT:
+            return node.probability
+
+        child_probs = [self._evaluate_node(tree, cid) for cid in node.children]
+
+        if node.gate_type == FaultTreeGateType.AND:
+            result = 1.0
+            for p in child_probs:
+                result *= p
+            return result
+
+        if node.gate_type == FaultTreeGateType.OR:
+            result = 1.0
+            for p in child_probs:
+                result *= (1.0 - p)
+            return 1.0 - result
+
+        if node.gate_type == FaultTreeGateType.VOTING:
+            k = node.voting_k
+            n = len(child_probs)
+            # Exact computation: sum over all subsets of size >= k
+            total = 0.0
+            for r in range(k, n + 1):
+                for subset in combinations(range(n), r):
+                    p_subset = 1.0
+                    for i in range(n):
+                        if i in subset:
+                            p_subset *= child_probs[i]
+                        else:
+                            p_subset *= (1.0 - child_probs[i])
+                    total += p_subset
+            return total
+
+        raise ValueError(f"Unknown gate type: {node.gate_type}")
+
+    def get_minimal_cut_sets(self, tree: FaultTree) -> List[Set[str]]:
+        """Find minimal combinations of basic events that cause the top event.
+
+        A cut set is a set of basic events whose simultaneous failure causes
+        the top event.  A minimal cut set has no proper subset that is also a
+        cut set.
+        """
+        raw_sets = self._cut_sets_for_node(tree, tree.root_id)
+
+        # Minimise: remove any set that is a superset of another
+        minimal: List[Set[str]] = []
+        sorted_sets = sorted(raw_sets, key=len)
+        for candidate in sorted_sets:
+            if not any(existing <= candidate for existing in minimal):
+                minimal.append(candidate)
+        return minimal
+
+    def _cut_sets_for_node(self, tree: FaultTree, node_id: str) -> List[Set[str]]:
+        """Recursively compute cut sets for a node."""
+        node = tree.nodes[node_id]
+
+        if node.node_type == FaultTreeNodeType.EVENT:
+            return [{node_id}]
+
+        children_cut_sets = [
+            self._cut_sets_for_node(tree, cid) for cid in node.children
+        ]
+
+        if node.gate_type == FaultTreeGateType.AND:
+            # AND gate: cross product of children's cut sets
+            result = children_cut_sets[0]
+            for child_sets in children_cut_sets[1:]:
+                new_result: List[Set[str]] = []
+                for s1 in result:
+                    for s2 in child_sets:
+                        new_result.append(s1 | s2)
+                result = new_result
+            return result
+
+        if node.gate_type == FaultTreeGateType.OR:
+            # OR gate: union of all children's cut sets
+            result: List[Set[str]] = []
+            for child_sets in children_cut_sets:
+                result.extend(child_sets)
+            return result
+
+        if node.gate_type == FaultTreeGateType.VOTING:
+            # VOTING(k/n): union of cross products of k-subsets of children
+            k = node.voting_k
+            n = len(children_cut_sets)
+            result: List[Set[str]] = []
+            for child_indices in combinations(range(n), k):
+                selected = [children_cut_sets[i] for i in child_indices]
+                cross = selected[0]
+                for s in selected[1:]:
+                    new_cross: List[Set[str]] = []
+                    for s1 in cross:
+                        for s2 in s:
+                            new_cross.append(s1 | s2)
+                    cross = new_cross
+                result.extend(cross)
+            return result
+
+        raise ValueError(f"Unknown gate type: {node.gate_type}")
+
+    def importance_analysis(self, tree: FaultTree) -> Dict[str, float]:
+        """Birnbaum importance for each basic event.
+
+        Birnbaum importance = dP_top / dP_event, computed as:
+            I_B(i) = P(top | event_i=1) - P(top | event_i=0)
+        """
+        basic_events = [
+            n for n in tree.nodes.values()
+            if n.node_type == FaultTreeNodeType.EVENT
+        ]
+
+        importances: Dict[str, float] = {}
+        for event in basic_events:
+            original_prob = event.probability
+
+            # P(top | event = 1)
+            event.probability = 1.0
+            p_top_1 = self.evaluate(tree)
+
+            # P(top | event = 0)
+            event.probability = 0.0
+            p_top_0 = self.evaluate(tree)
+
+            # Restore
+            event.probability = original_prob
+
+            importances[event.node_id] = p_top_1 - p_top_0
+
+        return importances
+
+    def get_critical_path(self, tree: FaultTree) -> List[str]:
+        """Return the path from root to a leaf with the highest probability contribution.
+
+        At each gate, the child with the highest evaluated probability is
+        selected, forming the critical path through the tree.
+        """
+        path: List[str] = []
+        current_id = tree.root_id
+
+        while True:
+            path.append(current_id)
+            node = tree.nodes[current_id]
+            if node.node_type == FaultTreeNodeType.EVENT:
+                break
+            if not node.children:
+                break
+            # Pick child with highest probability
+            best_child = max(
+                node.children,
+                key=lambda cid: self._evaluate_node(tree, cid),
+            )
+            current_id = best_child
+
+        return path
 
 
 def main(args=None):

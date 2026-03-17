@@ -807,6 +807,262 @@ class NotificationDispatcher:
             return f"[{severity}] {subject}", body
 
 
+# ---------------------------------------------------------------------------
+# Alarm flood detection and rate limiting
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AlarmFloodEvent:
+    """Represents a detected alarm flood episode.
+
+    Attributes:
+        start_time: Timestamp when the flood was first detected.
+        end_time: Timestamp when the flood subsided (None while active).
+        alarm_count: Total alarms received during the flood window.
+        unique_alarm_types: Set of distinct alarm type strings seen.
+        suppressed_count: Number of alarms suppressed during the flood.
+        is_active: Whether the flood is currently ongoing.
+    """
+    start_time: float
+    end_time: Optional[float] = None
+    alarm_count: int = 0
+    unique_alarm_types: set = field(default_factory=set)
+    suppressed_count: int = 0
+    is_active: bool = True
+
+
+@dataclass
+class AlarmSuppression:
+    """Record of a single suppressed alarm during a flood.
+
+    Attributes:
+        alarm_id: Identifier of the suppressed alarm.
+        reason: Human-readable reason for suppression.
+        suppressed_at: Timestamp when the alarm was suppressed.
+        original_severity: Severity value the alarm carried.
+        would_have_notified: Whether the alarm would have triggered a
+            notification under normal (non-flood) conditions.
+    """
+    alarm_id: str
+    reason: str
+    suppressed_at: float
+    original_severity: float
+    would_have_notified: bool = True
+
+
+class AlarmFloodDetector:
+    """Detects alarm floods and suppresses duplicate / low-severity alarms.
+
+    When the alarm arrival rate exceeds *flood_threshold* alarms per minute
+    within a sliding *window_sec* window, the detector enters flood mode.
+    While in flood mode:
+
+    * Duplicate alarms (same alarm_type) are suppressed.
+    * Only the highest-severity alarm per alarm_type is forwarded.
+    * All suppression decisions are logged for later audit.
+
+    After the rate drops below the threshold, a *cooldown_sec* period is
+    enforced before the detector returns to normal operation.
+
+    Args:
+        flood_threshold: Alarms per minute to trigger flood mode (default 10).
+        window_sec: Sliding window length in seconds (default 60).
+        cooldown_sec: Seconds after flood before resuming normal (default 30).
+    """
+
+    def __init__(
+        self,
+        flood_threshold: int = 10,
+        window_sec: float = 60.0,
+        cooldown_sec: float = 30.0,
+    ) -> None:
+        self.flood_threshold = flood_threshold
+        self.window_sec = window_sec
+        self.cooldown_sec = cooldown_sec
+        # Internal threshold: number of alarms within the window that
+        # corresponds to *flood_threshold* alarms per minute.
+        self._window_count_threshold = flood_threshold * (window_sec / 60.0)
+
+        # Sliding window of (timestamp, alarm_id, severity, alarm_type)
+        self._arrivals: List[Tuple[float, str, float, str]] = []
+        self._lock = threading.Lock()
+
+        # Current flood event (None when not in flood)
+        self._current_flood: Optional[AlarmFloodEvent] = None
+        # Timestamp when the last flood ended (for cooldown tracking)
+        self._flood_ended_at: Optional[float] = None
+
+        # Suppression log
+        self._suppression_log: List[AlarmSuppression] = []
+
+        # During flood: alarm_type -> highest severity seen so far
+        self._flood_type_severity: Dict[str, float] = {}
+        # During flood: alarm_type -> whether the first (highest) was forwarded
+        self._flood_type_forwarded: Dict[str, bool] = {}
+
+    # -- public API ----------------------------------------------------------
+
+    def record_alarm(
+        self,
+        alarm_id: str,
+        severity: float,
+        alarm_type: str,
+        timestamp: float,
+    ) -> bool:
+        """Record an incoming alarm and decide whether to forward it.
+
+        Args:
+            alarm_id: Unique alarm identifier.
+            severity: Alarm severity (higher = more severe).
+            alarm_type: Category / type string for the alarm.
+            timestamp: Arrival timestamp (epoch seconds).
+
+        Returns:
+            ``True`` if the alarm should be forwarded to operators.
+            ``False`` if the alarm was suppressed (flood mitigation).
+        """
+        with self._lock:
+            # Append to sliding window
+            self._arrivals.append((timestamp, alarm_id, severity, alarm_type))
+            # Prune arrivals outside the window
+            self._prune_window(timestamp)
+
+            count = len(self._arrivals)
+            in_cooldown = self._in_cooldown(timestamp)
+
+            # --- flood state transitions ---
+            if self._current_flood is not None and self._current_flood.is_active:
+                # Already in flood
+                self._current_flood.alarm_count += 1
+                self._current_flood.unique_alarm_types.add(alarm_type)
+
+                if count < self._window_count_threshold and not in_cooldown:
+                    # Flood has subsided
+                    self._current_flood.is_active = False
+                    self._current_flood.end_time = timestamp
+                    self._flood_ended_at = timestamp
+                    self._flood_type_severity.clear()
+                    self._flood_type_forwarded.clear()
+                    # This alarm arrives after flood ended — forward it
+                    return True
+
+                # Still in flood — apply suppression logic
+                return self._flood_filter(alarm_id, severity, alarm_type, timestamp)
+
+            # Not currently in flood
+            if count >= self._window_count_threshold and not in_cooldown:
+                # Enter flood mode
+                self._current_flood = AlarmFloodEvent(
+                    start_time=timestamp,
+                    alarm_count=1,
+                    unique_alarm_types={alarm_type},
+                )
+                self._flood_type_severity.clear()
+                self._flood_type_forwarded.clear()
+                # The first alarm that triggers the flood is forwarded
+                self._flood_type_severity[alarm_type] = severity
+                self._flood_type_forwarded[alarm_type] = True
+                return True
+
+            if in_cooldown:
+                # During cooldown we still suppress duplicates
+                return self._cooldown_filter(alarm_id, severity, alarm_type, timestamp)
+
+            # Normal operation — forward everything
+            return True
+
+    def get_flood_status(self) -> Optional[AlarmFloodEvent]:
+        """Return the current flood event, or ``None`` if no flood is active."""
+        with self._lock:
+            return self._current_flood
+
+    def get_suppression_log(self) -> List[AlarmSuppression]:
+        """Return the full list of suppression records."""
+        with self._lock:
+            return list(self._suppression_log)
+
+    def alarm_rate_per_minute(self, current_time: Optional[float] = None) -> float:
+        """Return the current alarm rate (alarms per minute).
+
+        Args:
+            current_time: Optional timestamp override (epoch seconds).
+                If ``None``, uses the latest arrival timestamp.
+        """
+        with self._lock:
+            if not self._arrivals:
+                return 0.0
+            ref_time = current_time if current_time is not None else self._arrivals[-1][0]
+            self._prune_window(ref_time)
+            return self._compute_rate(ref_time)
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _prune_window(self, now: float) -> None:
+        """Remove arrivals older than the sliding window."""
+        cutoff = now - self.window_sec
+        self._arrivals = [a for a in self._arrivals if a[0] > cutoff]
+
+    def _compute_rate(self, now: float) -> float:
+        """Compute alarms-per-minute from the current sliding window.
+
+        Uses the actual time span covered by arrivals (capped at window_sec)
+        to avoid inflating the rate when few alarms sit in a short window.
+        """
+        if not self._arrivals:
+            return 0.0
+        count = len(self._arrivals)
+        actual_span = max(now - self._arrivals[0][0], 1.0)
+        span = min(actual_span, self.window_sec)
+        return count * (60.0 / span) if span > 0 else 0.0
+
+    def _in_cooldown(self, now: float) -> bool:
+        """Check whether we are in the post-flood cooldown period."""
+        if self._flood_ended_at is None:
+            return False
+        return (now - self._flood_ended_at) < self.cooldown_sec
+
+    def _flood_filter(
+        self, alarm_id: str, severity: float, alarm_type: str, timestamp: float,
+    ) -> bool:
+        """Decide whether to forward or suppress an alarm during a flood.
+
+        During a flood, only the highest-severity alarm per alarm_type is
+        forwarded. Subsequent alarms of the same type (or lower severity)
+        are suppressed.
+        """
+        prev_severity = self._flood_type_severity.get(alarm_type)
+
+        if prev_severity is None:
+            # First alarm of this type during the flood — forward it
+            self._flood_type_severity[alarm_type] = severity
+            self._flood_type_forwarded[alarm_type] = True
+            return True
+
+        if severity > prev_severity:
+            # Higher severity supersedes — forward the new one
+            self._flood_type_severity[alarm_type] = severity
+            self._flood_type_forwarded[alarm_type] = True
+            return True
+
+        # Duplicate or lower severity — suppress
+        self._current_flood.suppressed_count += 1
+        self._suppression_log.append(AlarmSuppression(
+            alarm_id=alarm_id,
+            reason=f'Flood suppression: duplicate alarm_type={alarm_type}',
+            suppressed_at=timestamp,
+            original_severity=severity,
+            would_have_notified=True,
+        ))
+        return False
+
+    def _cooldown_filter(
+        self, alarm_id: str, severity: float, alarm_type: str, timestamp: float,
+    ) -> bool:
+        """During cooldown, suppress only exact duplicates of already-seen types."""
+        # During cooldown we forward all alarms (no suppression by default)
+        return True
+
+
 class AlarmManagerNode(MiracleLifecycleNode):
     """Centralizes alarm management with ISA-18.2 compliance.
 

@@ -1177,4 +1177,466 @@ namespace MiracleTwin.Cutting
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Arc Fitting Optimizer
+    // -----------------------------------------------------------------------
+
+    /// <summary>Plane on which an arc lies.</summary>
+    public enum ArcPlane
+    {
+        XY,
+        XZ,
+        YZ
+    }
+
+    /// <summary>Segment type emitted by the arc fitting optimizer.</summary>
+    public enum PathSegmentType
+    {
+        LINE,
+        ARC
+    }
+
+    /// <summary>
+    /// Candidate arc produced by least-squares circle fitting.
+    /// Contains the geometric parameters needed to emit a G2/G3 command.
+    /// </summary>
+    [Serializable]
+    public struct ArcCandidate
+    {
+        /// <summary>Center of the fitted circle (mm).</summary>
+        public Vector3 center;
+        /// <summary>Radius of the fitted circle (mm).</summary>
+        public float radius;
+        /// <summary>Start angle of the arc (radians).</summary>
+        public float startAngle;
+        /// <summary>Sweep angle of the arc (radians, positive = CCW).</summary>
+        public float sweepAngle;
+        /// <summary>Plane on which the arc lies.</summary>
+        public ArcPlane plane;
+        /// <summary>First point of the arc.</summary>
+        public Vector3 startPoint;
+        /// <summary>Last point of the arc.</summary>
+        public Vector3 endPoint;
+        /// <summary>Maximum deviation of any source point from the fitted circle (mm).</summary>
+        public float maxDeviation;
+    }
+
+    /// <summary>
+    /// A single segment in the optimised tool path — either a straight line
+    /// or a circular arc (G2/G3).
+    /// </summary>
+    [Serializable]
+    public class PathSegment
+    {
+        /// <summary>Whether this segment is a line or an arc.</summary>
+        public PathSegmentType segmentType;
+        /// <summary>Start position (mm).</summary>
+        public Vector3 startPoint;
+        /// <summary>End position (mm).</summary>
+        public Vector3 endPoint;
+        /// <summary>Arc center (mm). Only meaningful when segmentType == ARC.</summary>
+        public Vector3 center;
+        /// <summary>Arc radius (mm). Only meaningful when segmentType == ARC.</summary>
+        public float radius;
+        /// <summary>True for clockwise (G2), false for counter-clockwise (G3). Only meaningful for arcs.</summary>
+        public bool isClockwise;
+    }
+
+    /// <summary>
+    /// Aggregate result of the arc-fitting optimization pass.
+    /// </summary>
+    [Serializable]
+    public class ArcFitResult
+    {
+        /// <summary>Number of linear segments in the original path.</summary>
+        public int originalSegmentCount;
+        /// <summary>Number of arcs that replaced linear segment runs.</summary>
+        public int fittedArcCount;
+        /// <summary>Percentage reduction in segment count.</summary>
+        public float lineReductionPct;
+        /// <summary>Sum of max-deviation values across all fitted arcs (mm).</summary>
+        public float totalDeviation;
+    }
+
+    /// <summary>
+    /// Replaces sequences of short linear G1 moves with circular arcs (G2/G3)
+    /// where the points are coplanar and lie within a configurable tolerance of
+    /// a least-squares fitted circle. This reduces segment count and allows the
+    /// CNC controller to maintain higher feed rates through smooth curves.
+    /// </summary>
+    public class ArcFittingOptimizer
+    {
+        /// <summary>Maximum allowed deviation (mm) between source points and the fitted arc.</summary>
+        public float tolerance = 0.005f;
+
+        /// <summary>Tolerance (mm) for coplanarity check — all points must lie within this
+        /// distance of the candidate plane to be considered coplanar.</summary>
+        public float planeTolerance = 0.001f;
+
+        /// <summary>Minimum number of points required to attempt a circle fit.</summary>
+        public int minPointsForArc = 3;
+
+        // ── Plane detection ──────────────────────────────────────────────
+
+        /// <summary>
+        /// Determine which principal plane (XY, XZ, YZ) a set of points lies on.
+        /// Returns true if all points are within <see cref="planeTolerance"/> of
+        /// one of the three planes; outputs the detected plane.
+        /// </summary>
+        public bool DetectPlane(List<Vector3> points, out ArcPlane plane)
+        {
+            plane = ArcPlane.XY;
+            if (points == null || points.Count < 2) return false;
+
+            // Compute the range (span) along each axis
+            float minX = float.MaxValue, maxX = float.MinValue;
+            float minY = float.MaxValue, maxY = float.MinValue;
+            float minZ = float.MaxValue, maxZ = float.MinValue;
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                var p = points[i];
+                if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+                if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+            }
+
+            float spanX = maxX - minX;
+            float spanY = maxY - minY;
+            float spanZ = maxZ - minZ;
+
+            // The flat axis is the one with the smallest span
+            // XY plane => Z is flat, XZ plane => Y is flat, YZ plane => X is flat
+            if (spanZ <= spanX && spanZ <= spanY)
+            {
+                plane = ArcPlane.XY;
+                return spanZ <= planeTolerance;
+            }
+            if (spanY <= spanX && spanY <= spanZ)
+            {
+                plane = ArcPlane.XZ;
+                return spanY <= planeTolerance;
+            }
+            // spanX is smallest
+            plane = ArcPlane.YZ;
+            return spanX <= planeTolerance;
+        }
+
+        // ── 2-D coordinate extraction ────────────────────────────────────
+
+        /// <summary>
+        /// Extract the two in-plane coordinates for a point given the arc plane.
+        /// </summary>
+        private static void GetPlaneCoords(Vector3 p, ArcPlane plane, out float u, out float v)
+        {
+            switch (plane)
+            {
+                case ArcPlane.XY: u = p.x; v = p.y; break;
+                case ArcPlane.XZ: u = p.x; v = p.z; break;
+                case ArcPlane.YZ: u = p.y; v = p.z; break;
+                default: u = p.x; v = p.y; break;
+            }
+        }
+
+        // ── Least-squares circle fitting ─────────────────────────────────
+
+        /// <summary>
+        /// Fit a circle to a set of 2-D points using the algebraic least-squares
+        /// method (Kasa method). Minimises the sum of (distance - radius)².
+        /// Returns false if the fit is degenerate.
+        /// </summary>
+        public bool FitCircle(List<Vector3> points, ArcPlane plane,
+            out float centerU, out float centerV, out float radius)
+        {
+            centerU = 0f; centerV = 0f; radius = 0f;
+            int n = points.Count;
+            if (n < 3) return false;
+
+            // Kasa method: solve [ sum(ui²+vi²)*ui  ] = A * [a, b, c]^T
+            // where circle equation: u² + v² + a*u + b*v + c = 0
+            // center = (-a/2, -b/2), radius = sqrt(a²/4 + b²/4 - c)
+            double sumU = 0, sumV = 0, sumU2 = 0, sumV2 = 0;
+            double sumUV = 0, sumU3 = 0, sumV3 = 0, sumU2V = 0, sumUV2 = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                GetPlaneCoords(points[i], plane, out float uf, out float vf);
+                double u = uf, v = vf;
+                double u2 = u * u, v2 = v * v;
+                sumU += u; sumV += v;
+                sumU2 += u2; sumV2 += v2;
+                sumUV += u * v;
+                sumU3 += u2 * u; sumV3 += v2 * v;
+                sumU2V += u2 * v; sumUV2 += u * v2;
+            }
+
+            // Build the 3x3 normal equations:
+            // | sumU2  sumUV  sumU | |a|   | -(sumU3 + sumUV2) |
+            // | sumUV  sumV2  sumV | |b| = | -(sumU2V + sumV3) |
+            // | sumU   sumV   n    | |c|   | -(sumU2 + sumV2)  |
+            double[,] A = new double[3, 3];
+            double[] B = new double[3];
+
+            A[0, 0] = sumU2; A[0, 1] = sumUV; A[0, 2] = sumU;
+            A[1, 0] = sumUV; A[1, 1] = sumV2; A[1, 2] = sumV;
+            A[2, 0] = sumU;  A[2, 1] = sumV;  A[2, 2] = n;
+
+            B[0] = -(sumU3 + sumUV2);
+            B[1] = -(sumU2V + sumV3);
+            B[2] = -(sumU2 + sumV2);
+
+            // Solve via Cramer's rule
+            double det = Det3(A);
+            if (System.Math.Abs(det) < 1e-12) return false;
+
+            double a = Det3Substituted(A, B, 0) / det;
+            double b = Det3Substituted(A, B, 1) / det;
+            double c = Det3Substituted(A, B, 2) / det;
+
+            centerU = (float)(-a * 0.5);
+            centerV = (float)(-b * 0.5);
+            double rSquared = a * a * 0.25 + b * b * 0.25 - c;
+            if (rSquared < 0) return false;
+            radius = (float)System.Math.Sqrt(rSquared);
+            return radius > 1e-6f;
+        }
+
+        /// <summary>Determinant of a 3x3 matrix.</summary>
+        private static double Det3(double[,] m)
+        {
+            return m[0, 0] * (m[1, 1] * m[2, 2] - m[1, 2] * m[2, 1])
+                 - m[0, 1] * (m[1, 0] * m[2, 2] - m[1, 2] * m[2, 0])
+                 + m[0, 2] * (m[1, 0] * m[2, 1] - m[1, 1] * m[2, 0]);
+        }
+
+        /// <summary>Determinant with column <paramref name="col"/> replaced by <paramref name="b"/>.</summary>
+        private static double Det3Substituted(double[,] m, double[] b, int col)
+        {
+            double[,] tmp = (double[,])m.Clone();
+            for (int r = 0; r < 3; r++) tmp[r, col] = b[r];
+            return Det3(tmp);
+        }
+
+        // ── Build ArcCandidate ───────────────────────────────────────────
+
+        /// <summary>
+        /// Build an <see cref="ArcCandidate"/> from a fitted circle and the source
+        /// points. Computes start angle, sweep angle, max deviation, and direction.
+        /// </summary>
+        public ArcCandidate BuildCandidate(
+            List<Vector3> points, ArcPlane plane,
+            float centerU, float centerV, float radius)
+        {
+            var candidate = new ArcCandidate
+            {
+                plane = plane,
+                startPoint = points[0],
+                endPoint = points[points.Count - 1],
+                radius = radius,
+            };
+
+            // Set center in 3-D — place the out-of-plane coordinate at the
+            // average value so the center is on the same plane as the points.
+            float outOfPlane = 0f;
+            for (int i = 0; i < points.Count; i++)
+            {
+                switch (plane)
+                {
+                    case ArcPlane.XY: outOfPlane += points[i].z; break;
+                    case ArcPlane.XZ: outOfPlane += points[i].y; break;
+                    case ArcPlane.YZ: outOfPlane += points[i].x; break;
+                }
+            }
+            outOfPlane /= points.Count;
+
+            switch (plane)
+            {
+                case ArcPlane.XY: candidate.center = new Vector3(centerU, centerV, outOfPlane); break;
+                case ArcPlane.XZ: candidate.center = new Vector3(centerU, outOfPlane, centerV); break;
+                case ArcPlane.YZ: candidate.center = new Vector3(outOfPlane, centerU, centerV); break;
+            }
+
+            // Angles
+            GetPlaneCoords(points[0], plane, out float su, out float sv);
+            GetPlaneCoords(points[points.Count - 1], plane, out float eu, out float ev);
+            candidate.startAngle = Mathf.Atan2(sv - centerV, su - centerU);
+
+            float endAngle = Mathf.Atan2(ev - centerV, eu - centerU);
+
+            // Determine sweep direction from point ordering (cross-product sign)
+            float sweepCCW = endAngle - candidate.startAngle;
+            if (sweepCCW < 0) sweepCCW += Mathf.PI * 2f;
+            float sweepCW = sweepCCW - Mathf.PI * 2f; // negative
+
+            // Use cross-product of successive chords to determine winding
+            if (points.Count >= 3)
+            {
+                GetPlaneCoords(points[1], plane, out float mu, out float mv);
+                float cross = (mu - su) * (ev - sv) - (mv - sv) * (eu - su);
+                candidate.sweepAngle = cross >= 0 ? sweepCCW : sweepCW;
+            }
+            else
+            {
+                candidate.sweepAngle = sweepCCW;
+            }
+
+            // Max deviation
+            float maxDev = 0f;
+            for (int i = 0; i < points.Count; i++)
+            {
+                GetPlaneCoords(points[i], plane, out float pu, out float pv);
+                float dist = Mathf.Sqrt((pu - centerU) * (pu - centerU) + (pv - centerV) * (pv - centerV));
+                float dev = Mathf.Abs(dist - radius);
+                if (dev > maxDev) maxDev = dev;
+            }
+            candidate.maxDeviation = maxDev;
+
+            return candidate;
+        }
+
+        // ── High-level optimisation entry point ──────────────────────────
+
+        /// <summary>
+        /// Analyse a sequence of linear toolpath points, replace runs that
+        /// approximate circular arcs with arc segments, and return an optimised
+        /// list of <see cref="PathSegment"/> objects. Also populates an
+        /// <see cref="ArcFitResult"/> with aggregate metrics.
+        /// </summary>
+        public List<PathSegment> OptimizeToolPath(List<Vector3> points, float tolerance)
+        {
+            var segments = new List<PathSegment>();
+            if (points == null || points.Count < 2)
+                return segments;
+
+            this.tolerance = tolerance;
+            int n = points.Count;
+            int i = 0;
+
+            while (i < n - 1)
+            {
+                // Try to find the longest run starting at i that fits an arc
+                int bestEnd = -1;
+                ArcCandidate bestCandidate = default;
+
+                if (i + minPointsForArc - 1 < n)
+                {
+                    // Expand window from minimum size outward
+                    for (int end = i + minPointsForArc - 1; end < n; end++)
+                    {
+                        var window = points.GetRange(i, end - i + 1);
+
+                        if (!DetectPlane(window, out ArcPlane plane))
+                            break;
+
+                        if (!FitCircle(window, plane, out float cu, out float cv, out float r))
+                            break;
+
+                        var candidate = BuildCandidate(window, plane, cu, cv, r);
+
+                        if (candidate.maxDeviation <= tolerance)
+                        {
+                            bestEnd = end;
+                            bestCandidate = candidate;
+                        }
+                        else
+                        {
+                            break; // deviation exceeded — stop expanding
+                        }
+                    }
+                }
+
+                if (bestEnd >= 0)
+                {
+                    // Emit an arc segment
+                    segments.Add(new PathSegment
+                    {
+                        segmentType = PathSegmentType.ARC,
+                        startPoint = bestCandidate.startPoint,
+                        endPoint = bestCandidate.endPoint,
+                        center = bestCandidate.center,
+                        radius = bestCandidate.radius,
+                        isClockwise = bestCandidate.sweepAngle < 0,
+                    });
+                    i = bestEnd; // advance past the arc
+                }
+                else
+                {
+                    // Emit a single line segment
+                    segments.Add(new PathSegment
+                    {
+                        segmentType = PathSegmentType.LINE,
+                        startPoint = points[i],
+                        endPoint = points[i + 1],
+                    });
+                    i++;
+                }
+            }
+
+            return segments;
+        }
+
+        /// <summary>
+        /// Run <see cref="OptimizeToolPath"/> and return both the segment list and
+        /// the aggregate <see cref="ArcFitResult"/>.
+        /// </summary>
+        public ArcFitResult Analyze(List<Vector3> points, float tolerance)
+        {
+            var result = new ArcFitResult();
+            if (points == null || points.Count < 2)
+                return result;
+
+            result.originalSegmentCount = points.Count - 1;
+
+            var segments = OptimizeToolPath(points, tolerance);
+            int arcCount = 0;
+            float totalDev = 0f;
+
+            // Recompute total deviation by re-fitting each arc window
+            int idx = 0;
+            foreach (var seg in segments)
+            {
+                if (seg.segmentType == PathSegmentType.ARC)
+                {
+                    arcCount++;
+                    // Find the sub-range of original points that form this arc
+                    int arcStart = idx;
+                    int arcEnd = arcStart;
+                    for (int j = arcStart; j < points.Count; j++)
+                    {
+                        if (points[j] == seg.endPoint)
+                        {
+                            arcEnd = j;
+                            break;
+                        }
+                    }
+
+                    var window = points.GetRange(arcStart, arcEnd - arcStart + 1);
+                    if (DetectPlane(window, out ArcPlane plane) &&
+                        FitCircle(window, plane, out float cu, out float cv, out float r))
+                    {
+                        var cand = BuildCandidate(window, plane, cu, cv, r);
+                        totalDev += cand.maxDeviation;
+                    }
+
+                    idx = arcEnd;
+                }
+                else
+                {
+                    idx++;
+                }
+            }
+
+            result.fittedArcCount = arcCount;
+            result.totalDeviation = totalDev;
+
+            if (result.originalSegmentCount > 0)
+            {
+                result.lineReductionPct =
+                    (1f - (float)segments.Count / result.originalSegmentCount) * 100f;
+            }
+
+            return result;
+        }
+    }
 }

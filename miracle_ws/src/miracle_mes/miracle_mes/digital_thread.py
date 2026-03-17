@@ -997,6 +997,172 @@ class DigitalThreadNode(MiracleLifecycleNode):
         return True
 
 
+# ------------------------------------------------------------------
+# Batch traceability
+# ------------------------------------------------------------------
+
+@dataclass
+class MaterialBatch:
+    """A material batch received from a supplier."""
+
+    batch_id: str
+    material_type: str
+    supplier: str
+    lot_number: str
+    received_date: float
+    quantity: float
+    unit: str
+    certifications: List[str] = field(default_factory=list)
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BatchUsageRecord:
+    """A record of material batch consumption during manufacturing."""
+
+    batch_id: str
+    job_id: str
+    machine_id: str
+    quantity_used: float
+    timestamp: float
+    operation: str
+
+
+class BatchTraceabilityManager:
+    """Tracks material batches through the manufacturing process.
+
+    Provides forward traceability (batch -> jobs) and backward
+    traceability (job -> batches), remaining quantity tracking,
+    certification verification, and shelf-life expiry detection.
+    """
+
+    def __init__(self) -> None:
+        self._batches: Dict[str, MaterialBatch] = {}
+        self._usage_records: List[BatchUsageRecord] = []
+        self._lock = threading.Lock()
+
+    # -- registration ------------------------------------------------
+
+    def register_batch(self, batch: MaterialBatch) -> None:
+        """Register a new material batch."""
+        with self._lock:
+            self._batches[batch.batch_id] = batch
+
+    # -- usage recording ---------------------------------------------
+
+    def record_usage(
+        self,
+        batch_id: str,
+        job_id: str,
+        machine_id: str,
+        quantity: float,
+        operation: str,
+    ) -> None:
+        """Record consumption of material from a batch."""
+        record = BatchUsageRecord(
+            batch_id=batch_id,
+            job_id=job_id,
+            machine_id=machine_id,
+            quantity_used=quantity,
+            timestamp=time.time(),
+            operation=operation,
+        )
+        with self._lock:
+            self._usage_records.append(record)
+
+    # -- queries -----------------------------------------------------
+
+    def get_batch_history(self, batch_id: str) -> List[BatchUsageRecord]:
+        """Return all usage records for a given batch."""
+        with self._lock:
+            return [r for r in self._usage_records if r.batch_id == batch_id]
+
+    def get_job_materials(self, job_id: str) -> List[BatchUsageRecord]:
+        """Return all batch usage records associated with a job."""
+        with self._lock:
+            return [r for r in self._usage_records if r.job_id == job_id]
+
+    def get_remaining_quantity(self, batch_id: str) -> float:
+        """Compute the remaining quantity for a batch.
+
+        Returns the original quantity minus the sum of all recorded
+        usage.  Returns ``0.0`` if the batch is unknown.
+        """
+        with self._lock:
+            batch = self._batches.get(batch_id)
+            if batch is None:
+                return 0.0
+            used = sum(
+                r.quantity_used
+                for r in self._usage_records
+                if r.batch_id == batch_id
+            )
+            return batch.quantity - used
+
+    # -- traceability ------------------------------------------------
+
+    def trace_forward(self, batch_id: str) -> List[str]:
+        """Forward traceability: find all jobs that used a batch.
+
+        Returns a deduplicated list of job IDs.
+        """
+        with self._lock:
+            seen: Dict[str, None] = {}
+            for r in self._usage_records:
+                if r.batch_id == batch_id:
+                    seen[r.job_id] = None
+            return list(seen.keys())
+
+    def trace_backward(self, job_id: str) -> List[str]:
+        """Backward traceability: find all batches that went into a job.
+
+        Returns a deduplicated list of batch IDs.
+        """
+        with self._lock:
+            seen: Dict[str, None] = {}
+            for r in self._usage_records:
+                if r.job_id == job_id:
+                    seen[r.batch_id] = None
+            return list(seen.keys())
+
+    # -- certification -----------------------------------------------
+
+    def check_certification(self, batch_id: str, required_cert: str) -> bool:
+        """Verify that a batch holds a required certification.
+
+        Returns ``False`` if the batch is unknown or lacks the
+        certification.
+        """
+        with self._lock:
+            batch = self._batches.get(batch_id)
+            if batch is None:
+                return False
+            return required_cert in batch.certifications
+
+    # -- shelf-life expiry -------------------------------------------
+
+    def get_expiring_batches(self, days_ahead: float) -> List[MaterialBatch]:
+        """Find batches whose shelf life expires within *days_ahead* days.
+
+        Only considers batches that have a ``shelf_life_days`` key in
+        their *properties* dict.  A batch expires when
+        ``received_date + shelf_life_days * 86400`` is within
+        *days_ahead* days from now.
+        """
+        now = time.time()
+        horizon = now + days_ahead * 86400.0
+        with self._lock:
+            expiring: List[MaterialBatch] = []
+            for batch in self._batches.values():
+                shelf_life = batch.properties.get('shelf_life_days')
+                if shelf_life is None:
+                    continue
+                expiry_ts = batch.received_date + float(shelf_life) * 86400.0
+                if expiry_ts <= horizon:
+                    expiring.append(batch)
+            return expiring
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

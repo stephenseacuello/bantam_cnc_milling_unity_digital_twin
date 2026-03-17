@@ -2752,3 +2752,295 @@ class AdaptiveFeedController:
             total_adjustments=self._state.total_adjustments,
             override_histogram=histogram,
         )
+
+
+# ---------------------------------------------------------------------------
+# Spindle Warmup Manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WarmupStage:
+    """A single stage in a spindle warmup sequence."""
+    rpm: float
+    duration_min: float
+    description: str
+
+
+@dataclass
+class WarmupProfile:
+    """Complete warmup profile for a spindle warmup sequence."""
+    stages: List[WarmupStage]
+    total_duration_min: float
+    target_rpm: float
+    machine_id: str = 'default'
+
+
+@dataclass
+class WarmupStatus:
+    """Current status of a warmup sequence in progress."""
+    current_stage_idx: int
+    elapsed_min: float
+    current_rpm: float
+    thermal_stability_pct: float  # 0-100, 100 = fully stable
+    is_complete: bool
+
+
+class SpindleWarmupManager:
+    """Manages spindle warmup sequences to prevent thermal shock and ensure
+    dimensional stability.
+
+    Spindle bearings and the spindle shaft expand as they reach operating
+    temperature.  Running a controlled warmup sequence reduces thermal
+    gradients, prevents premature bearing wear, and improves dimensional
+    accuracy of the first cuts.
+
+    Pre-built profiles:
+        COLD_START   — 5 stages, 500 -> 1000 -> 2000 -> 4000 -> target
+        WARM_RESTART — 2 stages, quick ramp for machines idle < 2 h
+        HIGH_SPEED   — 6 stages, gradual ramp to 24 000 rpm
+    """
+
+    # Thresholds (hours since last run) for profile selection
+    COLD_THRESHOLD_HOURS: float = 4.0
+    WARM_THRESHOLD_HOURS: float = 2.0
+
+    # Thermal stability evaluation constants
+    TEMP_CONVERGENCE_TOLERANCE_C: float = 2.0  # degrees C
+    MIN_STABILITY_PCT: float = 0.0
+    MAX_STABILITY_PCT: float = 100.0
+
+    # --------------- pre-built profiles ---------------
+
+    @staticmethod
+    def _cold_start_profile(target_rpm: float, machine_id: str = 'default') -> WarmupProfile:
+        """5-stage warmup for a cold machine (idle > 4 h)."""
+        stages = [
+            WarmupStage(rpm=500, duration_min=3.0,
+                        description='Initial bearing lubrication at low speed'),
+            WarmupStage(rpm=1000, duration_min=3.0,
+                        description='Gentle thermal soak — inner race warming'),
+            WarmupStage(rpm=2000, duration_min=4.0,
+                        description='Mid-speed stabilisation'),
+            WarmupStage(rpm=4000, duration_min=4.0,
+                        description='High-speed bearing preload settling'),
+            WarmupStage(rpm=target_rpm, duration_min=6.0,
+                        description='Final target RPM — thermal equilibrium'),
+        ]
+        total = sum(s.duration_min for s in stages)
+        return WarmupProfile(
+            stages=stages,
+            total_duration_min=total,
+            target_rpm=target_rpm,
+            machine_id=machine_id,
+        )
+
+    @staticmethod
+    def _warm_restart_profile(target_rpm: float, machine_id: str = 'default') -> WarmupProfile:
+        """2-stage warmup for a warm machine (idle < 2 h)."""
+        mid_rpm = min(target_rpm * 0.5, 4000.0)
+        stages = [
+            WarmupStage(rpm=mid_rpm, duration_min=2.0,
+                        description='Quick mid-speed check'),
+            WarmupStage(rpm=target_rpm, duration_min=3.0,
+                        description='Ramp to target RPM'),
+        ]
+        total = sum(s.duration_min for s in stages)
+        return WarmupProfile(
+            stages=stages,
+            total_duration_min=total,
+            target_rpm=target_rpm,
+            machine_id=machine_id,
+        )
+
+    @staticmethod
+    def _high_speed_profile(machine_id: str = 'default') -> WarmupProfile:
+        """6-stage warmup for high-speed spindles (up to 24 000 rpm)."""
+        stages = [
+            WarmupStage(rpm=500, duration_min=2.0,
+                        description='Lubrication distribution'),
+            WarmupStage(rpm=2000, duration_min=3.0,
+                        description='Low-speed thermal soak'),
+            WarmupStage(rpm=6000, duration_min=4.0,
+                        description='Mid-range bearing warmup'),
+            WarmupStage(rpm=12000, duration_min=5.0,
+                        description='High-speed preload adjustment zone'),
+            WarmupStage(rpm=18000, duration_min=5.0,
+                        description='Near-max thermal stabilisation'),
+            WarmupStage(rpm=24000, duration_min=6.0,
+                        description='Full speed — final equilibrium'),
+        ]
+        total = sum(s.duration_min for s in stages)
+        return WarmupProfile(
+            stages=stages,
+            total_duration_min=total,
+            target_rpm=24000.0,
+            machine_id=machine_id,
+        )
+
+    # --------------- public API ---------------
+
+    def generate_profile(
+        self,
+        target_rpm: float,
+        machine_state: str = 'cold',
+        machine_id: str = 'default',
+    ) -> WarmupProfile:
+        """Create an appropriate warmup profile based on target speed and
+        current thermal state.
+
+        Args:
+            target_rpm: Desired operating spindle speed.
+            machine_state: One of 'cold', 'warm', or 'hot'.
+            machine_id: Identifier for the machine.
+
+        Returns:
+            WarmupProfile tailored to the current conditions.
+        """
+        if target_rpm >= 20000:
+            return self._high_speed_profile(machine_id=machine_id)
+
+        if machine_state == 'warm':
+            return self._warm_restart_profile(target_rpm, machine_id=machine_id)
+
+        if machine_state == 'hot':
+            # Hot machine: single stage, short dwell at target
+            stages = [
+                WarmupStage(rpm=target_rpm, duration_min=2.0,
+                            description='Verification run at target RPM'),
+            ]
+            return WarmupProfile(
+                stages=stages,
+                total_duration_min=2.0,
+                target_rpm=target_rpm,
+                machine_id=machine_id,
+            )
+
+        # Default: cold start
+        return self._cold_start_profile(target_rpm, machine_id=machine_id)
+
+    def evaluate_stability(
+        self,
+        bearing_temps: List[float],
+        spindle_temps: List[float],
+    ) -> float:
+        """Evaluate thermal stability based on temperature convergence.
+
+        Stability is 100% when all bearing and spindle temperatures are
+        within ``TEMP_CONVERGENCE_TOLERANCE_C`` of each other, and
+        decreases linearly with the maximum spread.
+
+        Args:
+            bearing_temps: List of bearing temperature readings (C).
+            spindle_temps: List of spindle shaft temperature readings (C).
+
+        Returns:
+            thermal_stability_pct in range [0, 100].
+        """
+        all_temps = bearing_temps + spindle_temps
+        if not all_temps:
+            return self.MIN_STABILITY_PCT
+
+        temp_min = min(all_temps)
+        temp_max = max(all_temps)
+        spread = temp_max - temp_min
+
+        if spread <= self.TEMP_CONVERGENCE_TOLERANCE_C:
+            return self.MAX_STABILITY_PCT
+
+        # Linear decay: 100 % at tolerance, 0 % at 10x tolerance
+        max_spread = self.TEMP_CONVERGENCE_TOLERANCE_C * 10.0
+        stability = max(
+            self.MIN_STABILITY_PCT,
+            self.MAX_STABILITY_PCT * (1.0 - (spread - self.TEMP_CONVERGENCE_TOLERANCE_C)
+                                      / (max_spread - self.TEMP_CONVERGENCE_TOLERANCE_C)),
+        )
+        return round(stability, 2)
+
+    def recommend_warmup(
+        self,
+        target_rpm: float,
+        hours_since_last_run: float,
+    ) -> Tuple[bool, str]:
+        """Recommend whether a warmup cycle is needed.
+
+        Args:
+            target_rpm: Desired operating RPM.
+            hours_since_last_run: Hours since the spindle was last run.
+
+        Returns:
+            Tuple of (warmup_recommended: bool, reason: str).
+        """
+        if hours_since_last_run >= self.COLD_THRESHOLD_HOURS:
+            return (
+                True,
+                f"Machine has been idle for {hours_since_last_run:.1f} h "
+                f"(>= {self.COLD_THRESHOLD_HOURS} h). "
+                "Full cold-start warmup recommended to avoid thermal shock.",
+            )
+
+        if hours_since_last_run >= self.WARM_THRESHOLD_HOURS:
+            return (
+                True,
+                f"Machine has been idle for {hours_since_last_run:.1f} h "
+                f"(>= {self.WARM_THRESHOLD_HOURS} h). "
+                "Short warm-restart warmup recommended.",
+            )
+
+        if target_rpm >= 20000:
+            return (
+                True,
+                f"Target RPM ({target_rpm}) is in the high-speed range. "
+                "High-speed warmup recommended regardless of idle time.",
+            )
+
+        return (
+            False,
+            f"Machine was recently active ({hours_since_last_run:.1f} h ago) "
+            f"and target RPM ({target_rpm}) is moderate. No warmup needed.",
+        )
+
+    def get_status(
+        self,
+        profile: WarmupProfile,
+        elapsed_min: float,
+        bearing_temps: Optional[List[float]] = None,
+        spindle_temps: Optional[List[float]] = None,
+    ) -> WarmupStatus:
+        """Compute the current warmup status given elapsed time.
+
+        Args:
+            profile: The active warmup profile.
+            elapsed_min: Minutes elapsed since warmup started.
+            bearing_temps: Optional current bearing temps for stability calc.
+            spindle_temps: Optional current spindle temps for stability calc.
+
+        Returns:
+            WarmupStatus snapshot.
+        """
+        cumulative = 0.0
+        current_stage_idx = len(profile.stages) - 1
+        current_rpm = profile.target_rpm
+
+        for i, stage in enumerate(profile.stages):
+            cumulative += stage.duration_min
+            if elapsed_min < cumulative:
+                current_stage_idx = i
+                current_rpm = stage.rpm
+                break
+
+        is_complete = elapsed_min >= profile.total_duration_min
+
+        if bearing_temps and spindle_temps:
+            stability = self.evaluate_stability(bearing_temps, spindle_temps)
+        else:
+            # Estimate stability from elapsed fraction
+            fraction = min(1.0, elapsed_min / max(profile.total_duration_min, 1e-9))
+            stability = round(fraction * 100.0, 2)
+
+        return WarmupStatus(
+            current_stage_idx=current_stage_idx,
+            elapsed_min=elapsed_min,
+            current_rpm=current_rpm,
+            thermal_stability_pct=stability,
+            is_complete=is_complete,
+        )

@@ -1041,6 +1041,627 @@ class ExplanationGeneratorNode(MiracleLifecycleNode):
             return list(self._history)
 
 
+@dataclass
+class HypothesisTest:
+    """Result of a statistical hypothesis test for manufacturing process analysis."""
+    test_name: str
+    null_hypothesis: str
+    alternative_hypothesis: str
+    test_statistic: float
+    p_value: float
+    reject_null: bool
+    confidence_level: float
+    sample_size: int
+    conclusion: str
+
+
+class HypothesisTestEngine:
+    """Statistical hypothesis testing engine for manufacturing process analysis.
+
+    Performs common statistical tests (t-tests, F-test, chi-squared) using
+    pure-Python implementations — no scipy dependency required.  Approximations
+    for the t-distribution and chi-squared CDF are based on well-known series
+    expansions and the regularised incomplete beta / gamma functions.
+    """
+
+    # ------------------------------------------------------------------
+    # Mathematical helpers (pure Python, no scipy)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mean(data: List[float]) -> float:
+        """Arithmetic mean."""
+        return sum(data) / len(data)
+
+    @staticmethod
+    def _variance(data: List[float], ddof: int = 1) -> float:
+        """Sample variance with *ddof* degrees-of-freedom correction."""
+        n = len(data)
+        if n <= ddof:
+            return 0.0
+        m = sum(data) / n
+        return sum((x - m) ** 2 for x in data) / (n - ddof)
+
+    @staticmethod
+    def _std(data: List[float], ddof: int = 1) -> float:
+        """Sample standard deviation."""
+        return math.sqrt(HypothesisTestEngine._variance(data, ddof))
+
+    # ---- Gamma / Beta helpers for CDF approximations -------------------
+
+    @staticmethod
+    def _ln_gamma(z: float) -> float:
+        """Lanczos approximation of ln(Gamma(z)) for z > 0."""
+        if z <= 0:
+            return 0.0
+        # Lanczos g=7, n=9 coefficients
+        coeffs = [
+            0.99999999999980993,
+            676.5203681218851,
+            -1259.1392167224028,
+            771.32342877765313,
+            -176.61502916214059,
+            12.507343278686905,
+            -0.13857109526572012,
+            9.9843695780195716e-6,
+            1.5056327351493116e-7,
+        ]
+        g = 7
+        z_shifted = z - 1.0
+        x = coeffs[0]
+        for i in range(1, g + 2):
+            x += coeffs[i] / (z_shifted + i)
+        t = z_shifted + g + 0.5
+        return (0.5 * math.log(2.0 * math.pi)
+                + (z_shifted + 0.5) * math.log(t)
+                - t
+                + math.log(x))
+
+    @staticmethod
+    def _beta_cf(a: float, b: float, x: float) -> float:
+        """Evaluate the continued fraction for the incomplete beta function.
+
+        Numerical Recipes method (betacf).  Returns the CF value that should
+        be multiplied by the front factor to yield I_x(a,b).
+        """
+        max_iter = 200
+        eps = 3e-14
+        tiny = 1e-30
+
+        qab = a + b
+        qap = a + 1.0
+        qam = a - 1.0
+
+        # First step of Lentz's method
+        c = 1.0
+        d = 1.0 - qab * x / qap
+        if abs(d) < tiny:
+            d = tiny
+        d = 1.0 / d
+        h = d
+
+        for m in range(1, max_iter + 1):
+            m2 = 2 * m
+
+            # Even coefficient: d_{2m} = m(b-m)x / ((a+2m-1)(a+2m))
+            aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < tiny:
+                d = tiny
+            c = 1.0 + aa / c
+            if abs(c) < tiny:
+                c = tiny
+            d = 1.0 / d
+            h *= d * c
+
+            # Odd coefficient: d_{2m+1} = -(a+m)(a+b+m)x / ((a+2m)(a+2m+1))
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+            d = 1.0 + aa * d
+            if abs(d) < tiny:
+                d = tiny
+            c = 1.0 + aa / c
+            if abs(c) < tiny:
+                c = tiny
+            d = 1.0 / d
+            delta = d * c
+            h *= delta
+
+            if abs(delta - 1.0) < eps:
+                break
+
+        return h
+
+    @staticmethod
+    def _regularised_incomplete_beta(a: float, b: float, x: float) -> float:
+        """Regularised incomplete beta function I_x(a, b).
+
+        Used to compute CDF of the t-distribution and F-distribution.
+        """
+        if x < 0.0 or x > 1.0:
+            return 0.0
+        if x == 0.0:
+            return 0.0
+        if x == 1.0:
+            return 1.0
+
+        ln_beta = (HypothesisTestEngine._ln_gamma(a)
+                    + HypothesisTestEngine._ln_gamma(b)
+                    - HypothesisTestEngine._ln_gamma(a + b))
+
+        # Front factor: x^a * (1-x)^b / (a * B(a,b))
+        front = math.exp(
+            a * math.log(x) + b * math.log(1.0 - x) - ln_beta
+        ) / a
+
+        # Use symmetry relation when x > (a+1)/(a+b+2) for better CF convergence
+        if x > (a + 1.0) / (a + b + 2.0):
+            return 1.0 - HypothesisTestEngine._regularised_incomplete_beta(
+                b, a, 1.0 - x,
+            )
+
+        return front * HypothesisTestEngine._beta_cf(a, b, x)
+
+    @staticmethod
+    def _t_cdf(t_val: float, df: float) -> float:
+        """CDF of Student's t-distribution with *df* degrees of freedom."""
+        if df <= 0:
+            return 0.5
+        x = df / (df + t_val * t_val)
+        beta_val = 0.5 * HypothesisTestEngine._regularised_incomplete_beta(
+            df / 2.0, 0.5, x,
+        )
+        if t_val >= 0:
+            return 1.0 - beta_val
+        return beta_val
+
+    @staticmethod
+    def _regularised_gamma_lower(a: float, x: float) -> float:
+        """Lower regularised incomplete gamma function P(a, x).
+
+        Uses series expansion for x < a + 1, continued fraction otherwise.
+        """
+        if x < 0.0:
+            return 0.0
+        if x == 0.0:
+            return 0.0
+
+        ln_ga = HypothesisTestEngine._ln_gamma(a)
+
+        if x < a + 1.0:
+            # Series expansion
+            ap = a
+            s = 1.0 / a
+            delta = s
+            for _ in range(200):
+                ap += 1.0
+                delta *= x / ap
+                s += delta
+                if abs(delta) < abs(s) * 1e-14:
+                    break
+            return s * math.exp(a * math.log(x) - x - ln_ga)
+        else:
+            # Continued fraction (Legendre)
+            b_cf = x + 1.0 - a
+            c = 1e30
+            d = 1.0 / b_cf if abs(b_cf) > 1e-30 else 1e30
+            f = d
+            for i in range(1, 200):
+                an = -i * (i - a)
+                b_cf += 2.0
+                d = an * d + b_cf
+                if abs(d) < 1e-30:
+                    d = 1e-30
+                c = b_cf + an / c
+                if abs(c) < 1e-30:
+                    c = 1e-30
+                d = 1.0 / d
+                delta = d * c
+                f *= delta
+                if abs(delta - 1.0) < 1e-14:
+                    break
+            return 1.0 - f * math.exp(a * math.log(x) - x - ln_ga)
+
+    @staticmethod
+    def _chi2_cdf(x: float, k: float) -> float:
+        """CDF of the chi-squared distribution with *k* degrees of freedom."""
+        if x <= 0.0:
+            return 0.0
+        return HypothesisTestEngine._regularised_gamma_lower(k / 2.0, x / 2.0)
+
+    @staticmethod
+    def _f_cdf(f_val: float, d1: float, d2: float) -> float:
+        """CDF of the F-distribution with (d1, d2) degrees of freedom."""
+        if f_val <= 0.0:
+            return 0.0
+        x = d1 * f_val / (d1 * f_val + d2)
+        return HypothesisTestEngine._regularised_incomplete_beta(
+            d1 / 2.0, d2 / 2.0, x,
+        )
+
+    # ------------------------------------------------------------------
+    # Public hypothesis tests
+    # ------------------------------------------------------------------
+
+    def t_test_one_sample(
+        self,
+        data: List[float],
+        mu0: float = 0.0,
+        alpha: float = 0.05,
+    ) -> HypothesisTest:
+        """One-sample t-test: is the population mean equal to *mu0*?
+
+        Args:
+            data: Sample observations.
+            mu0: Hypothesised population mean under H0.
+            alpha: Significance level.
+
+        Returns:
+            HypothesisTest result.
+        """
+        n = len(data)
+        if n < 2:
+            return HypothesisTest(
+                test_name='one_sample_t_test',
+                null_hypothesis=f'mu == {mu0}',
+                alternative_hypothesis=f'mu != {mu0}',
+                test_statistic=0.0,
+                p_value=1.0,
+                reject_null=False,
+                confidence_level=1.0 - alpha,
+                sample_size=n,
+                conclusion='Insufficient data (n < 2)',
+            )
+
+        x_bar = self._mean(data)
+        s = self._std(data, ddof=1)
+        se = s / math.sqrt(n)
+        t_stat = (x_bar - mu0) / se if se > 0 else 0.0
+        df = n - 1
+
+        # Two-tailed p-value
+        p_value = 2.0 * (1.0 - self._t_cdf(abs(t_stat), df))
+        reject = p_value < alpha
+
+        if reject:
+            conclusion = (
+                f'Reject H0: sample mean ({x_bar:.4f}) differs significantly '
+                f'from {mu0} (t={t_stat:.4f}, p={p_value:.6f})'
+            )
+        else:
+            conclusion = (
+                f'Fail to reject H0: no significant difference between '
+                f'sample mean ({x_bar:.4f}) and {mu0} (t={t_stat:.4f}, p={p_value:.6f})'
+            )
+
+        return HypothesisTest(
+            test_name='one_sample_t_test',
+            null_hypothesis=f'mu == {mu0}',
+            alternative_hypothesis=f'mu != {mu0}',
+            test_statistic=t_stat,
+            p_value=p_value,
+            reject_null=reject,
+            confidence_level=1.0 - alpha,
+            sample_size=n,
+            conclusion=conclusion,
+        )
+
+    def t_test_two_sample(
+        self,
+        data1: List[float],
+        data2: List[float],
+        alpha: float = 0.05,
+    ) -> HypothesisTest:
+        """Welch's two-sample t-test: do two populations have the same mean?
+
+        Uses the Welch-Satterthwaite approximation for degrees of freedom
+        (does not assume equal variances).
+
+        Args:
+            data1: First sample observations.
+            data2: Second sample observations.
+            alpha: Significance level.
+
+        Returns:
+            HypothesisTest result.
+        """
+        n1, n2 = len(data1), len(data2)
+        total_n = n1 + n2
+
+        if n1 < 2 or n2 < 2:
+            return HypothesisTest(
+                test_name='two_sample_t_test_welch',
+                null_hypothesis='mu1 == mu2',
+                alternative_hypothesis='mu1 != mu2',
+                test_statistic=0.0,
+                p_value=1.0,
+                reject_null=False,
+                confidence_level=1.0 - alpha,
+                sample_size=total_n,
+                conclusion='Insufficient data (each sample needs n >= 2)',
+            )
+
+        x1 = self._mean(data1)
+        x2 = self._mean(data2)
+        v1 = self._variance(data1, ddof=1)
+        v2 = self._variance(data2, ddof=1)
+
+        se = math.sqrt(v1 / n1 + v2 / n2) if (v1 / n1 + v2 / n2) > 0 else 1e-15
+        t_stat = (x1 - x2) / se
+
+        # Welch-Satterthwaite degrees of freedom
+        num = (v1 / n1 + v2 / n2) ** 2
+        denom = ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
+        df = num / denom if denom > 0 else 1.0
+
+        p_value = 2.0 * (1.0 - self._t_cdf(abs(t_stat), df))
+        reject = p_value < alpha
+
+        if reject:
+            conclusion = (
+                f'Reject H0: means differ significantly '
+                f'(x1={x1:.4f}, x2={x2:.4f}, t={t_stat:.4f}, p={p_value:.6f})'
+            )
+        else:
+            conclusion = (
+                f'Fail to reject H0: no significant difference between means '
+                f'(x1={x1:.4f}, x2={x2:.4f}, t={t_stat:.4f}, p={p_value:.6f})'
+            )
+
+        return HypothesisTest(
+            test_name='two_sample_t_test_welch',
+            null_hypothesis='mu1 == mu2',
+            alternative_hypothesis='mu1 != mu2',
+            test_statistic=t_stat,
+            p_value=p_value,
+            reject_null=reject,
+            confidence_level=1.0 - alpha,
+            sample_size=total_n,
+            conclusion=conclusion,
+        )
+
+    def f_test_variance(
+        self,
+        data1: List[float],
+        data2: List[float],
+        alpha: float = 0.05,
+    ) -> HypothesisTest:
+        """F-test for equality of variances between two samples.
+
+        Args:
+            data1: First sample observations.
+            data2: Second sample observations.
+            alpha: Significance level.
+
+        Returns:
+            HypothesisTest result.
+        """
+        n1, n2 = len(data1), len(data2)
+        total_n = n1 + n2
+
+        if n1 < 2 or n2 < 2:
+            return HypothesisTest(
+                test_name='f_test_variance',
+                null_hypothesis='sigma1^2 == sigma2^2',
+                alternative_hypothesis='sigma1^2 != sigma2^2',
+                test_statistic=0.0,
+                p_value=1.0,
+                reject_null=False,
+                confidence_level=1.0 - alpha,
+                sample_size=total_n,
+                conclusion='Insufficient data (each sample needs n >= 2)',
+            )
+
+        v1 = self._variance(data1, ddof=1)
+        v2 = self._variance(data2, ddof=1)
+
+        # Ensure the larger variance is in the numerator
+        if v1 >= v2:
+            f_stat = v1 / v2 if v2 > 0 else float('inf')
+            df1 = n1 - 1
+            df2 = n2 - 1
+        else:
+            f_stat = v2 / v1 if v1 > 0 else float('inf')
+            df1 = n2 - 1
+            df2 = n1 - 1
+
+        # Two-tailed p-value
+        p_value = 2.0 * (1.0 - self._f_cdf(f_stat, df1, df2))
+        p_value = min(p_value, 1.0)
+        reject = p_value < alpha
+
+        if reject:
+            conclusion = (
+                f'Reject H0: variances differ significantly '
+                f'(F={f_stat:.4f}, p={p_value:.6f})'
+            )
+        else:
+            conclusion = (
+                f'Fail to reject H0: no significant difference in variances '
+                f'(F={f_stat:.4f}, p={p_value:.6f})'
+            )
+
+        return HypothesisTest(
+            test_name='f_test_variance',
+            null_hypothesis='sigma1^2 == sigma2^2',
+            alternative_hypothesis='sigma1^2 != sigma2^2',
+            test_statistic=f_stat,
+            p_value=p_value,
+            reject_null=reject,
+            confidence_level=1.0 - alpha,
+            sample_size=total_n,
+            conclusion=conclusion,
+        )
+
+    def chi_squared_goodness_of_fit(
+        self,
+        observed: List[float],
+        expected: List[float],
+        alpha: float = 0.05,
+    ) -> HypothesisTest:
+        """Chi-squared goodness-of-fit test.
+
+        Tests whether observed frequencies match the expected distribution.
+
+        Args:
+            observed: Observed frequency counts.
+            expected: Expected frequency counts.
+            alpha: Significance level.
+
+        Returns:
+            HypothesisTest result.
+        """
+        n = len(observed)
+        total_obs = int(sum(observed))
+
+        if n != len(expected) or n < 2:
+            return HypothesisTest(
+                test_name='chi_squared_goodness_of_fit',
+                null_hypothesis='observed matches expected distribution',
+                alternative_hypothesis='observed does not match expected distribution',
+                test_statistic=0.0,
+                p_value=1.0,
+                reject_null=False,
+                confidence_level=1.0 - alpha,
+                sample_size=total_obs,
+                conclusion='Invalid input: observed and expected must have equal length >= 2',
+            )
+
+        chi2 = 0.0
+        for o, e in zip(observed, expected):
+            if e > 0:
+                chi2 += (o - e) ** 2 / e
+
+        df = n - 1
+        p_value = 1.0 - self._chi2_cdf(chi2, df)
+        reject = p_value < alpha
+
+        if reject:
+            conclusion = (
+                f'Reject H0: observed distribution differs significantly '
+                f'from expected (chi2={chi2:.4f}, df={df}, p={p_value:.6f})'
+            )
+        else:
+            conclusion = (
+                f'Fail to reject H0: observed distribution consistent with '
+                f'expected (chi2={chi2:.4f}, df={df}, p={p_value:.6f})'
+            )
+
+        return HypothesisTest(
+            test_name='chi_squared_goodness_of_fit',
+            null_hypothesis='observed matches expected distribution',
+            alternative_hypothesis='observed does not match expected distribution',
+            test_statistic=chi2,
+            p_value=p_value,
+            reject_null=reject,
+            confidence_level=1.0 - alpha,
+            sample_size=total_obs,
+            conclusion=conclusion,
+        )
+
+    def process_shift_detection(
+        self,
+        data: List[float],
+        baseline_mean: float,
+        baseline_std: float,
+        alpha: float = 0.05,
+    ) -> HypothesisTest:
+        """Detect whether a manufacturing process has shifted from its baseline.
+
+        Combines a one-sample t-test against the baseline mean with a check
+        of how many standard deviations the sample mean has drifted.
+
+        Args:
+            data: Recent process measurements.
+            baseline_mean: Historical baseline mean.
+            baseline_std: Historical baseline standard deviation.
+            alpha: Significance level.
+
+        Returns:
+            HypothesisTest result with shift-specific conclusion.
+        """
+        n = len(data)
+        if n < 2:
+            return HypothesisTest(
+                test_name='process_shift_detection',
+                null_hypothesis=f'process mean == {baseline_mean}',
+                alternative_hypothesis=f'process has shifted from baseline mean {baseline_mean}',
+                test_statistic=0.0,
+                p_value=1.0,
+                reject_null=False,
+                confidence_level=1.0 - alpha,
+                sample_size=n,
+                conclusion='Insufficient data (n < 2)',
+            )
+
+        x_bar = self._mean(data)
+        s = self._std(data, ddof=1)
+        se = s / math.sqrt(n)
+        t_stat = (x_bar - baseline_mean) / se if se > 0 else 0.0
+        df = n - 1
+
+        p_value = 2.0 * (1.0 - self._t_cdf(abs(t_stat), df))
+        reject = p_value < alpha
+
+        # Compute shift magnitude in baseline-std units
+        shift_sigmas = abs(x_bar - baseline_mean) / baseline_std if baseline_std > 0 else 0.0
+
+        if reject:
+            direction = 'above' if x_bar > baseline_mean else 'below'
+            conclusion = (
+                f'Process shift detected: mean shifted {shift_sigmas:.2f} sigma '
+                f'{direction} baseline (x_bar={x_bar:.4f}, baseline={baseline_mean:.4f}, '
+                f't={t_stat:.4f}, p={p_value:.6f})'
+            )
+        else:
+            conclusion = (
+                f'No significant process shift: mean within expected range '
+                f'(x_bar={x_bar:.4f}, baseline={baseline_mean:.4f}, '
+                f'shift={shift_sigmas:.2f} sigma, t={t_stat:.4f}, p={p_value:.6f})'
+            )
+
+        return HypothesisTest(
+            test_name='process_shift_detection',
+            null_hypothesis=f'process mean == {baseline_mean}',
+            alternative_hypothesis=f'process has shifted from baseline mean {baseline_mean}',
+            test_statistic=t_stat,
+            p_value=p_value,
+            reject_null=reject,
+            confidence_level=1.0 - alpha,
+            sample_size=n,
+            conclusion=conclusion,
+        )
+
+    def run_test(self, test_type: str, **kwargs: Any) -> HypothesisTest:
+        """Dispatcher that runs the appropriate hypothesis test.
+
+        Args:
+            test_type: One of 'one_sample_t', 'two_sample_t', 'f_test',
+                       'chi_squared', or 'process_shift'.
+            **kwargs: Arguments forwarded to the selected test method.
+
+        Returns:
+            HypothesisTest result.
+
+        Raises:
+            ValueError: If *test_type* is not recognised.
+        """
+        dispatch: Dict[str, Any] = {
+            'one_sample_t': self.t_test_one_sample,
+            'two_sample_t': self.t_test_two_sample,
+            'f_test': self.f_test_variance,
+            'chi_squared': self.chi_squared_goodness_of_fit,
+            'process_shift': self.process_shift_detection,
+        }
+
+        handler = dispatch.get(test_type)
+        if handler is None:
+            raise ValueError(
+                f"Unknown test_type '{test_type}'. "
+                f"Valid types: {', '.join(sorted(dispatch))}"
+            )
+        return handler(**kwargs)
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

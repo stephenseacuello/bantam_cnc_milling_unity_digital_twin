@@ -1704,6 +1704,274 @@ class SetupSheetGenerator:
         return checklist
 
 
+# ---------------------------------------------------------------------------
+# Cycle Time Estimator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MachineCapability:
+    """Machine kinematic and process capability parameters."""
+    max_feed_mm_min: float = 5000.0
+    max_rapid_mm_min: float = 30000.0
+    tool_change_sec: float = 5.0
+    spindle_accel_sec: float = 2.0
+    axis_accel_mm_s2: float = 2000.0
+
+
+@dataclass
+class CycleTimeBreakdown:
+    """Breakdown of estimated cycle time by category."""
+    cutting_time_min: float
+    rapid_time_min: float
+    tool_change_time_min: float
+    dwell_time_min: float
+    spindle_time_min: float
+    total_time_min: float
+    efficiency_pct: float
+
+
+class CycleTimeEstimator:
+    """Estimates machining cycle times from G-code parameters and machine capabilities.
+
+    Supports block-level estimation from parsed G-code, summary-level quick
+    estimates, accuracy comparison against actuals, and time-saving suggestions.
+    """
+
+    DEFAULT_CAPABILITY = MachineCapability()
+
+    def estimate_from_blocks(
+        self,
+        blocks: List[Dict[str, Any]],
+        capability: Optional[MachineCapability] = None,
+    ) -> CycleTimeBreakdown:
+        """Estimate cycle time from a list of G-code blocks.
+
+        Each block is a dict with keys:
+            type: 'cut' | 'rapid' | 'dwell' | 'tool_change'
+            distance_mm: float  (for cut/rapid)
+            feed_mm_min: float  (for cut; 0 or absent uses max_feed)
+            dwell_sec: float    (for dwell)
+
+        Args:
+            blocks: Parsed G-code block descriptions.
+            capability: Machine capability parameters (uses defaults if None).
+
+        Returns:
+            CycleTimeBreakdown with per-category times.
+        """
+        cap = capability or self.DEFAULT_CAPABILITY
+
+        cutting_sec = 0.0
+        rapid_sec = 0.0
+        tool_change_sec = 0.0
+        dwell_sec = 0.0
+        spindle_events = 0  # count of tool changes that require spindle re-accel
+
+        for block in blocks:
+            btype = block.get('type', '')
+
+            if btype == 'cut':
+                distance = block.get('distance_mm', 0.0)
+                feed = block.get('feed_mm_min', 0.0)
+                if feed <= 0:
+                    feed = cap.max_feed_mm_min
+                # Clamp feed to machine maximum
+                feed = min(feed, cap.max_feed_mm_min)
+                if feed > 0 and distance > 0:
+                    # Add acceleration/deceleration overhead
+                    feed_mm_s = feed / 60.0
+                    accel_time = feed_mm_s / cap.axis_accel_mm_s2
+                    accel_dist = 0.5 * cap.axis_accel_mm_s2 * accel_time ** 2
+                    if 2 * accel_dist >= distance:
+                        # Move is too short to reach full speed
+                        cutting_sec += 2.0 * math.sqrt(distance / cap.axis_accel_mm_s2)
+                    else:
+                        cruise_dist = distance - 2.0 * accel_dist
+                        cruise_sec = cruise_dist / feed_mm_s
+                        cutting_sec += 2.0 * accel_time + cruise_sec
+
+            elif btype == 'rapid':
+                distance = block.get('distance_mm', 0.0)
+                if distance > 0:
+                    rapid_mm_s = cap.max_rapid_mm_min / 60.0
+                    accel_time = rapid_mm_s / cap.axis_accel_mm_s2
+                    accel_dist = 0.5 * cap.axis_accel_mm_s2 * accel_time ** 2
+                    if 2 * accel_dist >= distance:
+                        rapid_sec += 2.0 * math.sqrt(distance / cap.axis_accel_mm_s2)
+                    else:
+                        cruise_dist = distance - 2.0 * accel_dist
+                        cruise_sec = cruise_dist / rapid_mm_s
+                        rapid_sec += 2.0 * accel_time + cruise_sec
+
+            elif btype == 'dwell':
+                dwell_sec += block.get('dwell_sec', 0.0)
+
+            elif btype == 'tool_change':
+                tool_change_sec += cap.tool_change_sec
+                spindle_events += 1
+
+        spindle_sec = spindle_events * cap.spindle_accel_sec
+
+        cutting_min = cutting_sec / 60.0
+        rapid_min = rapid_sec / 60.0
+        tool_change_min = tool_change_sec / 60.0
+        dwell_min = dwell_sec / 60.0
+        spindle_min = spindle_sec / 60.0
+        total_min = cutting_min + rapid_min + tool_change_min + dwell_min + spindle_min
+
+        # Efficiency: cutting time as percentage of total time
+        efficiency_pct = (cutting_min / total_min * 100.0) if total_min > 0 else 0.0
+
+        return CycleTimeBreakdown(
+            cutting_time_min=round(cutting_min, 4),
+            rapid_time_min=round(rapid_min, 4),
+            tool_change_time_min=round(tool_change_min, 4),
+            dwell_time_min=round(dwell_min, 4),
+            spindle_time_min=round(spindle_min, 4),
+            total_time_min=round(total_min, 4),
+            efficiency_pct=round(efficiency_pct, 2),
+        )
+
+    def estimate_from_program_stats(
+        self,
+        total_cut_distance: float,
+        total_rapid_distance: float,
+        num_tool_changes: int,
+        total_dwell_sec: float,
+        avg_feed: float,
+        capability: Optional[MachineCapability] = None,
+    ) -> CycleTimeBreakdown:
+        """Quick cycle-time estimate from program summary statistics.
+
+        Uses simple distance/speed calculations without per-block
+        acceleration modelling.
+
+        Args:
+            total_cut_distance: Total cutting distance in mm.
+            total_rapid_distance: Total rapid traverse distance in mm.
+            num_tool_changes: Number of tool changes.
+            total_dwell_sec: Total dwell time in seconds.
+            avg_feed: Average cutting feedrate in mm/min.
+            capability: Machine capability parameters.
+
+        Returns:
+            CycleTimeBreakdown.
+        """
+        cap = capability or self.DEFAULT_CAPABILITY
+
+        feed = min(avg_feed, cap.max_feed_mm_min) if avg_feed > 0 else cap.max_feed_mm_min
+        cutting_min = (total_cut_distance / feed) if feed > 0 else 0.0
+        rapid_min = (total_rapid_distance / cap.max_rapid_mm_min) if cap.max_rapid_mm_min > 0 else 0.0
+        tool_change_min = (num_tool_changes * cap.tool_change_sec) / 60.0
+        dwell_min = total_dwell_sec / 60.0
+        spindle_min = (num_tool_changes * cap.spindle_accel_sec) / 60.0
+
+        total_min = cutting_min + rapid_min + tool_change_min + dwell_min + spindle_min
+        efficiency_pct = (cutting_min / total_min * 100.0) if total_min > 0 else 0.0
+
+        return CycleTimeBreakdown(
+            cutting_time_min=round(cutting_min, 4),
+            rapid_time_min=round(rapid_min, 4),
+            tool_change_time_min=round(tool_change_min, 4),
+            dwell_time_min=round(dwell_min, 4),
+            spindle_time_min=round(spindle_min, 4),
+            total_time_min=round(total_min, 4),
+            efficiency_pct=round(efficiency_pct, 2),
+        )
+
+    def compare_estimated_vs_actual(
+        self,
+        estimated: CycleTimeBreakdown,
+        actual_min: float,
+    ) -> Dict[str, Any]:
+        """Compare an estimated cycle time against an actual measured time.
+
+        Args:
+            estimated: The estimated breakdown.
+            actual_min: Actual measured cycle time in minutes.
+
+        Returns:
+            Dict with 'accuracy_pct' (100 = perfect), 'deviation_min',
+            and 'indication' ('over', 'under', or 'exact').
+        """
+        if actual_min <= 0:
+            return {
+                'accuracy_pct': 0.0,
+                'deviation_min': estimated.total_time_min,
+                'indication': 'over' if estimated.total_time_min > 0 else 'exact',
+            }
+
+        deviation = estimated.total_time_min - actual_min
+        accuracy_pct = max(0.0, (1.0 - abs(deviation) / actual_min) * 100.0)
+
+        if abs(deviation) < 1e-9:
+            indication = 'exact'
+        elif deviation > 0:
+            indication = 'over'
+        else:
+            indication = 'under'
+
+        return {
+            'accuracy_pct': round(accuracy_pct, 2),
+            'deviation_min': round(deviation, 4),
+            'indication': indication,
+        }
+
+    def suggest_time_savings(
+        self, breakdown: CycleTimeBreakdown,
+    ) -> List[str]:
+        """Suggest actionable time savings based on a cycle time breakdown.
+
+        Args:
+            breakdown: A CycleTimeBreakdown to analyse.
+
+        Returns:
+            List of suggestion strings.
+        """
+        suggestions: List[str] = []
+
+        if breakdown.total_time_min <= 0:
+            return suggestions
+
+        rapid_pct = (breakdown.rapid_time_min / breakdown.total_time_min) * 100.0
+        tc_pct = (breakdown.tool_change_time_min / breakdown.total_time_min) * 100.0
+        dwell_pct = (breakdown.dwell_time_min / breakdown.total_time_min) * 100.0
+        spindle_pct = (breakdown.spindle_time_min / breakdown.total_time_min) * 100.0
+
+        if rapid_pct > 15.0:
+            suggestions.append(
+                'Reduce rapid distance by optimising tool-path retract heights and positioning.'
+            )
+
+        if tc_pct > 10.0:
+            suggestions.append(
+                'Minimize tool changes by reordering operations or using combination tools.'
+            )
+
+        if dwell_pct > 5.0:
+            suggestions.append(
+                'Review dwell times; reduce or eliminate unnecessary G4 pauses.'
+            )
+
+        if spindle_pct > 5.0:
+            suggestions.append(
+                'Reduce spindle acceleration overhead by grouping operations at similar RPM.'
+            )
+
+        if breakdown.efficiency_pct < 60.0:
+            suggestions.append(
+                'Overall cutting efficiency is below 60%; review non-cutting time contributors.'
+            )
+
+        if breakdown.efficiency_pct >= 90.0:
+            suggestions.append(
+                'Cutting efficiency is excellent; focus on feed/speed optimisation for further gains.'
+            )
+
+        return suggestions
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

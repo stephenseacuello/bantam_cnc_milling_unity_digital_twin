@@ -1133,6 +1133,223 @@ class NetworkTopologyMapper:
         return adj
 
 
+# ---------------------------------------------------------------------------
+# Heartbeat Health Scorer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HeartbeatRecord:
+    """A single recorded heartbeat from a system node."""
+    node_id: str
+    timestamp: float
+    sequence_number: int
+    payload_size: int = 0
+    round_trip_ms: float = 0.0
+
+
+@dataclass
+class NodeHealthScore:
+    """Computed health score for a system node."""
+    node_id: str
+    overall_score: float  # 0-100
+    availability_pct: float
+    avg_latency_ms: float
+    jitter_ms: float
+    missed_beats: int
+    trend: str  # 'stable', 'degrading', 'improving', 'critical'
+    last_seen: float
+
+
+class HeartbeatHealthScorer:
+    """Scores the health of system nodes based on heartbeat patterns.
+
+    Maintains a sliding window of the last ``window_size`` heartbeats per
+    node and computes an overall health score (0--100) by combining
+    availability, latency, jitter, and trend components.
+
+    Score formula (weighted):
+        - availability (40%): ``(received / (received + missed)) * 100``
+        - latency     (30%): ``max(0, 100 - avg_latency * 2)``
+        - jitter      (20%): ``max(0, 100 - jitter * 5)``
+        - trend_bonus (10%): derived from recent score trajectory
+    """
+
+    _WINDOW_SIZE = 100
+
+    def __init__(self, window_size: int = 100) -> None:
+        self._WINDOW_SIZE = window_size
+
+        # node_id -> list of HeartbeatRecord (sliding window)
+        self._heartbeats: Dict[str, List[HeartbeatRecord]] = {}
+        # node_id -> count of missed heartbeats
+        self._missed: Dict[str, int] = {}
+        # node_id -> list of recent overall scores (for trend detection)
+        self._score_history: Dict[str, List[float]] = {}
+
+    # ------------------------------------------------------------------ #
+    #  Recording
+    # ------------------------------------------------------------------ #
+
+    def record_heartbeat(
+        self,
+        node_id: str,
+        timestamp: float,
+        sequence: int,
+        rtt_ms: float,
+    ) -> None:
+        """Record an incoming heartbeat from *node_id*."""
+        record = HeartbeatRecord(
+            node_id=node_id,
+            timestamp=timestamp,
+            sequence_number=sequence,
+            round_trip_ms=rtt_ms,
+        )
+        window = self._heartbeats.setdefault(node_id, [])
+        window.append(record)
+        # Enforce sliding window
+        if len(window) > self._WINDOW_SIZE:
+            self._heartbeats[node_id] = window[-self._WINDOW_SIZE:]
+        # Ensure the node exists in missed tracking
+        self._missed.setdefault(node_id, 0)
+
+    def record_missed(self, node_id: str, expected_time: float) -> None:
+        """Record a missed heartbeat for *node_id*."""
+        self._missed[node_id] = self._missed.get(node_id, 0) + 1
+        # Ensure the node exists in heartbeat tracking
+        self._heartbeats.setdefault(node_id, [])
+
+    # ------------------------------------------------------------------ #
+    #  Scoring
+    # ------------------------------------------------------------------ #
+
+    def get_score(self, node_id: str) -> NodeHealthScore:
+        """Compute and return the :class:`NodeHealthScore` for *node_id*."""
+        records = self._heartbeats.get(node_id, [])
+        missed = self._missed.get(node_id, 0)
+        received = len(records)
+
+        # -- Availability --
+        total = received + missed
+        availability_pct = (received / total * 100.0) if total > 0 else 0.0
+        availability_score = availability_pct  # already 0-100
+
+        # -- Latency --
+        if received > 0:
+            avg_latency = sum(r.round_trip_ms for r in records) / received
+            latency_score = max(0.0, 100.0 - avg_latency * 2.0)
+        else:
+            avg_latency = 0.0
+            latency_score = 0.0
+
+        # -- Jitter --
+        if received >= 2:
+            rtts = [r.round_trip_ms for r in records]
+            mean_rtt = sum(rtts) / len(rtts)
+            variance = sum((r - mean_rtt) ** 2 for r in rtts) / len(rtts)
+            jitter = variance ** 0.5
+            jitter_score = max(0.0, 100.0 - jitter * 5.0)
+        elif received == 1:
+            jitter = 0.0
+            jitter_score = max(0.0, 100.0 - jitter * 5.0)
+        else:
+            jitter = 0.0
+            jitter_score = 0.0
+
+        # -- Trend --
+        trend = self._compute_trend(node_id)
+        trend_bonus = self._trend_bonus(trend)
+
+        # -- Overall score --
+        overall = (
+            availability_score * 0.4
+            + latency_score * 0.3
+            + jitter_score * 0.2
+            + trend_bonus * 0.1
+        )
+        overall = max(0.0, min(100.0, overall))
+
+        # -- Last seen --
+        last_seen = records[-1].timestamp if records else 0.0
+
+        score = NodeHealthScore(
+            node_id=node_id,
+            overall_score=round(overall, 2),
+            availability_pct=round(availability_pct, 2),
+            avg_latency_ms=round(avg_latency, 2),
+            jitter_ms=round(jitter, 2),
+            missed_beats=missed,
+            trend=trend,
+            last_seen=last_seen,
+        )
+
+        # Store in history for future trend calculations
+        self._score_history.setdefault(node_id, []).append(overall)
+
+        return score
+
+    def get_all_scores(self) -> List[NodeHealthScore]:
+        """Return scores for all known nodes, sorted by overall_score ascending."""
+        all_nodes = set(self._heartbeats) | set(self._missed)
+        scores = [self.get_score(node_id) for node_id in all_nodes]
+        scores.sort(key=lambda s: s.overall_score)
+        return scores
+
+    def get_degrading_nodes(self, threshold: float = 70.0) -> List[NodeHealthScore]:
+        """Return nodes with overall_score below *threshold*."""
+        return [s for s in self.get_all_scores() if s.overall_score < threshold]
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _compute_trend(self, node_id: str) -> str:
+        """Compare the last 10 scores to the previous 10 to determine trend."""
+        history = self._score_history.get(node_id, [])
+
+        if len(history) < 2:
+            # Not enough data -- check if the node is entirely missed
+            records = self._heartbeats.get(node_id, [])
+            missed = self._missed.get(node_id, 0)
+            if len(records) == 0 and missed > 0:
+                return 'critical'
+            return 'stable'
+
+        recent = history[-10:]
+        previous = history[-20:-10] if len(history) >= 20 else history[:-len(recent)]
+
+        if not previous:
+            # Only have recent data
+            avg_recent = sum(recent) / len(recent)
+            if avg_recent < 30.0:
+                return 'critical'
+            return 'stable'
+
+        avg_recent = sum(recent) / len(recent)
+        avg_previous = sum(previous) / len(previous)
+
+        diff = avg_recent - avg_previous
+
+        if avg_recent < 30.0:
+            return 'critical'
+        elif diff < -5.0:
+            return 'degrading'
+        elif diff > 5.0:
+            return 'improving'
+        else:
+            return 'stable'
+
+    @staticmethod
+    def _trend_bonus(trend: str) -> float:
+        """Return a 0-100 bonus value based on the trend classification."""
+        bonuses = {
+            'improving': 100.0,
+            'stable': 75.0,
+            'degrading': 25.0,
+            'critical': 0.0,
+        }
+        return bonuses.get(trend, 50.0)
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

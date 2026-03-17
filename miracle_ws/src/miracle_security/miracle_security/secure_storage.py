@@ -440,3 +440,266 @@ class SecureStorage:
         key_path = self._dir / '.aes_key'
         key_path.write_bytes(new_key)
         os.chmod(key_path, 0o600)
+
+
+# ======================================================================
+# Data Retention Policy Manager
+# ======================================================================
+
+
+@dataclass
+class RetentionPolicy:
+    """Defines how long a category of data is retained, archived, and deleted."""
+    category: str
+    retention_days: int
+    archive_after_days: int = 0       # 0 = no archive
+    delete_after_days: int = 0        # 0 = never delete
+    requires_approval: bool = False
+    description: str = ""
+
+
+@dataclass
+class RetentionRecord:
+    """Tracks an individual data record subject to retention policies."""
+    record_id: str
+    category: str
+    created_at: float
+    size_bytes: int
+    is_archived: bool = False
+    is_deleted: bool = False
+    archived_at: Optional[float] = None
+    deleted_at: Optional[float] = None
+
+
+@dataclass
+class RetentionAction:
+    """An action to be taken (or already taken) on a record."""
+    record_id: str
+    action: str          # 'archive' | 'delete' | 'retain'
+    reason: str
+    timestamp: float
+
+
+class DataRetentionManager:
+    """Manages data retention policies and record lifecycle.
+
+    Default policies cover the most common CNC / manufacturing data
+    categories and comply with typical industrial record-keeping
+    requirements:
+
+    * **AUDIT_LOG** — 7 years (2555 days) retention.
+    * **SENSOR_DATA** — archive after 90 days, delete after 365 days.
+    * **ALARM_HISTORY** — archive after 180 days, delete after 730 days.
+    * **JOB_RECORDS** — 5 years (1825 days) retention.
+    * **CALIBRATION** — 10 years (3650 days) retention.
+    """
+
+    _SECONDS_PER_DAY = 86400
+
+    DEFAULT_POLICIES: List[RetentionPolicy] = [
+        RetentionPolicy(
+            category="AUDIT_LOG",
+            retention_days=2555,
+            archive_after_days=0,
+            delete_after_days=0,
+            requires_approval=True,
+            description="Audit log entries retained for 7 years",
+        ),
+        RetentionPolicy(
+            category="SENSOR_DATA",
+            retention_days=365,
+            archive_after_days=90,
+            delete_after_days=365,
+            requires_approval=False,
+            description="Sensor telemetry archived after 90 days, deleted after 1 year",
+        ),
+        RetentionPolicy(
+            category="ALARM_HISTORY",
+            retention_days=730,
+            archive_after_days=180,
+            delete_after_days=730,
+            requires_approval=False,
+            description="Alarm history archived after 180 days, deleted after 2 years",
+        ),
+        RetentionPolicy(
+            category="JOB_RECORDS",
+            retention_days=1825,
+            archive_after_days=0,
+            delete_after_days=0,
+            requires_approval=True,
+            description="Job records retained for 5 years",
+        ),
+        RetentionPolicy(
+            category="CALIBRATION",
+            retention_days=3650,
+            archive_after_days=0,
+            delete_after_days=0,
+            requires_approval=True,
+            description="Calibration data retained for 10 years",
+        ),
+    ]
+
+    def __init__(self) -> None:
+        self._policies: Dict[str, RetentionPolicy] = {}
+        self._records: Dict[str, RetentionRecord] = {}
+
+        # Load default policies
+        for policy in self.DEFAULT_POLICIES:
+            self._policies[policy.category] = policy
+
+    # ------------------------------------------------------------------
+    # Policy management
+    # ------------------------------------------------------------------
+
+    def add_policy(self, policy: RetentionPolicy) -> None:
+        """Register or update a retention policy for a data category."""
+        self._policies[policy.category] = policy
+
+    def get_policy(self, category: str) -> Optional[RetentionPolicy]:
+        """Return the retention policy for *category*, or ``None``."""
+        return self._policies.get(category)
+
+    # ------------------------------------------------------------------
+    # Record management
+    # ------------------------------------------------------------------
+
+    def register_record(self, record: RetentionRecord) -> None:
+        """Track a data record under retention management."""
+        self._records[record.record_id] = record
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def evaluate_records(self, current_time: float) -> List[RetentionAction]:
+        """Evaluate all tracked records and return actions for those due.
+
+        For each non-deleted record the matching policy is consulted:
+
+        * If ``delete_after_days`` > 0 and the record age exceeds the
+          threshold, a **delete** action is emitted (unless it is already
+          deleted).
+        * Otherwise, if ``archive_after_days`` > 0 and the record age
+          exceeds the archive threshold and the record has not yet been
+          archived, an **archive** action is emitted.
+        * Records that require no action are given a **retain** action
+          only when they are still active (not archived, not deleted).
+
+        Returns a list of :class:`RetentionAction` instances.
+        """
+        actions: List[RetentionAction] = []
+
+        for record in self._records.values():
+            if record.is_deleted:
+                continue
+
+            policy = self._policies.get(record.category)
+            if policy is None:
+                # No policy — retain by default
+                actions.append(RetentionAction(
+                    record_id=record.record_id,
+                    action='retain',
+                    reason='no policy defined for category',
+                    timestamp=current_time,
+                ))
+                continue
+
+            age_days = (current_time - record.created_at) / self._SECONDS_PER_DAY
+
+            # Check deletion threshold first (takes precedence)
+            if policy.delete_after_days > 0 and age_days >= policy.delete_after_days:
+                actions.append(RetentionAction(
+                    record_id=record.record_id,
+                    action='delete',
+                    reason=(
+                        f"record age {age_days:.0f}d exceeds "
+                        f"delete threshold {policy.delete_after_days}d"
+                    ),
+                    timestamp=current_time,
+                ))
+                continue
+
+            # Check archive threshold
+            if (
+                policy.archive_after_days > 0
+                and age_days >= policy.archive_after_days
+                and not record.is_archived
+            ):
+                actions.append(RetentionAction(
+                    record_id=record.record_id,
+                    action='archive',
+                    reason=(
+                        f"record age {age_days:.0f}d exceeds "
+                        f"archive threshold {policy.archive_after_days}d"
+                    ),
+                    timestamp=current_time,
+                ))
+                continue
+
+            # No action needed — retain
+            actions.append(RetentionAction(
+                record_id=record.record_id,
+                action='retain',
+                reason='within retention period',
+                timestamp=current_time,
+            ))
+
+        return actions
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+
+    def get_storage_summary(self) -> Dict[str, Any]:
+        """Return a summary of all tracked records.
+
+        Keys: ``total_records``, ``total_size``, ``records_by_category``,
+        ``pending_archive``, ``pending_delete``.
+
+        Note: ``pending_archive`` and ``pending_delete`` count records
+        that are *not yet* archived/deleted respectively.
+        """
+        total_size = 0
+        by_category: Dict[str, int] = {}
+        pending_archive = 0
+        pending_delete = 0
+
+        for record in self._records.values():
+            total_size += record.size_bytes
+            by_category[record.category] = by_category.get(record.category, 0) + 1
+
+            if not record.is_archived and not record.is_deleted:
+                pending_archive += 1
+            if not record.is_deleted:
+                pending_delete += 1
+
+        return {
+            'total_records': len(self._records),
+            'total_size': total_size,
+            'records_by_category': by_category,
+            'pending_archive': pending_archive,
+            'pending_delete': pending_delete,
+        }
+
+    # ------------------------------------------------------------------
+    # Apply actions
+    # ------------------------------------------------------------------
+
+    def apply_actions(self, actions: List[RetentionAction]) -> None:
+        """Apply a list of retention actions to the tracked records.
+
+        * **archive**: sets ``is_archived = True`` and ``archived_at``.
+        * **delete**: sets ``is_deleted = True`` and ``deleted_at``.
+        * **retain**: no-op.
+        """
+        for action in actions:
+            record = self._records.get(action.record_id)
+            if record is None:
+                continue
+
+            if action.action == 'archive':
+                record.is_archived = True
+                record.archived_at = action.timestamp
+            elif action.action == 'delete':
+                record.is_deleted = True
+                record.deleted_at = action.timestamp

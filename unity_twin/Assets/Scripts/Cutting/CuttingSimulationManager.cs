@@ -692,4 +692,224 @@ namespace MiracleTwin.Cutting
             voxelWorkpiece = wp;
         }
     }
+
+    // ── Machine Digital Passport ────────────────────────────────────────
+
+    /// <summary>
+    /// Core identity information for a CNC machine tool.
+    /// </summary>
+    [Serializable]
+    public class MachineIdentity
+    {
+        public string serialNumber;
+        public string manufacturer;
+        public string model;
+        public int yearOfManufacture;
+        public string controllerType;
+        public float maxSpindleRpm;
+        public float maxFeedRate;       // mm/min
+        public Vector3 workEnvelope;    // X, Y, Z travel in mm
+        public int axisCount;
+    }
+
+    /// <summary>
+    /// A single maintenance event in the machine's lifecycle.
+    /// Type must be one of: "preventive", "corrective", "predictive".
+    /// </summary>
+    [Serializable]
+    public class MaintenanceRecord
+    {
+        public string recordId;
+        public string date;             // ISO-8601 date string
+        public string type;             // preventive | corrective | predictive
+        public string description;
+        public string technician;
+        public List<string> partsReplaced;
+        public float downtimeHours;
+        public float cost;
+    }
+
+    /// <summary>
+    /// A single calibration measurement for one machine parameter.
+    /// </summary>
+    [Serializable]
+    public class CalibrationRecord
+    {
+        public string recordId;
+        public string date;             // ISO-8601 date string
+        public string parameter;        // e.g. "X_axis_backlash", "spindle_runout"
+        public float measuredValue;
+        public float nominalValue;
+        public float tolerance;
+        public bool passed;
+        public string calibratedBy;
+    }
+
+    /// <summary>
+    /// Health summary snapshot returned by <see cref="MachineDigitalPassport.GetHealthSummary"/>.
+    /// </summary>
+    [Serializable]
+    public class HealthSummary
+    {
+        public float uptimePercentage;
+        public Dictionary<string, bool> calibrationStatus;
+        public float maintenanceCompliancePercentage;
+        public float mtbf;
+        public int totalPartsProduced;
+        public float totalOperatingHours;
+    }
+
+    /// <summary>
+    /// Comprehensive digital passport for a CNC machine tool.
+    /// Tracks identity, maintenance history, calibration records,
+    /// operating hours, and parts produced over the machine's lifecycle.
+    /// Provides analytics for health monitoring, MTBF, and calibration compliance.
+    /// </summary>
+    public class MachineDigitalPassport
+    {
+        public MachineIdentity identity { get; set; }
+        public List<MaintenanceRecord> maintenanceHistory { get; private set; } = new List<MaintenanceRecord>();
+        public List<CalibrationRecord> calibrationHistory { get; private set; } = new List<CalibrationRecord>();
+        public float totalOperatingHours { get; set; }
+        public int totalPartsProduced { get; set; }
+
+        public MachineDigitalPassport(MachineIdentity identity)
+        {
+            this.identity = identity ?? throw new ArgumentNullException(nameof(identity));
+        }
+
+        /// <summary>Append a maintenance record to the history.</summary>
+        public void AddMaintenanceRecord(MaintenanceRecord record)
+        {
+            if (record == null) throw new ArgumentNullException(nameof(record));
+            maintenanceHistory.Add(record);
+        }
+
+        /// <summary>Append a calibration record to the history.</summary>
+        public void AddCalibrationRecord(CalibrationRecord record)
+        {
+            if (record == null) throw new ArgumentNullException(nameof(record));
+            calibrationHistory.Add(record);
+        }
+
+        /// <summary>Filter maintenance records by type (preventive, corrective, predictive).</summary>
+        public List<MaintenanceRecord> GetMaintenanceByType(string type)
+        {
+            return maintenanceHistory.Where(r => r.type == type).ToList();
+        }
+
+        /// <summary>
+        /// Returns a dictionary mapping each calibrated parameter to the pass/fail
+        /// result of its most recent calibration.
+        /// </summary>
+        public Dictionary<string, bool> GetCalibrationStatus()
+        {
+            var status = new Dictionary<string, bool>();
+            // Group by parameter and pick the latest record (last in list) for each
+            var grouped = calibrationHistory
+                .GroupBy(r => r.parameter)
+                .ToDictionary(g => g.Key, g => g.Last().passed);
+
+            foreach (var kvp in grouped)
+                status[kvp.Key] = kvp.Value;
+
+            return status;
+        }
+
+        /// <summary>
+        /// Overall machine health summary: uptime percentage, calibration status,
+        /// maintenance compliance, MTBF, and production statistics.
+        /// </summary>
+        public HealthSummary GetHealthSummary()
+        {
+            float totalDowntime = maintenanceHistory.Sum(r => r.downtimeHours);
+            float uptime = totalOperatingHours > 0f
+                ? ((totalOperatingHours - totalDowntime) / totalOperatingHours) * 100f
+                : 100f;
+            // Clamp to [0, 100]
+            uptime = Mathf.Clamp(uptime, 0f, 100f);
+
+            var calStatus = GetCalibrationStatus();
+
+            // Maintenance compliance: percentage of calibrated parameters that passed
+            float compliance = 100f;
+            if (calStatus.Count > 0)
+            {
+                int passedCount = calStatus.Values.Count(v => v);
+                compliance = ((float)passedCount / calStatus.Count) * 100f;
+            }
+
+            return new HealthSummary
+            {
+                uptimePercentage = uptime,
+                calibrationStatus = calStatus,
+                maintenanceCompliancePercentage = compliance,
+                mtbf = GetMTBF(),
+                totalPartsProduced = totalPartsProduced,
+                totalOperatingHours = totalOperatingHours
+            };
+        }
+
+        /// <summary>
+        /// Check whether a specific calibration parameter is due for recalibration.
+        /// Returns true if no calibration exists for the parameter or if the last
+        /// calibration was performed more than <paramref name="intervalDays"/> ago.
+        /// </summary>
+        public bool IsCalibrationDue(string parameter, float intervalDays)
+        {
+            var records = calibrationHistory
+                .Where(r => r.parameter == parameter)
+                .ToList();
+
+            if (records.Count == 0)
+                return true;
+
+            var lastRecord = records.Last();
+
+            DateTime lastDate;
+            if (!DateTime.TryParse(lastRecord.date, out lastDate))
+                return true;
+
+            double daysSince = (DateTime.Now - lastDate).TotalDays;
+            return daysSince >= intervalDays;
+        }
+
+        /// <summary>
+        /// Mean Time Between Failures calculated from corrective maintenance records.
+        /// Returns 0 if there are fewer than 2 corrective records or dates cannot be parsed.
+        /// MTBF = average interval between consecutive corrective maintenance events.
+        /// </summary>
+        public float GetMTBF()
+        {
+            var correctiveRecords = maintenanceHistory
+                .Where(r => r.type == "corrective")
+                .ToList();
+
+            if (correctiveRecords.Count < 2)
+                return 0f;
+
+            // Parse dates and sort
+            var dates = new List<DateTime>();
+            foreach (var record in correctiveRecords)
+            {
+                DateTime dt;
+                if (DateTime.TryParse(record.date, out dt))
+                    dates.Add(dt);
+            }
+
+            if (dates.Count < 2)
+                return 0f;
+
+            dates.Sort();
+
+            // Calculate average interval in hours between consecutive failures
+            double totalHours = 0;
+            for (int i = 1; i < dates.Count; i++)
+            {
+                totalHours += (dates[i] - dates[i - 1]).TotalHours;
+            }
+
+            return (float)(totalHours / (dates.Count - 1));
+        }
+    }
 }

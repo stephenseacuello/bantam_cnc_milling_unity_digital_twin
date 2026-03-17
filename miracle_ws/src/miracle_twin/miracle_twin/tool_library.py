@@ -700,3 +700,258 @@ class MaterialDatabase:
             m for m in self._materials.values()
             if q in m.material_id.lower() or q in m.name.lower()
         ]
+
+
+# ======================================================================
+# Tool Compensation Table Manager
+# ======================================================================
+
+@dataclass
+class CompensationEntry:
+    """A single tool compensation offset entry for a CNC machine.
+
+    Stores both geometry offsets (set during setup) and wear offsets
+    (accumulated incrementally as the tool wears).  The effective offset
+    used by the controller is the sum of geometry + wear.
+    """
+    tool_id: str
+    h_offset: float = 0.0          # geometry length offset (mm)
+    d_offset: float = 0.0          # geometry radius offset (mm)
+    wear_offset_h: float = 0.0     # wear length offset (mm)
+    wear_offset_d: float = 0.0     # wear radius offset (mm)
+    last_measured: float = 0.0     # timestamp of last measurement
+    measured_by: str = ''          # operator / probe ID
+    notes: str = ''
+
+
+@dataclass
+class CompensationTable:
+    """Compensation offset table for a specific CNC machine.
+
+    Groups all :class:`CompensationEntry` instances for a single machine
+    and tracks table revision history.
+    """
+    machine_id: str
+    entries: Dict[str, CompensationEntry] = field(default_factory=dict)
+    last_updated: float = 0.0
+    revision: int = 0
+
+
+class ToolCompensationManager:
+    """Manages tool length and radius compensation offset tables.
+
+    Each CNC machine has its own :class:`CompensationTable` containing
+    per-tool geometry and wear offsets.  The manager provides methods to
+    set, query, and validate these offsets as well as export and compare
+    tables across machines.
+    """
+
+    # Validation thresholds
+    MAX_LENGTH_OFFSET_MM = 200.0
+    MIN_RADIUS_OFFSET_MM = 0.0
+
+    def __init__(self):
+        self._tables: Dict[str, CompensationTable] = {}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_table(self, machine_id: str) -> CompensationTable:
+        """Return (and lazily create) the table for *machine_id*."""
+        if machine_id not in self._tables:
+            self._tables[machine_id] = CompensationTable(machine_id=machine_id)
+        return self._tables[machine_id]
+
+    def _get_entry(self, machine_id: str, tool_id: str) -> CompensationEntry:
+        """Return the entry for *tool_id* on *machine_id*, raising if absent."""
+        table = self._tables.get(machine_id)
+        if table is None:
+            raise KeyError(f"No compensation table for machine {machine_id!r}")
+        entry = table.entries.get(tool_id)
+        if entry is None:
+            raise KeyError(
+                f"No compensation entry for tool {tool_id!r} on machine {machine_id!r}"
+            )
+        return entry
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_offset(self, machine_id: str, tool_id: str,
+                   h_offset: float, d_offset: float,
+                   measured_by: str = '', notes: str = '') -> None:
+        """Set geometry offsets (H = length, D = radius) for a tool.
+
+        Creates the compensation table and/or entry if they do not yet
+        exist.  Updates the table revision and timestamp.
+        """
+        table = self._ensure_table(machine_id)
+        now = time.time()
+        if tool_id in table.entries:
+            entry = table.entries[tool_id]
+            entry.h_offset = h_offset
+            entry.d_offset = d_offset
+            entry.last_measured = now
+            if measured_by:
+                entry.measured_by = measured_by
+            if notes:
+                entry.notes = notes
+        else:
+            table.entries[tool_id] = CompensationEntry(
+                tool_id=tool_id,
+                h_offset=h_offset,
+                d_offset=d_offset,
+                last_measured=now,
+                measured_by=measured_by,
+                notes=notes,
+            )
+        table.last_updated = now
+        table.revision += 1
+
+    def apply_wear(self, machine_id: str, tool_id: str,
+                   wear_h: float, wear_d: float) -> None:
+        """Incrementally add wear offsets for a tool.
+
+        Raises ``KeyError`` if the tool has no existing compensation
+        entry on the specified machine.
+        """
+        entry = self._get_entry(machine_id, tool_id)
+        entry.wear_offset_h += wear_h
+        entry.wear_offset_d += wear_d
+        table = self._tables[machine_id]
+        table.last_updated = time.time()
+        table.revision += 1
+
+    def get_effective_offset(self, machine_id: str,
+                             tool_id: str) -> Dict[str, float]:
+        """Return total (geometry + wear) offsets for a tool.
+
+        Returns
+        -------
+        dict with keys ``h_total`` and ``d_total``.
+        """
+        entry = self._get_entry(machine_id, tool_id)
+        return {
+            'h_total': entry.h_offset + entry.wear_offset_h,
+            'd_total': entry.d_offset + entry.wear_offset_d,
+        }
+
+    def reset_wear(self, machine_id: str, tool_id: str) -> None:
+        """Zero out wear offsets for a tool (e.g. after tool replacement).
+
+        Geometry offsets are left unchanged.
+        """
+        entry = self._get_entry(machine_id, tool_id)
+        entry.wear_offset_h = 0.0
+        entry.wear_offset_d = 0.0
+        table = self._tables[machine_id]
+        table.last_updated = time.time()
+        table.revision += 1
+
+    def validate_offsets(self, machine_id: str) -> List[Dict[str, str]]:
+        """Check for missing or suspicious offsets on a machine.
+
+        Returns a list of warning dicts, each with keys ``tool_id``,
+        ``field``, and ``message``.  An empty list means all offsets
+        look reasonable.
+
+        Current checks:
+        * effective length > MAX_LENGTH_OFFSET_MM (default 200 mm)
+        * effective radius < 0
+        * both geometry offsets are exactly zero (possibly unset)
+        """
+        table = self._tables.get(machine_id)
+        if table is None:
+            return [{'tool_id': '', 'field': 'table',
+                     'message': f'No compensation table for machine {machine_id!r}'}]
+
+        warnings: List[Dict[str, str]] = []
+        for tool_id, entry in table.entries.items():
+            h_eff = entry.h_offset + entry.wear_offset_h
+            d_eff = entry.d_offset + entry.wear_offset_d
+
+            if h_eff > self.MAX_LENGTH_OFFSET_MM:
+                warnings.append({
+                    'tool_id': tool_id,
+                    'field': 'h_offset',
+                    'message': (f'Effective length offset {h_eff:.3f} mm '
+                                f'exceeds maximum {self.MAX_LENGTH_OFFSET_MM} mm'),
+                })
+            if d_eff < self.MIN_RADIUS_OFFSET_MM:
+                warnings.append({
+                    'tool_id': tool_id,
+                    'field': 'd_offset',
+                    'message': (f'Effective radius offset {d_eff:.3f} mm '
+                                f'is negative'),
+                })
+            if entry.h_offset == 0.0 and entry.d_offset == 0.0:
+                warnings.append({
+                    'tool_id': tool_id,
+                    'field': 'geometry',
+                    'message': 'Both geometry offsets are zero — possibly unset',
+                })
+
+        return warnings
+
+    def export_table(self, machine_id: str) -> List[dict]:
+        """Export the compensation table for a machine as a list of dicts.
+
+        Each dict contains: tool_id, h_offset, d_offset, wear_offset_h,
+        wear_offset_d, h_total, d_total, last_measured, measured_by,
+        notes.
+
+        Raises ``KeyError`` if the machine has no table.
+        """
+        table = self._tables.get(machine_id)
+        if table is None:
+            raise KeyError(f"No compensation table for machine {machine_id!r}")
+
+        rows: List[dict] = []
+        for tool_id in sorted(table.entries):
+            entry = table.entries[tool_id]
+            rows.append({
+                'tool_id': entry.tool_id,
+                'h_offset': entry.h_offset,
+                'd_offset': entry.d_offset,
+                'wear_offset_h': entry.wear_offset_h,
+                'wear_offset_d': entry.wear_offset_d,
+                'h_total': entry.h_offset + entry.wear_offset_h,
+                'd_total': entry.d_offset + entry.wear_offset_d,
+                'last_measured': entry.last_measured,
+                'measured_by': entry.measured_by,
+                'notes': entry.notes,
+            })
+        return rows
+
+    def compare_tables(self, machine_a: str,
+                       machine_b: str) -> List[Dict[str, object]]:
+        """Find offset differences between two machines for the same tools.
+
+        Returns a list of dicts for each tool_id present in *both* tables,
+        with keys: tool_id, h_diff, d_diff, wear_h_diff, wear_d_diff.
+        Differences are computed as machine_a - machine_b.
+        """
+        table_a = self._tables.get(machine_a)
+        table_b = self._tables.get(machine_b)
+        if table_a is None:
+            raise KeyError(f"No compensation table for machine {machine_a!r}")
+        if table_b is None:
+            raise KeyError(f"No compensation table for machine {machine_b!r}")
+
+        common_tools = sorted(
+            set(table_a.entries) & set(table_b.entries)
+        )
+        diffs: List[Dict[str, object]] = []
+        for tool_id in common_tools:
+            ea = table_a.entries[tool_id]
+            eb = table_b.entries[tool_id]
+            diffs.append({
+                'tool_id': tool_id,
+                'h_diff': ea.h_offset - eb.h_offset,
+                'd_diff': ea.d_offset - eb.d_offset,
+                'wear_h_diff': ea.wear_offset_h - eb.wear_offset_h,
+                'wear_d_diff': ea.wear_offset_d - eb.wear_offset_d,
+            })
+        return diffs

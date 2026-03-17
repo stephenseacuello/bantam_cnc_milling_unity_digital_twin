@@ -12,7 +12,8 @@ Performance  = (Ideal Cycle Time x Total Count) / Run Time
 Quality      = Good Count / Total Count
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum
 from dataclasses import dataclass, field, asdict
 import json
 import math
@@ -1728,6 +1729,252 @@ class CapabilityProfiler:
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# SPC Control Charts
+# ---------------------------------------------------------------------------
+
+class ControlChartType(Enum):
+    """Types of SPC control charts."""
+    XBAR_R = 'xbar_r'
+    XBAR_S = 'xbar_s'
+    EWMA = 'ewma'
+    CUSUM = 'cusum'
+
+
+@dataclass
+class RuleViolation:
+    """A Western Electric rule violation on a control chart."""
+    rule_number: int
+    rule_name: str
+    point_index: int
+    value: float
+    description: str
+
+
+@dataclass
+class ControlChartData:
+    """X-bar and R chart data with control limits and violations."""
+    subgroup_means: List[float] = field(default_factory=list)
+    subgroup_ranges: List[float] = field(default_factory=list)
+    x_bar_ucl: float = 0.0
+    x_bar_cl: float = 0.0
+    x_bar_lcl: float = 0.0
+    r_ucl: float = 0.0
+    r_cl: float = 0.0
+    r_lcl: float = 0.0
+    out_of_control_points: List[int] = field(default_factory=list)
+    rule_violations: List[RuleViolation] = field(default_factory=list)
+
+
+@dataclass
+class EWMAChartData:
+    """EWMA chart data."""
+    ewma_values: List[float] = field(default_factory=list)
+    ucl_values: List[float] = field(default_factory=list)
+    lcl_values: List[float] = field(default_factory=list)
+    center_line: float = 0.0
+    lambda_param: float = 0.2
+    out_of_control_points: List[int] = field(default_factory=list)
+
+
+# Standard SPC constants for subgroup sizes 2-10
+_A2 = {2: 1.880, 3: 1.023, 4: 0.729, 5: 0.577, 6: 0.483, 7: 0.419, 8: 0.373, 9: 0.337, 10: 0.308}
+_D3 = {2: 0.000, 3: 0.000, 4: 0.000, 5: 0.000, 6: 0.000, 7: 0.076, 8: 0.136, 9: 0.184, 10: 0.223}
+_D4 = {2: 3.267, 3: 2.574, 4: 2.282, 5: 2.114, 6: 2.004, 7: 1.924, 8: 1.864, 9: 1.816, 10: 1.777}
+_d2 = {2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326, 6: 2.534, 7: 2.704, 8: 2.847, 9: 2.970, 10: 3.078}
+
+
+class ControlChartGenerator:
+    """Generates SPC control charts from subgroup measurement data.
+
+    Supports X-bar/R charts, EWMA charts, and Western Electric rule detection.
+    """
+
+    @staticmethod
+    def compute_xbar_r(subgroups: List[List[float]]) -> ControlChartData:
+        """Compute X-bar and R chart from subgroup data.
+
+        Each subgroup is a list of measurements. All subgroups should be the same size.
+        """
+        if not subgroups:
+            return ControlChartData()
+
+        n = len(subgroups[0])  # subgroup size
+        if n < 2 or n > 10:
+            return ControlChartData()
+
+        means = [sum(sg) / len(sg) for sg in subgroups]
+        ranges = [max(sg) - min(sg) for sg in subgroups]
+
+        grand_mean = sum(means) / len(means)
+        r_bar = sum(ranges) / len(ranges)
+
+        a2 = _A2[n]
+        d3 = _D3[n]
+        d4 = _D4[n]
+
+        chart = ControlChartData(
+            subgroup_means=means,
+            subgroup_ranges=ranges,
+            x_bar_ucl=grand_mean + a2 * r_bar,
+            x_bar_cl=grand_mean,
+            x_bar_lcl=grand_mean - a2 * r_bar,
+            r_ucl=d4 * r_bar,
+            r_cl=r_bar,
+            r_lcl=d3 * r_bar,
+        )
+
+        # Detect out-of-control points (beyond X-bar limits)
+        for i, m in enumerate(means):
+            if m > chart.x_bar_ucl or m < chart.x_bar_lcl:
+                chart.out_of_control_points.append(i)
+
+        # Check Western Electric rules
+        chart.rule_violations = ControlChartGenerator._check_western_electric(
+            means, grand_mean, chart.x_bar_ucl, chart.x_bar_lcl)
+
+        return chart
+
+    @staticmethod
+    def compute_ewma(data: List[float], lambda_param: float = 0.2,
+                     L: float = 3.0, mu: Optional[float] = None,
+                     sigma: Optional[float] = None) -> EWMAChartData:
+        """Compute EWMA chart.
+
+        UCL/LCL = mu ± L * sigma * sqrt(lambda/(2-lambda) * (1-(1-lambda)^(2i)))
+        """
+        if not data:
+            return EWMAChartData(lambda_param=lambda_param)
+
+        if mu is None:
+            mu = sum(data) / len(data)
+        if sigma is None:
+            # Estimate sigma from moving ranges
+            if len(data) > 1:
+                mr = [abs(data[i] - data[i - 1]) for i in range(1, len(data))]
+                sigma = (sum(mr) / len(mr)) / 1.128  # d2 for n=2
+            else:
+                sigma = 1.0
+
+        ewma_values: List[float] = []
+        ucl_values: List[float] = []
+        lcl_values: List[float] = []
+        ooc: List[int] = []
+
+        z = mu  # initial EWMA = mu
+        lam = lambda_param
+        for i, x in enumerate(data):
+            z = lam * x + (1 - lam) * z
+            ewma_values.append(z)
+
+            # Control limits widen then stabilise
+            factor = math.sqrt(lam / (2 - lam) * (1 - (1 - lam) ** (2 * (i + 1))))
+            ucl = mu + L * sigma * factor
+            lcl = mu - L * sigma * factor
+            ucl_values.append(ucl)
+            lcl_values.append(lcl)
+
+            if z > ucl or z < lcl:
+                ooc.append(i)
+
+        return EWMAChartData(
+            ewma_values=ewma_values,
+            ucl_values=ucl_values,
+            lcl_values=lcl_values,
+            center_line=mu,
+            lambda_param=lam,
+            out_of_control_points=ooc,
+        )
+
+    @staticmethod
+    def _check_western_electric(values: List[float], cl: float,
+                                 ucl: float, lcl: float) -> List[RuleViolation]:
+        """Check Western Electric rules 1-4."""
+        violations: List[RuleViolation] = []
+        sigma = (ucl - cl) / 3.0 if ucl != cl else 1.0
+
+        # Rule 1: Point beyond 3σ (already caught as OOC, but record as violation)
+        for i, v in enumerate(values):
+            if v > ucl or v < lcl:
+                violations.append(RuleViolation(
+                    rule_number=1, rule_name='Beyond 3-sigma',
+                    point_index=i, value=v,
+                    description=f'Point {i} ({v:.4f}) beyond control limits',
+                ))
+
+        # Rule 2: 9 consecutive points on same side of CL
+        if len(values) >= 9:
+            above = [v > cl for v in values]
+            for i in range(len(values) - 8):
+                run = above[i:i + 9]
+                if all(run) or not any(run):
+                    side = 'above' if run[0] else 'below'
+                    violations.append(RuleViolation(
+                        rule_number=2, rule_name='9 consecutive same side',
+                        point_index=i, value=values[i],
+                        description=f'9 consecutive points {side} CL starting at {i}',
+                    ))
+                    break  # report first occurrence
+
+        # Rule 3: 6 consecutive increasing or decreasing
+        if len(values) >= 6:
+            for i in range(len(values) - 5):
+                segment = values[i:i + 6]
+                increasing = all(segment[j + 1] > segment[j] for j in range(5))
+                decreasing = all(segment[j + 1] < segment[j] for j in range(5))
+                if increasing or decreasing:
+                    direction = 'increasing' if increasing else 'decreasing'
+                    violations.append(RuleViolation(
+                        rule_number=3, rule_name='6 consecutive trend',
+                        point_index=i, value=values[i],
+                        description=f'6 consecutive {direction} points starting at {i}',
+                    ))
+                    break
+
+        # Rule 4: 14 consecutive alternating up/down
+        if len(values) >= 14:
+            for i in range(len(values) - 13):
+                segment = values[i:i + 14]
+                alternating = True
+                for j in range(1, 13):
+                    if j % 2 == 1:
+                        if not (segment[j] > segment[j - 1]):
+                            alternating = False
+                            break
+                    else:
+                        if not (segment[j] < segment[j - 1]):
+                            alternating = False
+                            break
+                if not alternating:
+                    # Check opposite pattern
+                    alternating = True
+                    for j in range(1, 13):
+                        if j % 2 == 1:
+                            if not (segment[j] < segment[j - 1]):
+                                alternating = False
+                                break
+                        else:
+                            if not (segment[j] > segment[j - 1]):
+                                alternating = False
+                                break
+                if alternating:
+                    violations.append(RuleViolation(
+                        rule_number=4, rule_name='14 consecutive alternating',
+                        point_index=i, value=values[i],
+                        description=f'14 consecutive alternating points starting at {i}',
+                    ))
+                    break
+
+        return violations
+
+    @staticmethod
+    def get_constants(n: int) -> Optional[Dict[str, float]]:
+        """Get A2, D3, D4, d2 constants for subgroup size n (2-10)."""
+        if n < 2 or n > 10:
+            return None
+        return {'A2': _A2[n], 'D3': _D3[n], 'D4': _D4[n], 'd2': _d2[n]}
+
 
 def main(args=None):
     """Entry point for the KPI calculator node."""

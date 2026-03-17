@@ -3,11 +3,15 @@ Reasoning Engine Node.
 
 Performs logical reasoning over the knowledge graph.
 Supports forward chaining, backward chaining, and rule evaluation.
+Includes a standalone ManufacturingKnowledgeGraph for entity-relationship modelling.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
+from enum import Enum
+from collections import deque
 import threading
+import time
 
 from rclpy.lifecycle import TransitionCallbackReturn
 from miracle_core.lifecycle_node_base import MiracleLifecycleNode
@@ -28,6 +32,279 @@ _ACTION_MAPPING = {
     ('requires', 'CoolantIncrease'): 'COOLANT_INCREASE',
     ('requires', 'EmergencyStop'): 'PAUSE',
 }
+
+
+# ---------------------------------------------------------------------------
+# Manufacturing Knowledge Graph
+# ---------------------------------------------------------------------------
+
+class EntityType(Enum):
+    """Types of manufacturing knowledge entities."""
+    MACHINE = 'machine'
+    TOOL = 'tool'
+    MATERIAL = 'material'
+    PROCESS = 'process'
+    PARAMETER = 'parameter'
+    OUTCOME = 'outcome'
+    FAILURE = 'failure'
+
+
+class RelationshipType(Enum):
+    """Types of relationships between entities."""
+    USES = 'uses'
+    PRODUCES = 'produces'
+    CAUSES = 'causes'
+    MITIGATES = 'mitigates'
+    REQUIRES = 'requires'
+    AFFECTS = 'affects'
+    OPTIMAL_FOR = 'optimal_for'
+
+
+@dataclass
+class KnowledgeNode:
+    """A node in the manufacturing knowledge graph."""
+    node_id: str
+    entity_type: EntityType
+    name: str
+    properties: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class KnowledgeEdge:
+    """A directed edge in the knowledge graph."""
+    source_id: str
+    target_id: str
+    relationship: RelationshipType
+    weight: float = 1.0  # 0-1 confidence
+    evidence: List[str] = field(default_factory=list)
+
+
+@dataclass
+class GraphQuery:
+    """A query against the knowledge graph."""
+    entity_type: Optional[EntityType] = None
+    relationship: Optional[RelationshipType] = None
+    source_id: Optional[str] = None
+    target_id: Optional[str] = None
+    min_weight: float = 0.0
+
+
+@dataclass
+class GraphQueryResult:
+    """Result of a knowledge graph query."""
+    nodes: List[KnowledgeNode] = field(default_factory=list)
+    edges: List[KnowledgeEdge] = field(default_factory=list)
+    paths: List[List[str]] = field(default_factory=list)
+
+
+class ManufacturingKnowledgeGraph:
+    """Graph of manufacturing entities and their relationships.
+
+    Supports adding nodes/edges, path finding, neighbour queries,
+    transitive inference, and recommendation queries.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: Dict[str, KnowledgeNode] = {}
+        # adjacency: source_id -> list of edges
+        self._adj: Dict[str, List[KnowledgeEdge]] = {}
+        # reverse adjacency for incoming edges
+        self._rev: Dict[str, List[KnowledgeEdge]] = {}
+
+    # -- mutators --
+
+    def add_node(self, node: KnowledgeNode) -> bool:
+        """Add a node. Returns False if node_id already exists (no overwrite)."""
+        if node.node_id in self._nodes:
+            return False
+        self._nodes[node.node_id] = node
+        self._adj.setdefault(node.node_id, [])
+        self._rev.setdefault(node.node_id, [])
+        return True
+
+    def add_edge(self, edge: KnowledgeEdge) -> bool:
+        """Add an edge. Source and target must already exist."""
+        if edge.source_id not in self._nodes or edge.target_id not in self._nodes:
+            return False
+        self._adj.setdefault(edge.source_id, []).append(edge)
+        self._rev.setdefault(edge.target_id, []).append(edge)
+        return True
+
+    # -- queries --
+
+    def get_node(self, node_id: str) -> Optional[KnowledgeNode]:
+        return self._nodes.get(node_id)
+
+    def query_by_type(self, entity_type: EntityType) -> List[KnowledgeNode]:
+        """Return all nodes of a given type."""
+        return [n for n in self._nodes.values() if n.entity_type == entity_type]
+
+    def get_neighbors(self, node_id: str,
+                      relationship: Optional[RelationshipType] = None,
+                      direction: str = 'outgoing') -> List[KnowledgeNode]:
+        """Get neighbouring nodes, optionally filtered by relationship type.
+
+        direction: 'outgoing' (default), 'incoming', or 'both'.
+        """
+        result_ids: List[str] = []
+        if direction in ('outgoing', 'both'):
+            for edge in self._adj.get(node_id, []):
+                if relationship is None or edge.relationship == relationship:
+                    result_ids.append(edge.target_id)
+        if direction in ('incoming', 'both'):
+            for edge in self._rev.get(node_id, []):
+                if relationship is None or edge.relationship == relationship:
+                    result_ids.append(edge.source_id)
+        # Deduplicate while preserving order
+        seen: Set[str] = set()
+        nodes: List[KnowledgeNode] = []
+        for nid in result_ids:
+            if nid not in seen:
+                seen.add(nid)
+                nodes.append(self._nodes[nid])
+        return nodes
+
+    def find_path(self, start_id: str, end_id: str) -> Optional[List[str]]:
+        """BFS shortest path from start to end. Returns list of node IDs or None."""
+        if start_id not in self._nodes or end_id not in self._nodes:
+            return None
+        if start_id == end_id:
+            return [start_id]
+        visited: Set[str] = {start_id}
+        queue: deque = deque([(start_id, [start_id])])
+        while queue:
+            current, path = queue.popleft()
+            for edge in self._adj.get(current, []):
+                nid = edge.target_id
+                if nid not in visited:
+                    new_path = path + [nid]
+                    if nid == end_id:
+                        return new_path
+                    visited.add(nid)
+                    queue.append((nid, new_path))
+        return None
+
+    # -- inference --
+
+    def infer_relationships(self, relationship: RelationshipType = RelationshipType.CAUSES,
+                             max_depth: int = 5) -> List[KnowledgeEdge]:
+        """Transitive closure: if A->B and B->C with the same relationship, infer A->C.
+
+        Confidence of inferred edge = product of intermediate weights.
+        Returns newly inferred edges (also added to graph).
+        """
+        new_edges: List[KnowledgeEdge] = []
+        # Build adjacency for the specific relationship
+        rel_adj: Dict[str, List[Tuple[str, float, List[str]]]] = {}
+        for src, edges in self._adj.items():
+            for e in edges:
+                if e.relationship == relationship:
+                    rel_adj.setdefault(src, []).append((e.target_id, e.weight, e.evidence))
+
+        # Existing direct pairs for this relationship
+        existing: Set[Tuple[str, str]] = set()
+        for src, targets in rel_adj.items():
+            for tgt, _, _ in targets:
+                existing.add((src, tgt))
+
+        # BFS from each source
+        for origin in list(rel_adj.keys()):
+            visited: Set[str] = {origin}
+            # (current_node, accumulated_weight, hops)
+            queue: deque = deque()
+            for tgt, w, ev in rel_adj.get(origin, []):
+                if tgt not in visited:
+                    visited.add(tgt)
+                    queue.append((tgt, w, 1))
+            while queue:
+                current, acc_weight, hops = queue.popleft()
+                if hops >= max_depth:
+                    continue
+                for next_tgt, w, ev in rel_adj.get(current, []):
+                    if next_tgt not in visited:
+                        visited.add(next_tgt)
+                        combined_weight = acc_weight * w
+                        if (origin, next_tgt) not in existing and combined_weight > 0.01:
+                            edge = KnowledgeEdge(
+                                source_id=origin,
+                                target_id=next_tgt,
+                                relationship=relationship,
+                                weight=round(combined_weight, 4),
+                                evidence=[f'inferred: transitive via {hops + 1} hops'],
+                            )
+                            self._adj.setdefault(origin, []).append(edge)
+                            self._rev.setdefault(next_tgt, []).append(edge)
+                            existing.add((origin, next_tgt))
+                            new_edges.append(edge)
+                        queue.append((next_tgt, acc_weight * w, hops + 1))
+        return new_edges
+
+    def query_recommendations(self, entity_type: EntityType,
+                                context: Dict[str, str]) -> List[Tuple[KnowledgeNode, float]]:
+        """Find optimal parameters for a given context by traversing OPTIMAL_FOR edges.
+
+        context maps property names to desired values (e.g. {'material': 'mat_1'}).
+        Returns list of (node, relevance_score) sorted by descending score.
+        """
+        candidates: List[Tuple[KnowledgeNode, float]] = []
+        # Find context nodes
+        context_ids: Set[str] = set()
+        for prop_name, prop_value in context.items():
+            for node in self._nodes.values():
+                if node.node_id == prop_value or node.properties.get(prop_name) == prop_value:
+                    context_ids.add(node.node_id)
+
+        # Walk OPTIMAL_FOR edges pointing to context nodes
+        for ctx_id in context_ids:
+            for edge in self._rev.get(ctx_id, []):
+                if edge.relationship == RelationshipType.OPTIMAL_FOR:
+                    source_node = self._nodes.get(edge.source_id)
+                    if source_node and (entity_type is None or source_node.entity_type == entity_type):
+                        candidates.append((source_node, edge.weight))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates
+
+    # -- statistics --
+
+    @property
+    def node_count(self) -> int:
+        return len(self._nodes)
+
+    @property
+    def edge_count(self) -> int:
+        return sum(len(edges) for edges in self._adj.values())
+
+    @property
+    def avg_degree(self) -> float:
+        if not self._nodes:
+            return 0.0
+        return self.edge_count / len(self._nodes)
+
+    def connected_components(self) -> int:
+        """Number of weakly connected components."""
+        if not self._nodes:
+            return 0
+        visited: Set[str] = set()
+        components = 0
+        for nid in self._nodes:
+            if nid not in visited:
+                components += 1
+                # BFS undirected
+                queue: deque = deque([nid])
+                visited.add(nid)
+                while queue:
+                    current = queue.popleft()
+                    for edge in self._adj.get(current, []):
+                        if edge.target_id not in visited:
+                            visited.add(edge.target_id)
+                            queue.append(edge.target_id)
+                    for edge in self._rev.get(current, []):
+                        if edge.source_id not in visited:
+                            visited.add(edge.source_id)
+                            queue.append(edge.source_id)
+        return components
 
 
 @dataclass

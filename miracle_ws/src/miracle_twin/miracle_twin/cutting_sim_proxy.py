@@ -8,7 +8,8 @@ PredictionRunner to replace hardcoded values with real simulation results.
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
 from miracle_twin.tool_library import ToolDefinition, ToolLibrary
 
@@ -2587,3 +2588,167 @@ class CuttingSimProxy:
             'chatter_risk_blocks': chatter_risk_blocks,
             'force_utilization_pct': round(force_utilization, 2),
         }
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Feed Override Controller
+# ---------------------------------------------------------------------------
+
+class FeedControlMode(Enum):
+    """Control modes for adaptive feed override."""
+    FORCE_CONSTANT = 'force_constant'
+    POWER_CONSTANT = 'power_constant'
+    MRR_CONSTANT = 'mrr_constant'
+
+
+@dataclass
+class FeedControlState:
+    """Internal state of the PID controller."""
+    current_override_pct: float = 100.0
+    previous_error: float = 0.0
+    integral_error: float = 0.0
+    total_adjustments: int = 0
+    mode: FeedControlMode = FeedControlMode.FORCE_CONSTANT
+    target_value: float = 500.0  # target force N, power W, or MRR mm³/min
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class FeedOverrideReport:
+    """Summary report of feed override controller performance."""
+    current_override: float
+    average_override: float
+    min_override: float
+    max_override: float
+    mode: str
+    total_adjustments: int
+    override_histogram: Dict[str, int] = field(default_factory=dict)
+
+
+class AdaptiveFeedController:
+    """PID-based adaptive feed override controller.
+
+    Monitors cutting forces/power/MRR and adjusts the feed override percentage
+    to maintain a target value.
+
+    Parameters:
+        kp: Proportional gain (default 0.5)
+        ki: Integral gain (default 0.05)
+        kd: Derivative gain (default 0.1)
+        min_override: Minimum override percentage (default 10%)
+        max_override: Maximum override percentage (default 150%)
+        max_rate: Maximum override change per cycle (default 5%)
+    """
+
+    def __init__(self, kp: float = 0.5, ki: float = 0.05, kd: float = 0.1,
+                 min_override: float = 10.0, max_override: float = 150.0,
+                 max_rate: float = 5.0) -> None:
+        self._kp = kp
+        self._ki = ki
+        self._kd = kd
+        self._min_override = min_override
+        self._max_override = max_override
+        self._max_rate = max_rate
+        self._state = FeedControlState()
+        self._history: List[Tuple[float, float]] = []  # (timestamp, override_pct)
+
+    @property
+    def current_override(self) -> float:
+        return self._state.current_override_pct
+
+    @property
+    def mode(self) -> FeedControlMode:
+        return self._state.mode
+
+    def set_mode(self, mode: FeedControlMode, target_value: float) -> None:
+        """Set control mode and target value."""
+        self._state.mode = mode
+        self._state.target_value = target_value
+        self._state.previous_error = 0.0
+        self._state.integral_error = 0.0
+
+    def reset(self) -> None:
+        """Reset controller to defaults."""
+        self._state = FeedControlState()
+        self._history.clear()
+
+    def update(self, measured_value: float) -> float:
+        """Update the controller with a new measurement.
+
+        Args:
+            measured_value: Current measured force (N), power (W), or MRR (mm³/min)
+                depending on the active control mode.
+
+        Returns:
+            The new feed override percentage.
+        """
+        target = self._state.target_value
+        if target <= 0:
+            return self._state.current_override_pct
+
+        # Error: positive means we're below target (need more feed)
+        # negative means above target (need less feed)
+        error = (target - measured_value) / target * 100.0  # normalised %
+
+        # PID calculation
+        self._state.integral_error += error
+        # Anti-windup: clamp integral
+        self._state.integral_error = max(-200.0, min(200.0, self._state.integral_error))
+
+        derivative = error - self._state.previous_error
+        self._state.previous_error = error
+
+        adjustment = (
+            self._kp * error +
+            self._ki * self._state.integral_error +
+            self._kd * derivative
+        )
+
+        # Rate limiting
+        adjustment = max(-self._max_rate, min(self._max_rate, adjustment))
+
+        # Apply adjustment
+        new_override = self._state.current_override_pct + adjustment
+
+        # Safety clamping
+        new_override = max(self._min_override, min(self._max_override, new_override))
+
+        self._state.current_override_pct = new_override
+        self._state.total_adjustments += 1
+        self._state.timestamp = time.time()
+
+        self._history.append((self._state.timestamp, new_override))
+
+        return new_override
+
+    def report(self) -> FeedOverrideReport:
+        """Generate a report of controller performance."""
+        if not self._history:
+            return FeedOverrideReport(
+                current_override=self._state.current_override_pct,
+                average_override=self._state.current_override_pct,
+                min_override=self._state.current_override_pct,
+                max_override=self._state.current_override_pct,
+                mode=self._state.mode.value,
+                total_adjustments=0,
+            )
+
+        overrides = [o for _, o in self._history]
+        avg = sum(overrides) / len(overrides)
+
+        # Build histogram in 10% buckets
+        histogram: Dict[str, int] = {}
+        for o in overrides:
+            bucket = int(o // 10) * 10
+            key = f'{bucket}-{bucket + 10}%'
+            histogram[key] = histogram.get(key, 0) + 1
+
+        return FeedOverrideReport(
+            current_override=self._state.current_override_pct,
+            average_override=round(avg, 2),
+            min_override=round(min(overrides), 2),
+            max_override=round(max(overrides), 2),
+            mode=self._state.mode.value,
+            total_adjustments=self._state.total_adjustments,
+            override_histogram=histogram,
+        )

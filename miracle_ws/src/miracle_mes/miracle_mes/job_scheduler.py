@@ -1540,6 +1540,170 @@ class JobSchedulerNode(MiracleLifecycleNode):
         self._status_pub.publish(msg)
 
 
+# ---------------------------------------------------------------------------
+# Setup Sheet Generator
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SAFETY_NOTES = [
+    'Verify tool lengths with probe before first cut.',
+    'Confirm workholding clamping force before cycle start.',
+    'Ensure coolant level is adequate and nozzles are aimed correctly.',
+    'Wear safety glasses and hearing protection.',
+    'Keep hands clear of moving axes during automatic operation.',
+]
+
+
+@dataclass
+class ToolSetup:
+    """A single tool entry on a setup sheet."""
+    pocket_number: int
+    tool_id: str
+    description: str = ''
+    diameter: float = 0.0
+    length_offset: Optional[float] = None
+    radius_comp: Optional[float] = None
+    min_stickout: float = 0.0
+    notes: str = ''
+
+
+@dataclass
+class WorkholdingSpec:
+    """Workholding configuration on a setup sheet."""
+    fixture_id: str
+    fixture_type: str = 'vise'
+    clamping_force_n: float = 0.0
+    jaw_width_mm: float = 0.0
+    parallels: bool = False
+    soft_jaws: bool = False
+    notes: str = ''
+
+
+@dataclass
+class SetupSheet:
+    """Complete machine setup sheet for a job."""
+    job_id: str
+    machine_id: str
+    program_name: str
+    tools: List[ToolSetup] = field(default_factory=list)
+    workholding: Optional[WorkholdingSpec] = None
+    wcs_offsets: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    material: str = ''
+    safety_notes: List[str] = field(default_factory=lambda: list(_DEFAULT_SAFETY_NOTES))
+    estimated_cycle_time: float = 0.0
+    revision: int = 1
+    created_at: float = field(default_factory=time.time)
+
+
+class SetupSheetGenerator:
+    """Generates and manages machine setup sheets for jobs."""
+
+    def __init__(self) -> None:
+        self._sheets: Dict[str, List[SetupSheet]] = {}
+
+    def create_sheet(self, job_id: str, machine_id: str, program_name: str,
+                     tools: Optional[List[ToolSetup]] = None,
+                     workholding: Optional[WorkholdingSpec] = None,
+                     wcs_offsets: Optional[Dict[str, Dict[str, float]]] = None,
+                     material: str = '',
+                     safety_notes: Optional[List[str]] = None,
+                     estimated_cycle_time: float = 0.0) -> SetupSheet:
+        revisions = self._sheets.get(job_id, [])
+        revision = len(revisions) + 1
+        sheet = SetupSheet(
+            job_id=job_id, machine_id=machine_id, program_name=program_name,
+            tools=tools or [], workholding=workholding,
+            wcs_offsets=wcs_offsets or {}, material=material,
+            safety_notes=safety_notes if safety_notes is not None else list(_DEFAULT_SAFETY_NOTES),
+            estimated_cycle_time=estimated_cycle_time, revision=revision,
+        )
+        self._sheets.setdefault(job_id, []).append(sheet)
+        return sheet
+
+    def get_sheet(self, job_id: str, revision: Optional[int] = None) -> Optional[SetupSheet]:
+        revisions = self._sheets.get(job_id, [])
+        if not revisions:
+            return None
+        if revision is not None:
+            for s in revisions:
+                if s.revision == revision:
+                    return s
+            return None
+        return revisions[-1]
+
+    def get_revision_history(self, job_id: str) -> List[SetupSheet]:
+        return list(self._sheets.get(job_id, []))
+
+    def validate(self, sheet: SetupSheet) -> Tuple[bool, List[str]]:
+        issues: List[str] = []
+        if not sheet.tools:
+            issues.append('No tools defined')
+        else:
+            for t in sheet.tools:
+                if t.length_offset is None:
+                    issues.append(f'Tool {t.tool_id} (pocket {t.pocket_number}) missing length offset')
+        if not sheet.wcs_offsets:
+            issues.append('No WCS offsets defined')
+        if not sheet.material:
+            issues.append('Material not specified')
+        if sheet.workholding is None:
+            issues.append('Workholding not specified')
+        return (len(issues) == 0, issues)
+
+    def compare_revisions(self, job_id: str, rev_a: int, rev_b: int) -> Dict[str, List[str]]:
+        sheet_a = self.get_sheet(job_id, rev_a)
+        sheet_b = self.get_sheet(job_id, rev_b)
+        changes: Dict[str, List[str]] = {'added': [], 'removed': [], 'changed': []}
+        if sheet_a is None or sheet_b is None:
+            return changes
+        tools_a = {t.tool_id for t in sheet_a.tools}
+        tools_b = {t.tool_id for t in sheet_b.tools}
+        for tid in tools_b - tools_a:
+            changes['added'].append(f'Tool {tid}')
+        for tid in tools_a - tools_b:
+            changes['removed'].append(f'Tool {tid}')
+        wcs_a = set(sheet_a.wcs_offsets.keys())
+        wcs_b = set(sheet_b.wcs_offsets.keys())
+        for w in wcs_b - wcs_a:
+            changes['added'].append(f'WCS {w}')
+        for w in wcs_a - wcs_b:
+            changes['removed'].append(f'WCS {w}')
+        for w in wcs_a & wcs_b:
+            if sheet_a.wcs_offsets[w] != sheet_b.wcs_offsets[w]:
+                changes['changed'].append(f'WCS {w} offsets modified')
+        if sheet_a.material != sheet_b.material:
+            changes['changed'].append(f'Material: {sheet_a.material} -> {sheet_b.material}')
+        if sheet_a.machine_id != sheet_b.machine_id:
+            changes['changed'].append(f'Machine: {sheet_a.machine_id} -> {sheet_b.machine_id}')
+        return changes
+
+    def generate_checklist(self, sheet: SetupSheet) -> List[str]:
+        checklist: List[str] = []
+        for t in sheet.tools:
+            checklist.append(f'Load tool {t.tool_id} ({t.description}) in pocket {t.pocket_number}')
+            if t.length_offset is not None:
+                checklist.append(f'  Set length offset H{t.pocket_number} = {t.length_offset:.3f} mm')
+            if t.radius_comp is not None:
+                checklist.append(f'  Set radius comp D{t.pocket_number} = {t.radius_comp:.3f} mm')
+        for wcs_name, offsets in sorted(sheet.wcs_offsets.items()):
+            parts = [f'{axis}={val:.3f}' for axis, val in sorted(offsets.items())]
+            checklist.append(f'Set {wcs_name}: {", ".join(parts)}')
+        if sheet.workholding:
+            wh = sheet.workholding
+            checklist.append(f'Install {wh.fixture_type} fixture {wh.fixture_id}')
+            if wh.clamping_force_n > 0:
+                checklist.append(f'  Clamping force: {wh.clamping_force_n:.0f} N')
+            if wh.parallels:
+                checklist.append('  Place parallels under workpiece')
+            if wh.soft_jaws:
+                checklist.append('  Install soft jaws')
+        if sheet.material:
+            checklist.append(f'Verify material is {sheet.material}')
+        checklist.append(f'Load program {sheet.program_name}')
+        for note in sheet.safety_notes:
+            checklist.append(f'[SAFETY] {note}')
+        return checklist
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

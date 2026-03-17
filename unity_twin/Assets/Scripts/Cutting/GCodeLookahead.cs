@@ -925,4 +925,256 @@ namespace MiracleTwin.Cutting
             return waypoints;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Dwell Time Analyzer
+    // -----------------------------------------------------------------------
+
+    /// <summary>Type of dwell detected in the program.</summary>
+    public enum DwellType
+    {
+        Explicit,   // G4 command
+        Implicit    // Consecutive blocks at same position
+    }
+
+    /// <summary>A single dwell event in the G-code program.</summary>
+    [Serializable]
+    public class DwellEvent
+    {
+        public int blockIndex;
+        public DwellType type;
+        public float durationSeconds;
+        public string rawLine;
+        public bool isExcessive;
+    }
+
+    /// <summary>An optimization suggestion for dwell usage.</summary>
+    [Serializable]
+    public class DwellOptimizationSuggestion
+    {
+        public string description;
+        public int blockIndex;
+        public float timeSavingSeconds;
+    }
+
+    /// <summary>Report summarising all dwells in a program.</summary>
+    [Serializable]
+    public class DwellReport
+    {
+        public float totalDwellTimeSeconds;
+        public int dwellCount;
+        public int excessiveDwellCount;
+        public int implicitDwellCount;
+        public float dwellPercentage;
+        public float totalProgramTimeSeconds;
+        public List<DwellEvent> events = new();
+        public List<DwellOptimizationSuggestion> suggestions = new();
+    }
+
+    /// <summary>
+    /// Analyses G-code programs for explicit (G4) and implicit dwells,
+    /// flags excessive dwell times, and suggests optimizations.
+    /// </summary>
+    public class DwellAnalyzer
+    {
+        private readonly float _excessiveThresholdSec;
+
+        /// <param name="excessiveThresholdSec">
+        /// Dwell duration above which a dwell is flagged as excessive (default 2.0 s).
+        /// </param>
+        public DwellAnalyzer(float excessiveThresholdSec = 2.0f)
+        {
+            _excessiveThresholdSec = excessiveThresholdSec;
+        }
+
+        /// <summary>
+        /// Analyse a list of G-code lines and an estimated total program time.
+        /// </summary>
+        public DwellReport Analyze(List<string> lines, float totalProgramTimeSec = 0f)
+        {
+            var report = new DwellReport { totalProgramTimeSeconds = totalProgramTimeSec };
+
+            Vector3 lastPos = Vector3.zero;
+            bool hasLastPos = false;
+            int consecutiveSame = 0;
+
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string line = lines[i].Trim().ToUpperInvariant();
+                if (string.IsNullOrEmpty(line) || line.StartsWith("%") || line.StartsWith("("))
+                    continue;
+
+                // Check for explicit G4 dwell
+                float dwellSec = ParseG4Dwell(line);
+                if (dwellSec > 0f)
+                {
+                    var evt = new DwellEvent
+                    {
+                        blockIndex = i,
+                        type = DwellType.Explicit,
+                        durationSeconds = dwellSec,
+                        rawLine = lines[i],
+                        isExcessive = dwellSec > _excessiveThresholdSec,
+                    };
+                    report.events.Add(evt);
+                    report.totalDwellTimeSeconds += dwellSec;
+                    report.dwellCount++;
+                    if (evt.isExcessive) report.excessiveDwellCount++;
+                    continue;
+                }
+
+                // Track position for implicit dwell detection
+                Vector3 pos = ParsePosition(line, lastPos);
+                if (hasLastPos && pos == lastPos)
+                {
+                    consecutiveSame++;
+                    if (consecutiveSame >= 2) // 3+ blocks at same position
+                    {
+                        // Only record once per run
+                        if (consecutiveSame == 2)
+                        {
+                            var evt = new DwellEvent
+                            {
+                                blockIndex = i - 2,
+                                type = DwellType.Implicit,
+                                durationSeconds = 0f, // unknown without feed simulation
+                                rawLine = $"(implicit dwell: {consecutiveSame + 1} blocks at same position)",
+                                isExcessive = false,
+                            };
+                            report.events.Add(evt);
+                            report.implicitDwellCount++;
+                            report.dwellCount++;
+                        }
+                    }
+                }
+                else
+                {
+                    consecutiveSame = 0;
+                }
+
+                lastPos = pos;
+                hasLastPos = true;
+            }
+
+            // Calculate dwell percentage
+            if (totalProgramTimeSec > 0f)
+                report.dwellPercentage = (report.totalDwellTimeSeconds / totalProgramTimeSec) * 100f;
+
+            // Generate optimization suggestions
+            GenerateSuggestions(report, lines);
+
+            return report;
+        }
+
+        /// <summary>Parse a G4 dwell command. Returns seconds, or 0 if not a G4.</summary>
+        public static float ParseG4Dwell(string line)
+        {
+            if (!line.Contains("G4") && !line.Contains("G04"))
+                return 0f;
+
+            // P parameter = milliseconds
+            int pIdx = line.IndexOf('P');
+            if (pIdx >= 0)
+            {
+                string numStr = ExtractNumber(line, pIdx + 1);
+                if (float.TryParse(numStr, out float pVal))
+                    return pVal / 1000f; // ms -> sec
+            }
+
+            // X parameter = seconds (Fanuc-style)
+            int xIdx = line.IndexOf('X');
+            if (xIdx >= 0)
+            {
+                string numStr = ExtractNumber(line, xIdx + 1);
+                if (float.TryParse(numStr, out float xVal))
+                    return xVal; // already seconds
+            }
+
+            return 0f;
+        }
+
+        private static string ExtractNumber(string line, int startIdx)
+        {
+            int end = startIdx;
+            bool hasDot = false;
+            if (end < line.Length && line[end] == '-') end++;
+            while (end < line.Length && (char.IsDigit(line[end]) || (line[end] == '.' && !hasDot)))
+            {
+                if (line[end] == '.') hasDot = true;
+                end++;
+            }
+            return line.Substring(startIdx, end - startIdx);
+        }
+
+        private static Vector3 ParsePosition(string line, Vector3 current)
+        {
+            float x = current.x, y = current.y, z = current.z;
+            int xi = line.IndexOf('X');
+            int yi = line.IndexOf('Y');
+            int zi = line.IndexOf('Z');
+            if (xi >= 0) { string n = ExtractNumber(line, xi + 1); float.TryParse(n, out x); }
+            if (yi >= 0) { string n = ExtractNumber(line, yi + 1); float.TryParse(n, out y); }
+            if (zi >= 0) { string n = ExtractNumber(line, zi + 1); float.TryParse(n, out z); }
+            return new Vector3(x, y, z);
+        }
+
+        private void GenerateSuggestions(DwellReport report, List<string> lines)
+        {
+            // Suggest removing dwells before rapids (G0)
+            for (int i = 0; i < report.events.Count; i++)
+            {
+                var evt = report.events[i];
+                if (evt.type != DwellType.Explicit) continue;
+
+                // Check if next non-empty line is a rapid
+                int nextIdx = evt.blockIndex + 1;
+                while (nextIdx < lines.Count)
+                {
+                    string next = lines[nextIdx].Trim().ToUpperInvariant();
+                    if (string.IsNullOrEmpty(next) || next.StartsWith("("))
+                    {
+                        nextIdx++;
+                        continue;
+                    }
+                    if (next.Contains("G0 ") || next.StartsWith("G0") || next.Contains("G00"))
+                    {
+                        report.suggestions.Add(new DwellOptimizationSuggestion
+                        {
+                            description = "Dwell before rapid move may be unnecessary",
+                            blockIndex = evt.blockIndex,
+                            timeSavingSeconds = evt.durationSeconds,
+                        });
+                    }
+                    break;
+                }
+
+                // Flag excessive dwells
+                if (evt.isExcessive)
+                {
+                    report.suggestions.Add(new DwellOptimizationSuggestion
+                    {
+                        description = $"Excessive dwell ({evt.durationSeconds:F1}s > {_excessiveThresholdSec:F1}s threshold)",
+                        blockIndex = evt.blockIndex,
+                        timeSavingSeconds = evt.durationSeconds - _excessiveThresholdSec,
+                    });
+                }
+            }
+
+            // Suggest consolidating consecutive explicit dwells
+            for (int i = 1; i < report.events.Count; i++)
+            {
+                if (report.events[i].type == DwellType.Explicit &&
+                    report.events[i - 1].type == DwellType.Explicit &&
+                    report.events[i].blockIndex == report.events[i - 1].blockIndex + 1)
+                {
+                    report.suggestions.Add(new DwellOptimizationSuggestion
+                    {
+                        description = "Consecutive dwells could be consolidated into one",
+                        blockIndex = report.events[i].blockIndex,
+                        timeSavingSeconds = 0f,
+                    });
+                }
+            }
+        }
+    }
 }

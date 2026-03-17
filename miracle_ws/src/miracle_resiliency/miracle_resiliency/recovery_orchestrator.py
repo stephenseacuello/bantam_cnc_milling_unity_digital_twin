@@ -5,12 +5,14 @@ Orchestrates multi-step recovery sequences for failed nodes,
 coordinating with lifecycle management and dependency ordering.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from enum import Enum
 import threading
 import asyncio
 import time
 import uuid
+import json
 
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -634,6 +636,284 @@ class RecoveryOrchestratorNode(MiracleLifecycleNode):
             f"(strategy={action.strategy}). Manual intervention required."
         )
         self._failure_pub.publish(msg)
+
+
+# ---------------------------------------------------------------------------
+# OPC-UA Tag Mapper
+# ---------------------------------------------------------------------------
+
+class ControllerType(Enum):
+    """Supported CNC controller types."""
+    FANUC = 'fanuc'
+    SIEMENS = 'siemens'
+    HAAS = 'haas'
+    GENERIC = 'generic'
+
+
+@dataclass
+class TagMapping:
+    """Maps an OPC-UA node ID to an internal signal name."""
+    opc_node_id: str
+    internal_name: str
+    data_type: str = 'float'  # float, int, bool, string
+    scaling_factor: float = 1.0
+    offset: float = 0.0
+    unit: str = ''
+    description: str = ''
+    poll_rate_ms: int = 100
+
+
+@dataclass
+class TagGroup:
+    """A named group of related tags."""
+    group_name: str
+    tags: List[TagMapping] = field(default_factory=list)
+    poll_rate_ms: int = 100
+    enabled: bool = True
+
+
+@dataclass
+class TagHealth:
+    """Health status of a single tag."""
+    tag_name: str
+    is_stale: bool
+    last_update_time: float
+    poll_rate_ms: int
+    staleness_ms: float
+
+
+@dataclass
+class TagValidationResult:
+    """Result of tag configuration validation."""
+    is_valid: bool
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+# Standard CNC tags expected for full connectivity
+_REQUIRED_TAGS = {
+    'spindle_speed', 'feed_rate', 'axis_x', 'axis_y', 'axis_z',
+    'tool_number', 'coolant_status',
+}
+
+_VALID_DATA_TYPES = {'float', 'int', 'bool', 'string'}
+
+# Controller-specific tag templates
+_CONTROLLER_TEMPLATES: Dict[ControllerType, List[TagMapping]] = {
+    ControllerType.FANUC: [
+        TagMapping('ns=2;s=GnCNC.SpindleSpeed', 'spindle_speed', 'float', 1.0, 0.0, 'rpm', 'Spindle speed'),
+        TagMapping('ns=2;s=GnCNC.FeedRate', 'feed_rate', 'float', 1.0, 0.0, 'mm/min', 'Feed rate'),
+        TagMapping('ns=2;s=GnCNC.AbsPos.X', 'axis_x', 'float', 1.0, 0.0, 'mm', 'X axis position'),
+        TagMapping('ns=2;s=GnCNC.AbsPos.Y', 'axis_y', 'float', 1.0, 0.0, 'mm', 'Y axis position'),
+        TagMapping('ns=2;s=GnCNC.AbsPos.Z', 'axis_z', 'float', 1.0, 0.0, 'mm', 'Z axis position'),
+        TagMapping('ns=2;s=GnCNC.ToolNo', 'tool_number', 'int', 1.0, 0.0, '', 'Active tool number'),
+        TagMapping('ns=2;s=GnCNC.Coolant', 'coolant_status', 'bool', 1.0, 0.0, '', 'Coolant on/off'),
+        TagMapping('ns=2;s=GnCNC.AlarmCode', 'alarm_code', 'int', 1.0, 0.0, '', 'Active alarm code'),
+    ],
+    ControllerType.SIEMENS: [
+        TagMapping('ns=2;s=Sinumerik.Channel.SpindleSpeed', 'spindle_speed', 'float', 1.0, 0.0, 'rpm', 'Spindle speed'),
+        TagMapping('ns=2;s=Sinumerik.Channel.FeedRate', 'feed_rate', 'float', 1.0, 0.0, 'mm/min', 'Feed rate'),
+        TagMapping('ns=2;s=Sinumerik.Channel.Axis.X.ActPos', 'axis_x', 'float', 1.0, 0.0, 'mm', 'X axis position'),
+        TagMapping('ns=2;s=Sinumerik.Channel.Axis.Y.ActPos', 'axis_y', 'float', 1.0, 0.0, 'mm', 'Y axis position'),
+        TagMapping('ns=2;s=Sinumerik.Channel.Axis.Z.ActPos', 'axis_z', 'float', 1.0, 0.0, 'mm', 'Z axis position'),
+        TagMapping('ns=2;s=Sinumerik.Channel.ToolIdent', 'tool_number', 'int', 1.0, 0.0, '', 'Active tool number'),
+        TagMapping('ns=2;s=Sinumerik.Channel.CoolantState', 'coolant_status', 'bool', 1.0, 0.0, '', 'Coolant on/off'),
+        TagMapping('ns=2;s=Sinumerik.Alarm.Active', 'alarm_code', 'int', 1.0, 0.0, '', 'Active alarm'),
+    ],
+    ControllerType.HAAS: [
+        TagMapping('ns=2;s=Haas.Spindle.ActualSpeed', 'spindle_speed', 'float', 1.0, 0.0, 'rpm', 'Spindle speed'),
+        TagMapping('ns=2;s=Haas.Motion.FeedRate', 'feed_rate', 'float', 1.0, 0.0, 'mm/min', 'Feed rate'),
+        TagMapping('ns=2;s=Haas.Axis.X.Position', 'axis_x', 'float', 1.0, 0.0, 'mm', 'X axis position'),
+        TagMapping('ns=2;s=Haas.Axis.Y.Position', 'axis_y', 'float', 1.0, 0.0, 'mm', 'Y axis position'),
+        TagMapping('ns=2;s=Haas.Axis.Z.Position', 'axis_z', 'float', 1.0, 0.0, 'mm', 'Z axis position'),
+        TagMapping('ns=2;s=Haas.Tool.CurrentNumber', 'tool_number', 'int', 1.0, 0.0, '', 'Active tool number'),
+        TagMapping('ns=2;s=Haas.Coolant.Status', 'coolant_status', 'bool', 1.0, 0.0, '', 'Coolant on/off'),
+        TagMapping('ns=2;s=Haas.Alarm.Code', 'alarm_code', 'int', 1.0, 0.0, '', 'Active alarm'),
+    ],
+    ControllerType.GENERIC: [
+        TagMapping('ns=2;s=CNC.SpindleSpeed', 'spindle_speed', 'float', 1.0, 0.0, 'rpm', 'Spindle speed'),
+        TagMapping('ns=2;s=CNC.FeedRate', 'feed_rate', 'float', 1.0, 0.0, 'mm/min', 'Feed rate'),
+        TagMapping('ns=2;s=CNC.Axis.X', 'axis_x', 'float', 1.0, 0.0, 'mm', 'X axis position'),
+        TagMapping('ns=2;s=CNC.Axis.Y', 'axis_y', 'float', 1.0, 0.0, 'mm', 'Y axis position'),
+        TagMapping('ns=2;s=CNC.Axis.Z', 'axis_z', 'float', 1.0, 0.0, 'mm', 'Z axis position'),
+        TagMapping('ns=2;s=CNC.ToolNumber', 'tool_number', 'int', 1.0, 0.0, '', 'Active tool number'),
+        TagMapping('ns=2;s=CNC.Coolant', 'coolant_status', 'bool', 1.0, 0.0, '', 'Coolant on/off'),
+        TagMapping('ns=2;s=CNC.Alarm', 'alarm_code', 'int', 1.0, 0.0, '', 'Active alarm'),
+    ],
+}
+
+
+class OpcUaTagMapper:
+    """Maps OPC-UA node IDs to internal CNC signal names.
+
+    Supports tag configuration, value transformation, health monitoring,
+    controller-specific templates, and JSON persistence.
+    """
+
+    def __init__(self) -> None:
+        self._tags: Dict[str, TagMapping] = {}  # keyed by internal_name
+        self._groups: Dict[str, TagGroup] = {}
+        self._last_update: Dict[str, float] = {}  # internal_name -> timestamp
+
+    def add_tag(self, tag: TagMapping) -> bool:
+        """Add a tag mapping. Returns False if internal_name already exists."""
+        if tag.internal_name in self._tags:
+            return False
+        self._tags[tag.internal_name] = tag
+        return True
+
+    def add_group(self, group: TagGroup) -> None:
+        """Add a tag group, registering all its tags."""
+        self._groups[group.group_name] = group
+        for tag in group.tags:
+            self.add_tag(tag)
+
+    def get_tag(self, internal_name: str) -> Optional[TagMapping]:
+        return self._tags.get(internal_name)
+
+    def get_all_tags(self) -> List[TagMapping]:
+        return list(self._tags.values())
+
+    def remove_tag(self, internal_name: str) -> bool:
+        if internal_name in self._tags:
+            del self._tags[internal_name]
+            self._last_update.pop(internal_name, None)
+            return True
+        return False
+
+    def transform_value(self, internal_name: str, raw_value: float) -> Optional[float]:
+        """Apply scaling_factor and offset: result = raw * scale + offset."""
+        tag = self._tags.get(internal_name)
+        if tag is None:
+            return None
+        self._last_update[internal_name] = time.time()
+        return raw_value * tag.scaling_factor + tag.offset
+
+    def record_update(self, internal_name: str) -> None:
+        """Record that a tag value was received (for health tracking)."""
+        self._last_update[internal_name] = time.time()
+
+    def get_tag_health(self) -> List[TagHealth]:
+        """Return health status for all tags. Stale = not updated within 2x poll_rate."""
+        now = time.time()
+        results: List[TagHealth] = []
+        for name, tag in self._tags.items():
+            last = self._last_update.get(name, 0.0)
+            staleness_ms = (now - last) * 1000.0 if last > 0 else float('inf')
+            is_stale = staleness_ms > (tag.poll_rate_ms * 2)
+            results.append(TagHealth(
+                tag_name=name,
+                is_stale=is_stale,
+                last_update_time=last,
+                poll_rate_ms=tag.poll_rate_ms,
+                staleness_ms=staleness_ms,
+            ))
+        return results
+
+    def validate(self) -> TagValidationResult:
+        """Validate tag configuration for completeness and correctness."""
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        # Check for duplicate OPC node IDs
+        opc_ids: Dict[str, str] = {}
+        for name, tag in self._tags.items():
+            if tag.opc_node_id in opc_ids:
+                errors.append(
+                    f"Duplicate OPC node ID '{tag.opc_node_id}' "
+                    f"mapped to both '{opc_ids[tag.opc_node_id]}' and '{name}'"
+                )
+            else:
+                opc_ids[tag.opc_node_id] = name
+
+            if tag.data_type not in _VALID_DATA_TYPES:
+                errors.append(f"Tag '{name}' has invalid data_type '{tag.data_type}'")
+
+        # Check required tags
+        present = set(self._tags.keys())
+        missing = _REQUIRED_TAGS - present
+        for m in sorted(missing):
+            warnings.append(f"Required tag '{m}' is not mapped")
+
+        return TagValidationResult(
+            is_valid=len(errors) == 0,
+            errors=errors,
+            warnings=warnings,
+        )
+
+    def discover_tags(self, server_url: str) -> List[TagMapping]:
+        """Simulate OPC-UA tag discovery for a server URL.
+
+        Returns a generic set of standard CNC tags.
+        """
+        prefix = f"ns=2;s={server_url.split('/')[-1] if '/' in server_url else 'Device'}"
+        tags = [
+            TagMapping(f'{prefix}.SpindleSpeed', 'spindle_speed', 'float', 1.0, 0.0, 'rpm', 'Spindle speed'),
+            TagMapping(f'{prefix}.FeedRate', 'feed_rate', 'float', 1.0, 0.0, 'mm/min', 'Feed rate'),
+            TagMapping(f'{prefix}.Axis.X', 'axis_x', 'float', 1.0, 0.0, 'mm', 'X position'),
+            TagMapping(f'{prefix}.Axis.Y', 'axis_y', 'float', 1.0, 0.0, 'mm', 'Y position'),
+            TagMapping(f'{prefix}.Axis.Z', 'axis_z', 'float', 1.0, 0.0, 'mm', 'Z position'),
+            TagMapping(f'{prefix}.ToolNumber', 'tool_number', 'int', 1.0, 0.0, '', 'Active tool'),
+            TagMapping(f'{prefix}.Coolant', 'coolant_status', 'bool', 1.0, 0.0, '', 'Coolant on/off'),
+            TagMapping(f'{prefix}.AlarmCode', 'alarm_code', 'int', 1.0, 0.0, '', 'Alarm code'),
+        ]
+        return tags
+
+    @staticmethod
+    def get_controller_template(controller: ControllerType) -> List[TagMapping]:
+        """Get the tag template for a specific controller type."""
+        return list(_CONTROLLER_TEMPLATES.get(controller, []))
+
+    def load_controller_template(self, controller: ControllerType) -> int:
+        """Load a controller template, adding all tags. Returns count added."""
+        count = 0
+        for tag in self.get_controller_template(controller):
+            if self.add_tag(tag):
+                count += 1
+        return count
+
+    def to_dict(self) -> dict:
+        """Serialize tag configuration to a dict."""
+        return {
+            'tags': [
+                {
+                    'opc_node_id': t.opc_node_id,
+                    'internal_name': t.internal_name,
+                    'data_type': t.data_type,
+                    'scaling_factor': t.scaling_factor,
+                    'offset': t.offset,
+                    'unit': t.unit,
+                    'description': t.description,
+                    'poll_rate_ms': t.poll_rate_ms,
+                }
+                for t in self._tags.values()
+            ],
+        }
+
+    def save_to_json(self, path: str) -> None:
+        """Save tag configuration to a JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    def load_from_json(self, path: str) -> int:
+        """Load tag configuration from a JSON file. Returns count loaded."""
+        with open(path) as f:
+            data = json.load(f)
+        count = 0
+        for t in data.get('tags', []):
+            tag = TagMapping(
+                opc_node_id=t['opc_node_id'],
+                internal_name=t['internal_name'],
+                data_type=t.get('data_type', 'float'),
+                scaling_factor=t.get('scaling_factor', 1.0),
+                offset=t.get('offset', 0.0),
+                unit=t.get('unit', ''),
+                description=t.get('description', ''),
+                poll_rate_ms=t.get('poll_rate_ms', 100),
+            )
+            if self.add_tag(tag):
+                count += 1
+        return count
 
 
 def main(args=None):

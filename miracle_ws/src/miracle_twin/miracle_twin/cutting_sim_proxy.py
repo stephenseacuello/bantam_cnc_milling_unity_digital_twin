@@ -3844,3 +3844,223 @@ class CuttingFluidManager:
             'num_full_changes': num_full_changes,
             'total_liters_used': round(total_liters, 2),
         }
+
+
+# ======================================================================
+# Surface Finish Predictor
+# ======================================================================
+
+@dataclass
+class SurfaceFinishInput:
+    """Input parameters for surface roughness prediction."""
+    feed_per_tooth_mm: float
+    tool_nose_radius_mm: float
+    cutting_speed_m_min: float
+    depth_of_cut_mm: float
+    tool_wear_vb_mm: float
+    vibration_amplitude_mm: float
+
+
+@dataclass
+class SurfaceFinishResult:
+    """Result of surface roughness prediction."""
+    ra_theoretical: float       # ideal Ra from kinematics (micrometers)
+    ra_predicted: float         # predicted Ra including all effects (micrometers)
+    ra_components: Dict[str, float]  # breakdown: ideal, wear, vibration
+    quality_grade: str          # ISO N grade (N1 .. N12)
+    meets_target: bool          # whether predicted Ra <= target
+    target_ra: float            # the target Ra that was checked against
+
+
+class SurfaceFinishPredictor:
+    """Predicts surface roughness (Ra) from cutting parameters.
+
+    Uses a combined theoretical + empirical model:
+    - Ideal (kinematic) roughness: Ra = f^2 / (32 * R)
+    - Flank wear contribution: +0.5 * VB
+    - Vibration contribution: +amplitude * 0.8
+    - Cutting speed correction factor for BUE / thermal effects
+    """
+
+    # ISO 1302 surface roughness grades — upper Ra boundary in micrometers.
+    _ISO_GRADES: List[Tuple[str, float]] = [
+        ('N1',  0.025),
+        ('N2',  0.05),
+        ('N3',  0.1),
+        ('N4',  0.2),
+        ('N5',  0.4),
+        ('N6',  0.8),
+        ('N7',  1.6),
+        ('N8',  3.2),
+        ('N9',  6.3),
+        ('N10', 12.5),
+        ('N11', 25.0),
+        ('N12', 50.0),
+    ]
+
+    # ------------------------------------------------------------------
+    # Core prediction
+    # ------------------------------------------------------------------
+
+    def predict_ra(
+        self,
+        inp: SurfaceFinishInput,
+        target_ra: float = 1.6,
+    ) -> SurfaceFinishResult:
+        """Predict surface roughness Ra from cutting parameters.
+
+        Parameters
+        ----------
+        inp:
+            A ``SurfaceFinishInput`` with all cutting parameters.
+        target_ra:
+            Desired maximum Ra in micrometers.
+
+        Returns
+        -------
+        ``SurfaceFinishResult`` with predicted Ra, components, grade, etc.
+        """
+        # 1. Ideal (kinematic) roughness  —  Ra = f² / (32·R)
+        #    feed and radius are in mm; result is in mm, convert to µm (* 1000).
+        if inp.tool_nose_radius_mm <= 0:
+            raise ValueError("tool_nose_radius_mm must be > 0")
+        ra_ideal_um = (inp.feed_per_tooth_mm ** 2
+                       / (32.0 * inp.tool_nose_radius_mm)) * 1000.0
+
+        # 2. Wear contribution  —  0.5 · VB  (VB in mm → contribution in µm)
+        ra_wear_um = 0.5 * inp.tool_wear_vb_mm * 1000.0  # convert mm to µm
+
+        # 3. Vibration contribution  —  amplitude · 0.8  (mm → µm)
+        ra_vib_um = inp.vibration_amplitude_mm * 0.8 * 1000.0
+
+        # 4. Speed correction factor  —  accounts for BUE at low speed
+        speed_factor = 1.0 + 0.1 * (1.0 - inp.cutting_speed_m_min / 200.0)
+        speed_factor = max(speed_factor, 0.5)  # clamp to avoid negative
+
+        # 5. Theoretical Ra (ideal only, with speed factor)
+        ra_theoretical = ra_ideal_um * speed_factor
+
+        # 6. Predicted Ra (all contributions, with speed factor)
+        ra_predicted = (ra_ideal_um + ra_wear_um + ra_vib_um) * speed_factor
+
+        quality_grade = self.get_iso_grade(ra_predicted)
+        meets = ra_predicted <= target_ra
+
+        return SurfaceFinishResult(
+            ra_theoretical=round(ra_theoretical, 4),
+            ra_predicted=round(ra_predicted, 4),
+            ra_components={
+                'ideal': round(ra_ideal_um * speed_factor, 4),
+                'wear': round(ra_wear_um * speed_factor, 4),
+                'vibration': round(ra_vib_um * speed_factor, 4),
+            },
+            quality_grade=quality_grade,
+            meets_target=meets,
+            target_ra=target_ra,
+        )
+
+    # ------------------------------------------------------------------
+    # ISO grade mapping
+    # ------------------------------------------------------------------
+
+    def get_iso_grade(self, ra_value: float) -> str:
+        """Map a Ra value (µm) to the corresponding ISO N grade.
+
+        Returns the grade whose upper boundary is >= ra_value.  If the
+        value exceeds N12 (50 µm), ``'N12+'`` is returned.
+        """
+        for grade, upper in self._ISO_GRADES:
+            if ra_value <= upper:
+                return grade
+        return 'N12+'
+
+    # ------------------------------------------------------------------
+    # Parameter recommendation
+    # ------------------------------------------------------------------
+
+    def recommend_parameters(
+        self,
+        target_ra: float,
+        current_input: SurfaceFinishInput,
+    ) -> Dict[str, object]:
+        """Suggest feed and speed adjustments to achieve *target_ra*.
+
+        The recommendation iteratively reduces feed per tooth (up to 60 %)
+        and increases cutting speed (up to 50 %) to bring the predicted Ra
+        below the target.
+
+        Returns
+        -------
+        dict with keys:
+            ``recommended_feed_per_tooth_mm`` – adjusted feed.
+            ``recommended_cutting_speed_m_min`` – adjusted speed.
+            ``predicted_ra`` – Ra at the recommended parameters.
+            ``achievable`` – whether target can be met within limits.
+        """
+        best_feed = current_input.feed_per_tooth_mm
+        best_speed = current_input.cutting_speed_m_min
+        achievable = False
+
+        # Search: reduce feed in 5 % steps, increase speed in 5 % steps
+        for feed_pct in range(100, 39, -5):   # 100 % down to 40 %
+            for speed_pct in range(100, 151, 5):  # 100 % up to 150 %
+                trial_feed = current_input.feed_per_tooth_mm * feed_pct / 100.0
+                trial_speed = current_input.cutting_speed_m_min * speed_pct / 100.0
+                trial_input = SurfaceFinishInput(
+                    feed_per_tooth_mm=trial_feed,
+                    tool_nose_radius_mm=current_input.tool_nose_radius_mm,
+                    cutting_speed_m_min=trial_speed,
+                    depth_of_cut_mm=current_input.depth_of_cut_mm,
+                    tool_wear_vb_mm=current_input.tool_wear_vb_mm,
+                    vibration_amplitude_mm=current_input.vibration_amplitude_mm,
+                )
+                result = self.predict_ra(trial_input, target_ra)
+                if result.meets_target:
+                    best_feed = trial_feed
+                    best_speed = trial_speed
+                    achievable = True
+                    break
+            if achievable:
+                break
+
+        # Compute predicted Ra at recommended parameters
+        rec_input = SurfaceFinishInput(
+            feed_per_tooth_mm=best_feed,
+            tool_nose_radius_mm=current_input.tool_nose_radius_mm,
+            cutting_speed_m_min=best_speed,
+            depth_of_cut_mm=current_input.depth_of_cut_mm,
+            tool_wear_vb_mm=current_input.tool_wear_vb_mm,
+            vibration_amplitude_mm=current_input.vibration_amplitude_mm,
+        )
+        final_result = self.predict_ra(rec_input, target_ra)
+
+        return {
+            'recommended_feed_per_tooth_mm': round(best_feed, 6),
+            'recommended_cutting_speed_m_min': round(best_speed, 2),
+            'predicted_ra': final_result.ra_predicted,
+            'achievable': achievable,
+        }
+
+    # ------------------------------------------------------------------
+    # Batch prediction
+    # ------------------------------------------------------------------
+
+    def predict_batch(
+        self,
+        inputs: List[SurfaceFinishInput],
+        target_ra: float = 1.6,
+    ) -> List[SurfaceFinishResult]:
+        """Predict Ra for a list of inputs.
+
+        Parameters
+        ----------
+        inputs:
+            Sequence of ``SurfaceFinishInput`` instances.
+        target_ra:
+            Common target Ra applied to every prediction.
+
+        Returns
+        -------
+        List of ``SurfaceFinishResult`` in the same order as *inputs*.
+        """
+        return [self.predict_ra(inp, target_ra) for inp in inputs]

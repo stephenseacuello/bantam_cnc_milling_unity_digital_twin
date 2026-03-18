@@ -1973,4 +1973,390 @@ namespace MiracleTwin.Cutting
             });
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Tool Magazine Manager
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Represents a single pocket in a tool magazine carousel.
+    /// </summary>
+    [Serializable]
+    public class MagazinePocket
+    {
+        public int pocketNumber;
+        public string toolId;       // null when empty
+        public string toolType;
+        public bool isOccupied;
+        public string lastAccessTime;
+    }
+
+    /// <summary>
+    /// Describes a planned tool-change move between two pockets.
+    /// </summary>
+    [Serializable]
+    public class ToolChangeSequence
+    {
+        public int fromPocket;
+        public int toPocket;
+        public float estimatedTimeSec;
+        public bool isOptimized;
+    }
+
+    /// <summary>
+    /// Snapshot of the magazine's current state.
+    /// </summary>
+    [Serializable]
+    public class MagazineStatus
+    {
+        public int totalPockets;
+        public int occupiedPockets;
+        public int emptyPockets;
+        public float utilizationPct;
+        public List<MagazinePocket> tools = new();
+    }
+
+    /// <summary>
+    /// Manages tool magazine pockets, tool assignments, and tool-change
+    /// optimization for a CNC machining centre.  Supports loading /
+    /// unloading tools, querying status, optimizing pocket layout based
+    /// on a planned usage order, and planning the load/unload sequence
+    /// required to prepare the magazine for a new job.
+    /// </summary>
+    public class ToolMagazineManager
+    {
+        private readonly List<MagazinePocket> _pockets = new();
+        private readonly int _magazineSize;
+
+        /// <summary>
+        /// Base time in seconds for the tool-change arm to swap one tool.
+        /// </summary>
+        private const float BaseChangeTimeSec = 4.5f;
+
+        /// <summary>
+        /// Additional time per pocket the carousel must rotate past.
+        /// </summary>
+        private const float TimePerPocketSec = 0.3f;
+
+        // ── Constructor ──────────────────────────────────────────────
+
+        public ToolMagazineManager(int magazineSize = 24)
+        {
+            if (magazineSize <= 0)
+                throw new ArgumentException("magazineSize must be positive");
+
+            _magazineSize = magazineSize;
+            for (int i = 1; i <= magazineSize; i++)
+            {
+                _pockets.Add(new MagazinePocket
+                {
+                    pocketNumber = i,
+                    toolId = null,
+                    toolType = null,
+                    isOccupied = false,
+                    lastAccessTime = null,
+                });
+            }
+        }
+
+        // ── Load / Unload ────────────────────────────────────────────
+
+        /// <summary>
+        /// Load a tool into a specific pocket.  Throws if the pocket is
+        /// out of range, already occupied, or the toolId is null/empty.
+        /// </summary>
+        public void LoadTool(int pocketNumber, string toolId, string toolType)
+        {
+            if (string.IsNullOrEmpty(toolId))
+                throw new ArgumentException("toolId must not be null or empty");
+            if (string.IsNullOrEmpty(toolType))
+                throw new ArgumentException("toolType must not be null or empty");
+
+            var pocket = GetPocket(pocketNumber);
+            if (pocket.isOccupied)
+                throw new InvalidOperationException(
+                    $"Pocket {pocketNumber} is already occupied by tool {pocket.toolId}");
+
+            pocket.toolId = toolId;
+            pocket.toolType = toolType;
+            pocket.isOccupied = true;
+            pocket.lastAccessTime = DateTime.UtcNow.ToString("o");
+        }
+
+        /// <summary>
+        /// Remove a tool from a pocket.  Throws if the pocket is out of
+        /// range or already empty.
+        /// </summary>
+        public void UnloadTool(int pocketNumber)
+        {
+            var pocket = GetPocket(pocketNumber);
+            if (!pocket.isOccupied)
+                throw new InvalidOperationException(
+                    $"Pocket {pocketNumber} is already empty");
+
+            pocket.toolId = null;
+            pocket.toolType = null;
+            pocket.isOccupied = false;
+            pocket.lastAccessTime = null;
+        }
+
+        // ── Query ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Find the pocket number that holds the given toolId.
+        /// Returns -1 if the tool is not in the magazine.
+        /// </summary>
+        public int FindTool(string toolId)
+        {
+            if (string.IsNullOrEmpty(toolId))
+                return -1;
+            foreach (var p in _pockets)
+            {
+                if (p.isOccupied && p.toolId == toolId)
+                    return p.pocketNumber;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Returns the first empty pocket number, or -1 if the magazine
+        /// is full.
+        /// </summary>
+        public int GetNextEmptyPocket()
+        {
+            foreach (var p in _pockets)
+            {
+                if (!p.isOccupied)
+                    return p.pocketNumber;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Build a snapshot of the magazine's current state.
+        /// </summary>
+        public MagazineStatus GetStatus()
+        {
+            int occupied = 0;
+            foreach (var p in _pockets)
+            {
+                if (p.isOccupied) occupied++;
+            }
+
+            return new MagazineStatus
+            {
+                totalPockets = _magazineSize,
+                occupiedPockets = occupied,
+                emptyPockets = _magazineSize - occupied,
+                utilizationPct = _magazineSize > 0
+                    ? (occupied / (float)_magazineSize) * 100f
+                    : 0f,
+                tools = new List<MagazinePocket>(_pockets),
+            };
+        }
+
+        // ── Optimization ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Rearrange tools in the magazine so that consecutively-used
+        /// tools sit in adjacent pockets, minimising carousel rotation
+        /// time.  Returns the list of ToolChangeSequence moves performed.
+        /// </summary>
+        public List<ToolChangeSequence> OptimizeLayout(List<string> toolUsageOrder)
+        {
+            if (toolUsageOrder == null || toolUsageOrder.Count == 0)
+                return new List<ToolChangeSequence>();
+
+            // Build desired pocket assignment: first tool in list → pocket 1, etc.
+            var moves = new List<ToolChangeSequence>();
+
+            // Snapshot current positions
+            var currentPositions = new Dictionary<string, int>();
+            foreach (var p in _pockets)
+            {
+                if (p.isOccupied)
+                    currentPositions[p.toolId] = p.pocketNumber;
+            }
+
+            int targetPocket = 1;
+            foreach (var toolId in toolUsageOrder)
+            {
+                if (!currentPositions.ContainsKey(toolId))
+                {
+                    targetPocket++;
+                    continue; // tool not in magazine, skip
+                }
+
+                int currentPocket = currentPositions[toolId];
+                if (currentPocket != targetPocket)
+                {
+                    // If the target pocket is occupied by another tool, swap
+                    var targetOccupant = _pockets[targetPocket - 1];
+                    if (targetOccupant.isOccupied)
+                    {
+                        // Swap the two tools
+                        string swapToolId = targetOccupant.toolId;
+                        string swapToolType = targetOccupant.toolType;
+
+                        var sourcePocket = _pockets[currentPocket - 1];
+
+                        targetOccupant.toolId = sourcePocket.toolId;
+                        targetOccupant.toolType = sourcePocket.toolType;
+
+                        sourcePocket.toolId = swapToolId;
+                        sourcePocket.toolType = swapToolType;
+
+                        // Update position tracking
+                        if (swapToolId != null)
+                            currentPositions[swapToolId] = currentPocket;
+                        currentPositions[toolId] = targetPocket;
+                    }
+                    else
+                    {
+                        // Move tool from current pocket to target pocket
+                        targetOccupant.toolId = _pockets[currentPocket - 1].toolId;
+                        targetOccupant.toolType = _pockets[currentPocket - 1].toolType;
+                        targetOccupant.isOccupied = true;
+                        targetOccupant.lastAccessTime = DateTime.UtcNow.ToString("o");
+
+                        _pockets[currentPocket - 1].toolId = null;
+                        _pockets[currentPocket - 1].toolType = null;
+                        _pockets[currentPocket - 1].isOccupied = false;
+                        _pockets[currentPocket - 1].lastAccessTime = null;
+
+                        currentPositions[toolId] = targetPocket;
+                    }
+
+                    int distance = Mathf.Abs(currentPocket - targetPocket);
+                    moves.Add(new ToolChangeSequence
+                    {
+                        fromPocket = currentPocket,
+                        toPocket = targetPocket,
+                        estimatedTimeSec = BaseChangeTimeSec + distance * TimePerPocketSec,
+                        isOptimized = true,
+                    });
+                }
+                targetPocket++;
+            }
+
+            return moves;
+        }
+
+        /// <summary>
+        /// Plan the sequence of tool loads and unloads required to prepare
+        /// the magazine for a job that needs <paramref name="requiredTools"/>.
+        /// Tools already present are kept; missing tools are loaded into
+        /// empty pockets; tools not in the required list are candidates for
+        /// unloading when space is needed.
+        /// Returns the planned ToolChangeSequence list.
+        /// </summary>
+        public List<ToolChangeSequence> PlanToolChanges(List<(string toolId, string toolType)> requiredTools)
+        {
+            if (requiredTools == null || requiredTools.Count == 0)
+                return new List<ToolChangeSequence>();
+
+            var plan = new List<ToolChangeSequence>();
+
+            // Identify which required tools are already present
+            var needed = new List<(string toolId, string toolType)>();
+            var presentIds = new HashSet<string>();
+            foreach (var p in _pockets)
+            {
+                if (p.isOccupied)
+                    presentIds.Add(p.toolId);
+            }
+
+            foreach (var req in requiredTools)
+            {
+                if (!presentIds.Contains(req.toolId))
+                    needed.Add(req);
+            }
+
+            // Build a set of required tool IDs for quick lookup
+            var requiredIds = new HashSet<string>();
+            foreach (var req in requiredTools)
+                requiredIds.Add(req.toolId);
+
+            // For each needed tool, find a pocket (prefer empty, then unload
+            // a non-required tool)
+            foreach (var tool in needed)
+            {
+                int emptyPocket = GetNextEmptyPocket();
+                if (emptyPocket != -1)
+                {
+                    LoadTool(emptyPocket, tool.toolId, tool.toolType);
+                    plan.Add(new ToolChangeSequence
+                    {
+                        fromPocket = -1,     // from external / spindle
+                        toPocket = emptyPocket,
+                        estimatedTimeSec = BaseChangeTimeSec,
+                        isOptimized = false,
+                    });
+                }
+                else
+                {
+                    // Find an occupied pocket holding a tool NOT in the required set
+                    int victimPocket = -1;
+                    foreach (var p in _pockets)
+                    {
+                        if (p.isOccupied && !requiredIds.Contains(p.toolId))
+                        {
+                            victimPocket = p.pocketNumber;
+                            break;
+                        }
+                    }
+
+                    if (victimPocket == -1)
+                        continue; // magazine full of required tools — cannot fit
+
+                    // Unload the victim, then load the new tool
+                    plan.Add(new ToolChangeSequence
+                    {
+                        fromPocket = victimPocket,
+                        toPocket = -1,       // to external storage
+                        estimatedTimeSec = BaseChangeTimeSec,
+                        isOptimized = false,
+                    });
+                    UnloadTool(victimPocket);
+
+                    LoadTool(victimPocket, tool.toolId, tool.toolType);
+                    plan.Add(new ToolChangeSequence
+                    {
+                        fromPocket = -1,
+                        toPocket = victimPocket,
+                        estimatedTimeSec = BaseChangeTimeSec,
+                        isOptimized = false,
+                    });
+                }
+            }
+
+            return plan;
+        }
+
+        // ── Helpers ──────────────────────────────────────────────────
+
+        /// <summary>
+        /// Estimate carousel rotation time between two pockets.
+        /// </summary>
+        public float EstimateChangeTime(int fromPocket, int toPocket)
+        {
+            if (fromPocket < 1 || fromPocket > _magazineSize ||
+                toPocket < 1 || toPocket > _magazineSize)
+                throw new ArgumentOutOfRangeException("pocket numbers must be between 1 and magazineSize");
+
+            int distance = Math.Abs(fromPocket - toPocket);
+            // Carousel can rotate in either direction
+            distance = Math.Min(distance, _magazineSize - distance);
+            return BaseChangeTimeSec + distance * TimePerPocketSec;
+        }
+
+        private MagazinePocket GetPocket(int pocketNumber)
+        {
+            if (pocketNumber < 1 || pocketNumber > _magazineSize)
+                throw new ArgumentOutOfRangeException(
+                    nameof(pocketNumber),
+                    $"Pocket number must be between 1 and {_magazineSize}");
+            return _pockets[pocketNumber - 1];
+        }
+    }
 }

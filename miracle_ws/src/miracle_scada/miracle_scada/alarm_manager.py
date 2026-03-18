@@ -11,7 +11,9 @@ Maintains alarm history with ISA-18.2 compliance.
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+import fnmatch
 import threading
+import time
 import uuid
 
 from rclpy.lifecycle import TransitionCallbackReturn
@@ -1061,6 +1063,284 @@ class AlarmFloodDetector:
         """During cooldown, suppress only exact duplicates of already-seen types."""
         # During cooldown we forward all alarms (no suppression by default)
         return True
+
+
+# ---------------------------------------------------------------------------
+# Alarm suppression rule manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SuppressionRule:
+    """Configurable alarm suppression rule.
+
+    Supports shelving, maintenance windows, state-based suppression, and
+    duplicate suppression with pattern matching on alarm type and machine.
+
+    Attributes:
+        rule_id: Unique identifier for this rule.
+        name: Human-readable name.
+        rule_type: One of 'shelve', 'maintenance_window', 'state_based',
+            'duplicate'.
+        alarm_type_pattern: Glob pattern for alarm types ('*' matches all,
+            'THERMAL*' matches prefix).
+        machine_pattern: Glob pattern for machine IDs.
+        start_time: Start of the suppression window (epoch seconds).
+        end_time: End of the suppression window (epoch seconds).
+        max_occurrences: Maximum number of alarm occurrences before
+            suppression kicks in (used by 'duplicate' rules).
+        window_sec: Rolling window in seconds for occurrence counting.
+        is_active: Whether the rule is currently active.
+        created_by: Operator or system that created this rule.
+        reason: Human-readable explanation for the suppression.
+    """
+    rule_id: str
+    name: str
+    rule_type: str  # 'shelve' | 'maintenance_window' | 'state_based' | 'duplicate'
+    alarm_type_pattern: str = '*'
+    machine_pattern: str = '*'
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    max_occurrences: int = 1
+    window_sec: float = 60.0
+    is_active: bool = True
+    created_by: str = ''
+    reason: str = ''
+
+
+@dataclass
+class SuppressionDecision:
+    """Result of evaluating an alarm against suppression rules.
+
+    Attributes:
+        alarm_id: The alarm identifier that was evaluated.
+        rule_id: The rule that triggered suppression (empty string if not
+            suppressed).
+        should_suppress: Whether the alarm should be suppressed.
+        reason: Human-readable explanation of the decision.
+        timestamp: When the decision was made (epoch seconds).
+    """
+    alarm_id: str
+    rule_id: str
+    should_suppress: bool
+    reason: str
+    timestamp: float
+
+
+class AlarmSuppressionRuleManager:
+    """Manages configurable alarm suppression rules.
+
+    Supports shelving (temporary suppression of an alarm type),
+    maintenance windows (suppress alarms for a machine during planned
+    downtime), state-based suppression, and duplicate suppression.
+
+    Pattern matching uses ``fnmatch``-style globs: ``'*'`` matches
+    everything, ``'THERMAL*'`` matches any type starting with THERMAL.
+    """
+
+    def __init__(self) -> None:
+        self._rules: Dict[str, SuppressionRule] = {}
+        self._history: List[SuppressionDecision] = []
+        # Track alarm occurrences for duplicate suppression:
+        # key = (alarm_type, machine_id), value = list of timestamps
+        self._occurrence_log: Dict[Tuple[str, str], List[float]] = {}
+        self._lock = threading.Lock()
+
+    # -- rule management -----------------------------------------------------
+
+    def add_rule(self, rule: SuppressionRule) -> None:
+        """Add or replace a suppression rule."""
+        with self._lock:
+            self._rules[rule.rule_id] = rule
+
+    def remove_rule(self, rule_id: str) -> bool:
+        """Remove a suppression rule by ID. Returns True if removed."""
+        with self._lock:
+            return self._rules.pop(rule_id, None) is not None
+
+    def get_active_rules(self) -> List[SuppressionRule]:
+        """Return all currently active rules."""
+        with self._lock:
+            return [r for r in self._rules.values() if r.is_active]
+
+    # -- evaluation ----------------------------------------------------------
+
+    def _matches_pattern(self, value: str, pattern: str) -> bool:
+        """Check whether *value* matches a glob *pattern*."""
+        return fnmatch.fnmatch(value, pattern)
+
+    def _is_time_valid(self, rule: SuppressionRule, timestamp: float) -> bool:
+        """Return True if *timestamp* falls within the rule's time window."""
+        if rule.start_time is not None and timestamp < rule.start_time:
+            return False
+        if rule.end_time is not None and timestamp > rule.end_time:
+            return False
+        return True
+
+    def _check_duplicate(
+        self, alarm_type: str, machine_id: str, timestamp: float,
+        rule: SuppressionRule,
+    ) -> bool:
+        """Return True if duplicate threshold has been exceeded."""
+        key = (alarm_type, machine_id)
+        timestamps = self._occurrence_log.get(key, [])
+        # Trim to window
+        cutoff = timestamp - rule.window_sec
+        timestamps = [t for t in timestamps if t >= cutoff]
+        self._occurrence_log[key] = timestamps
+        return len(timestamps) >= rule.max_occurrences
+
+    def evaluate(
+        self,
+        alarm_id: str,
+        alarm_type: str,
+        machine_id: str,
+        severity: float,
+        timestamp: float,
+    ) -> SuppressionDecision:
+        """Evaluate an alarm against all active suppression rules.
+
+        Returns a ``SuppressionDecision``.  The first matching rule wins.
+        Occurrence tracking for duplicate suppression is updated regardless
+        of whether the alarm is ultimately suppressed.
+
+        Args:
+            alarm_id: Unique identifier of the alarm being evaluated.
+            alarm_type: Type/category of the alarm (e.g. 'THERMAL').
+            machine_id: Source machine identifier.
+            severity: Alarm severity (0.0-1.0).
+            timestamp: Alarm timestamp (epoch seconds).
+        """
+        with self._lock:
+            # Record occurrence for duplicate tracking
+            occ_key = (alarm_type, machine_id)
+            self._occurrence_log.setdefault(occ_key, []).append(timestamp)
+
+            for rule in self._rules.values():
+                if not rule.is_active:
+                    continue
+                if not self._matches_pattern(alarm_type, rule.alarm_type_pattern):
+                    continue
+                if not self._matches_pattern(machine_id, rule.machine_pattern):
+                    continue
+                if not self._is_time_valid(rule, timestamp):
+                    continue
+
+                # Rule-type specific checks
+                if rule.rule_type == 'duplicate':
+                    if not self._check_duplicate(alarm_type, machine_id, timestamp, rule):
+                        continue
+
+                decision = SuppressionDecision(
+                    alarm_id=alarm_id,
+                    rule_id=rule.rule_id,
+                    should_suppress=True,
+                    reason=f'Suppressed by rule {rule.rule_id!r} ({rule.rule_type}): {rule.reason}',
+                    timestamp=timestamp,
+                )
+                self._history.append(decision)
+                return decision
+
+            # No rule matched — allow the alarm
+            decision = SuppressionDecision(
+                alarm_id=alarm_id,
+                rule_id='',
+                should_suppress=False,
+                reason='No suppression rule matched',
+                timestamp=timestamp,
+            )
+            self._history.append(decision)
+            return decision
+
+    # -- convenience methods -------------------------------------------------
+
+    def shelve_alarm_type(
+        self,
+        alarm_type: str,
+        duration_sec: float,
+        reason: str = '',
+        created_by: str = '',
+    ) -> SuppressionRule:
+        """Temporarily suppress all alarms of the given type.
+
+        Creates a 'shelve' rule that expires after *duration_sec* seconds.
+
+        Args:
+            alarm_type: Exact alarm type (or glob pattern) to shelve.
+            duration_sec: How long to shelve, in seconds.
+            reason: Human-readable reason for shelving.
+            created_by: Operator ID.
+
+        Returns:
+            The created ``SuppressionRule``.
+        """
+        now = time.time()
+        rule = SuppressionRule(
+            rule_id=f'shelve_{uuid.uuid4().hex[:8]}',
+            name=f'Shelve {alarm_type}',
+            rule_type='shelve',
+            alarm_type_pattern=alarm_type,
+            machine_pattern='*',
+            start_time=now,
+            end_time=now + duration_sec,
+            is_active=True,
+            created_by=created_by,
+            reason=reason,
+        )
+        self.add_rule(rule)
+        return rule
+
+    def add_maintenance_window(
+        self,
+        machine_id: str,
+        start_time: float,
+        end_time: float,
+        reason: str = '',
+    ) -> SuppressionRule:
+        """Suppress all alarms for a machine during a maintenance window.
+
+        Args:
+            machine_id: Machine ID (or glob pattern).
+            start_time: Window start (epoch seconds).
+            end_time: Window end (epoch seconds).
+            reason: Human-readable reason.
+
+        Returns:
+            The created ``SuppressionRule``.
+        """
+        rule = SuppressionRule(
+            rule_id=f'maint_{uuid.uuid4().hex[:8]}',
+            name=f'Maintenance window for {machine_id}',
+            rule_type='maintenance_window',
+            alarm_type_pattern='*',
+            machine_pattern=machine_id,
+            start_time=start_time,
+            end_time=end_time,
+            is_active=True,
+            created_by='system',
+            reason=reason,
+        )
+        self.add_rule(rule)
+        return rule
+
+    def get_suppression_history(self) -> List[SuppressionDecision]:
+        """Return all past suppression decisions."""
+        with self._lock:
+            return list(self._history)
+
+    def get_active_shelves(self) -> List[SuppressionRule]:
+        """Return currently active shelved alarm types.
+
+        A shelf is considered active if it is a 'shelve' rule, is marked
+        active, and its end_time has not yet passed.
+        """
+        now = time.time()
+        with self._lock:
+            return [
+                r for r in self._rules.values()
+                if r.rule_type == 'shelve'
+                and r.is_active
+                and (r.end_time is None or r.end_time > now)
+            ]
 
 
 class AlarmManagerNode(MiracleLifecycleNode):

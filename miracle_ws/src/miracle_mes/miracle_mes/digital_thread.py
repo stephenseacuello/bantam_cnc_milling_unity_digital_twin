@@ -1419,6 +1419,169 @@ class ProductionOrderScheduler:
         }
 
 
+# ------------------------------------------------------------------
+# Inventory tracking
+# ------------------------------------------------------------------
+
+@dataclass
+class InventoryItem:
+    """A single inventory item with stock levels and reorder parameters."""
+
+    item_id: str
+    name: str
+    category: str  # 'raw_material' | 'wip' | 'finished_good' | 'consumable' | 'tooling'
+    quantity: float
+    unit: str
+    location: str
+    reorder_point: float
+    reorder_quantity: float
+    unit_cost: float
+    last_updated: float = 0.0
+
+
+@dataclass
+class InventoryTransaction:
+    """A single inventory transaction record."""
+
+    transaction_id: str
+    item_id: str
+    transaction_type: str  # 'receive' | 'issue' | 'adjust' | 'scrap' | 'return'
+    quantity: float
+    timestamp: float
+    reference: str
+    operator: str
+
+
+class InventoryTracker:
+    """Tracks raw material and finished goods inventory levels.
+
+    Provides methods for recording transactions, computing reorder alerts,
+    calculating inventory value, and forecasting stockouts based on
+    historical consumption rates.
+    """
+
+    def __init__(self) -> None:
+        self._items: Dict[str, InventoryItem] = {}
+        self._transactions: List[InventoryTransaction] = []
+        self._lock = threading.Lock()
+
+    # -- Item CRUD -------------------------------------------------------
+
+    def add_item(self, item: InventoryItem) -> None:
+        """Register a new inventory item."""
+        with self._lock:
+            self._items[item.item_id] = item
+
+    def get_item(self, item_id: str) -> Optional[InventoryItem]:
+        """Return an inventory item by its id, or ``None``."""
+        with self._lock:
+            return self._items.get(item_id)
+
+    def get_all_items(self) -> List[InventoryItem]:
+        """Return every registered inventory item."""
+        with self._lock:
+            return list(self._items.values())
+
+    # -- Transactions ----------------------------------------------------
+
+    def record_transaction(self, transaction: InventoryTransaction) -> None:
+        """Record an inventory transaction and update the item quantity.
+
+        Transaction types that *increase* stock: ``receive``, ``return``.
+        Transaction types that *decrease* stock: ``issue``, ``scrap``.
+        ``adjust`` sets the quantity to exactly ``transaction.quantity``.
+        """
+        with self._lock:
+            item = self._items.get(transaction.item_id)
+            if item is None:
+                raise KeyError(
+                    f"Unknown item_id: {transaction.item_id}"
+                )
+
+            if transaction.transaction_type in ('receive', 'return'):
+                item.quantity += transaction.quantity
+            elif transaction.transaction_type in ('issue', 'scrap'):
+                item.quantity -= transaction.quantity
+            elif transaction.transaction_type == 'adjust':
+                item.quantity = transaction.quantity
+            else:
+                raise ValueError(
+                    f"Unknown transaction_type: {transaction.transaction_type}"
+                )
+
+            item.last_updated = transaction.timestamp
+            self._transactions.append(transaction)
+
+    # -- Queries ---------------------------------------------------------
+
+    def get_reorder_alerts(self) -> List[InventoryItem]:
+        """Return items whose quantity is at or below their reorder point."""
+        with self._lock:
+            return [
+                item for item in self._items.values()
+                if item.quantity <= item.reorder_point
+            ]
+
+    def get_inventory_value(self) -> Dict[str, float]:
+        """Return total inventory value grouped by category."""
+        with self._lock:
+            value_by_category: Dict[str, float] = {}
+            for item in self._items.values():
+                value_by_category[item.category] = (
+                    value_by_category.get(item.category, 0.0)
+                    + item.quantity * item.unit_cost
+                )
+            return value_by_category
+
+    def get_transaction_history(
+        self, item_id: str
+    ) -> List[InventoryTransaction]:
+        """Return all transactions for *item_id*, ordered by timestamp."""
+        with self._lock:
+            return sorted(
+                [t for t in self._transactions if t.item_id == item_id],
+                key=lambda t: t.timestamp,
+            )
+
+    # -- Analytics -------------------------------------------------------
+
+    def get_consumption_rate(self, item_id: str, days: float) -> float:
+        """Return the average daily consumption over the last *days* days.
+
+        Only ``issue`` and ``scrap`` transactions are counted as
+        consumption.  Returns ``0.0`` when there are no qualifying
+        transactions in the window.
+        """
+        now = time.time()
+        window_start = now - days * 86400.0
+        with self._lock:
+            total_consumed = sum(
+                t.quantity
+                for t in self._transactions
+                if t.item_id == item_id
+                and t.transaction_type in ('issue', 'scrap')
+                and t.timestamp >= window_start
+            )
+        if days <= 0:
+            return 0.0
+        return total_consumed / days
+
+    def forecast_stockout(self, item_id: str, lookback_days: float = 30.0) -> Optional[float]:
+        """Predict the number of days until *item_id* reaches zero stock.
+
+        Uses :meth:`get_consumption_rate` over *lookback_days* to
+        extrapolate.  Returns ``None`` when there is no consumption
+        (infinite runway) or the item does not exist.
+        """
+        item = self.get_item(item_id)
+        if item is None:
+            return None
+        rate = self.get_consumption_rate(item_id, lookback_days)
+        if rate <= 0:
+            return None
+        return item.quantity / rate
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

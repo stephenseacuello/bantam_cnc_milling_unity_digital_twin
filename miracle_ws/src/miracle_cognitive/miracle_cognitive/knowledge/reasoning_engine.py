@@ -12,6 +12,7 @@ from enum import Enum
 from collections import deque
 from itertools import combinations
 from math import comb
+import math
 import threading
 import time
 
@@ -1360,6 +1361,171 @@ class FaultDiagnosisTree:
         _dfs(self._root_id)
 
         return errors
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Learning Rate Scheduler
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LearningEpisode:
+    """Record of a single learning episode for adaptive model updates."""
+    episode_id: int
+    timestamp: float
+    learning_rate: float
+    loss: float
+    metric_value: float
+    model_name: str
+
+
+@dataclass
+class SchedulerConfig:
+    """Configuration for the adaptive learning rate scheduler."""
+    initial_lr: float = 0.01
+    min_lr: float = 0.0001
+    max_lr: float = 0.1
+    patience: int = 5
+    decay_factor: float = 0.5
+    warmup_episodes: int = 10
+
+
+class AdaptiveLearningScheduler:
+    """Manages learning rate schedules for adaptive manufacturing models.
+
+    Supports three scheduling strategies that compose together:
+    - **Warmup**: linearly ramp from ``min_lr`` to ``initial_lr`` over the
+      first ``warmup_episodes`` episodes.
+    - **Plateau**: reduce the learning rate by ``decay_factor`` when the loss
+      has not improved for ``patience`` consecutive episodes.
+    - **Cosine annealing**: optionally apply cosine decay over a fixed cycle
+      length, oscillating between the current LR and ``min_lr``.
+
+    The scheduler tracks every episode and exposes helpers for early stopping,
+    best-episode retrieval, and full history inspection.
+    """
+
+    def __init__(
+        self,
+        config: Optional[SchedulerConfig] = None,
+        model_name: str = 'default',
+        use_cosine_annealing: bool = False,
+        cosine_cycle_length: int = 50,
+    ) -> None:
+        self._config = config or SchedulerConfig()
+        self._model_name = model_name
+        self._use_cosine_annealing = use_cosine_annealing
+        self._cosine_cycle_length = max(cosine_cycle_length, 1)
+
+        # Mutable state
+        self._current_lr: float = self._config.initial_lr
+        self._episodes: List[LearningEpisode] = []
+        self._best_loss: Optional[float] = None
+        self._episodes_since_improvement: int = 0
+        self._episode_counter: int = 0
+
+    # -- public API --
+
+    def get_learning_rate(self) -> float:
+        """Return the current learning rate."""
+        return self._current_lr
+
+    def step(self, loss: float, metric_value: float = 0.0) -> float:
+        """Record an episode and adjust the learning rate.
+
+        Parameters
+        ----------
+        loss : float
+            Training loss for this episode.
+        metric_value : float, optional
+            An auxiliary metric (e.g. accuracy) to store alongside the loss.
+
+        Returns
+        -------
+        float
+            The learning rate that will be used for the *next* episode.
+        """
+        episode = LearningEpisode(
+            episode_id=self._episode_counter,
+            timestamp=time.time(),
+            learning_rate=self._current_lr,
+            loss=loss,
+            metric_value=metric_value,
+            model_name=self._model_name,
+        )
+        self._episodes.append(episode)
+        self._episode_counter += 1
+
+        # --- Warmup phase ---
+        if self._episode_counter <= self._config.warmup_episodes:
+            progress = self._episode_counter / self._config.warmup_episodes
+            self._current_lr = (
+                self._config.min_lr
+                + (self._config.initial_lr - self._config.min_lr) * progress
+            )
+            return self._current_lr
+
+        # --- Track improvement for plateau logic ---
+        if self._best_loss is None or loss < self._best_loss:
+            self._best_loss = loss
+            self._episodes_since_improvement = 0
+        else:
+            self._episodes_since_improvement += 1
+
+        # --- Plateau decay ---
+        if self._episodes_since_improvement >= self._config.patience:
+            self._current_lr = max(
+                self._current_lr * self._config.decay_factor,
+                self._config.min_lr,
+            )
+            self._episodes_since_improvement = 0
+
+        # --- Cosine annealing (applied on top of current LR) ---
+        if self._use_cosine_annealing:
+            # Episode index within the current cosine cycle
+            t = (self._episode_counter - self._config.warmup_episodes) % self._cosine_cycle_length
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t / self._cosine_cycle_length))
+            self._current_lr = (
+                self._config.min_lr
+                + (self._current_lr - self._config.min_lr) * cosine_factor
+            )
+
+        # Clamp
+        self._current_lr = max(self._current_lr, self._config.min_lr)
+        self._current_lr = min(self._current_lr, self._config.max_lr)
+
+        return self._current_lr
+
+    def reset(self) -> None:
+        """Reset the scheduler to its initial state."""
+        self._current_lr = self._config.initial_lr
+        self._episodes.clear()
+        self._best_loss = None
+        self._episodes_since_improvement = 0
+        self._episode_counter = 0
+
+    def get_history(self) -> List[LearningEpisode]:
+        """Return all recorded learning episodes."""
+        return list(self._episodes)
+
+    def get_best_episode(self) -> Optional[LearningEpisode]:
+        """Return the episode with the lowest loss, or *None* if no episodes."""
+        if not self._episodes:
+            return None
+        return min(self._episodes, key=lambda e: e.loss)
+
+    def should_stop_early(
+        self,
+        min_episodes: int = 20,
+        no_improve_limit: int = 10,
+    ) -> bool:
+        """Check whether training should stop early.
+
+        Returns ``True`` when at least *min_episodes* have been recorded **and**
+        the loss has not improved for *no_improve_limit* consecutive episodes.
+        """
+        if len(self._episodes) < min_episodes:
+            return False
+        return self._episodes_since_improvement >= no_improve_limit
 
 
 def main(args=None):

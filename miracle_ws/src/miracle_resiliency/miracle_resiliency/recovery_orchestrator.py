@@ -2054,6 +2054,187 @@ class ConfigVersionManager:
         raise KeyError(f"Version '{version_id}' not found")
 
 
+class DegradationLevel(Enum):
+    """System degradation levels ordered by severity."""
+    NORMAL = 0
+    REDUCED = 1
+    MINIMAL = 2
+    EMERGENCY = 3
+    SHUTDOWN = 4
+
+
+@dataclass
+class FallbackStrategy:
+    """A fallback strategy to activate when a component fails."""
+    strategy_id: str
+    component: str
+    degradation_level: DegradationLevel
+    action: str
+    description: str
+    priority: int
+
+
+@dataclass
+class SystemStatus:
+    """Snapshot of current system degradation status."""
+    current_level: DegradationLevel
+    active_fallbacks: List[str]
+    failed_components: List[str]
+    available_capabilities: List[str]
+    timestamp: float
+
+
+# Components whose failure immediately triggers SHUTDOWN level.
+_CRITICAL_COMPONENTS = frozenset({
+    'emergency_stop', 'safety_monitor', 'safety_controller',
+})
+
+
+class GracefulDegradationManager:
+    """Manages system degradation levels and fallback strategies.
+
+    Tracks registered components and their capabilities.  When a
+    component failure is reported the manager activates matching
+    fallback strategies and recomputes the overall degradation level.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # component_name -> list of capability strings
+        self._components: Dict[str, List[str]] = {}
+        self._failed_components: Dict[str, str] = {}  # name -> reason
+        self._fallbacks: Dict[str, FallbackStrategy] = {}  # strategy_id -> strategy
+        self._active_fallback_ids: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
+
+    def register_component(self, component_name: str, capabilities: List[str]) -> None:
+        """Register a system component and its capabilities."""
+        with self._lock:
+            self._components[component_name] = list(capabilities)
+
+    def add_fallback(self, strategy: FallbackStrategy) -> None:
+        """Register a fallback strategy."""
+        with self._lock:
+            self._fallbacks[strategy.strategy_id] = strategy
+
+    # ------------------------------------------------------------------
+    # Failure / recovery reporting
+    # ------------------------------------------------------------------
+
+    def report_failure(self, component_name: str, reason: str) -> DegradationLevel:
+        """Report a component failure and trigger matching fallbacks.
+
+        Returns the new degradation level after processing the failure.
+        """
+        with self._lock:
+            self._failed_components[component_name] = reason
+            # Activate matching fallback strategies (sorted by priority)
+            matching = sorted(
+                [
+                    fb for fb in self._fallbacks.values()
+                    if fb.component == component_name
+                    and fb.strategy_id not in self._active_fallback_ids
+                ],
+                key=lambda fb: fb.priority,
+            )
+            for fb in matching:
+                self._active_fallback_ids.append(fb.strategy_id)
+            return self._compute_level()
+
+    def report_recovery(self, component_name: str) -> DegradationLevel:
+        """Report that a component has recovered.
+
+        Deactivates any fallback strategies for the component and
+        returns the new degradation level.
+        """
+        with self._lock:
+            self._failed_components.pop(component_name, None)
+            # Deactivate fallbacks tied to the recovered component
+            recovered_ids = {
+                fb.strategy_id
+                for fb in self._fallbacks.values()
+                if fb.component == component_name
+            }
+            self._active_fallback_ids = [
+                sid for sid in self._active_fallback_ids
+                if sid not in recovered_ids
+            ]
+            return self._compute_level()
+
+    # ------------------------------------------------------------------
+    # Status queries
+    # ------------------------------------------------------------------
+
+    def get_status(self) -> SystemStatus:
+        """Return the current system status snapshot."""
+        with self._lock:
+            return SystemStatus(
+                current_level=self._compute_level(),
+                active_fallbacks=list(self._active_fallback_ids),
+                failed_components=list(self._failed_components.keys()),
+                available_capabilities=self._available_capabilities(),
+                timestamp=time.time(),
+            )
+
+    def get_available_capabilities(self) -> List[str]:
+        """Return a list of capabilities still available."""
+        with self._lock:
+            return self._available_capabilities()
+
+    def get_degradation_level(self) -> DegradationLevel:
+        """Compute and return the overall degradation level."""
+        with self._lock:
+            return self._compute_level()
+
+    def can_operate(self, required_capabilities: List[str]) -> bool:
+        """Check whether all *required_capabilities* are still available."""
+        with self._lock:
+            available = set(self._available_capabilities())
+            return all(cap in available for cap in required_capabilities)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _compute_level(self) -> DegradationLevel:
+        """Determine the degradation level based on failed components.
+
+        Rules:
+        - 0 failures  -> NORMAL
+        - 1-2 failures -> REDUCED
+        - 3-4 failures -> MINIMAL
+        - 5+ failures  -> EMERGENCY
+        - Any critical component failed -> SHUTDOWN
+        """
+        failed = set(self._failed_components.keys())
+        if failed & _CRITICAL_COMPONENTS:
+            return DegradationLevel.SHUTDOWN
+        n = len(failed)
+        if n == 0:
+            return DegradationLevel.NORMAL
+        if n <= 2:
+            return DegradationLevel.REDUCED
+        if n <= 4:
+            return DegradationLevel.MINIMAL
+        return DegradationLevel.EMERGENCY
+
+    def _available_capabilities(self) -> List[str]:
+        """Return de-duplicated list of capabilities from healthy components."""
+        caps: List[str] = []
+        seen: set = set()
+        failed = set(self._failed_components.keys())
+        for comp, comp_caps in self._components.items():
+            if comp not in failed:
+                for c in comp_caps:
+                    if c not in seen:
+                        seen.add(c)
+                        caps.append(c)
+        return caps
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

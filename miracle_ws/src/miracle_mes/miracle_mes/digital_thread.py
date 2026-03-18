@@ -1582,6 +1582,330 @@ class InventoryTracker:
         return item.quantity / rate
 
 
+# ------------------------------------------------------------------
+# SPC Run Rules Engine (Nelson Rules)
+# ------------------------------------------------------------------
+
+@dataclass
+class RunRuleViolation:
+    """A single violation detected by the SPC Run Rules Engine."""
+
+    rule_number: int
+    rule_name: str
+    start_index: int
+    end_index: int
+    severity: str  # 'warning' | 'action'
+    description: str
+    values: List[float] = field(default_factory=list)
+
+
+@dataclass
+class SPCAnalysis:
+    """Result of an SPC analysis over a set of measurement data."""
+
+    mean: float
+    std: float
+    ucl: float
+    lcl: float
+    violations: List[RunRuleViolation] = field(default_factory=list)
+    in_control: bool = True
+    total_points: int = 0
+
+
+class SPCRunRulesEngine:
+    """Evaluates Statistical Process Control run rules (Nelson rules).
+
+    The eight Nelson rules are standard tests applied to control-chart
+    data to detect non-random patterns that indicate special-cause
+    variation.  Each rule returns a list of :class:`RunRuleViolation`
+    instances.
+    """
+
+    _RULE_DESCRIPTIONS: Dict[int, str] = {
+        1: 'One point beyond 3 sigma from the centre line',
+        2: 'Nine consecutive points on the same side of the centre line',
+        3: 'Six consecutive points steadily increasing or decreasing',
+        4: 'Fourteen consecutive points alternating up and down',
+        5: 'Two out of three consecutive points beyond 2 sigma (same side)',
+        6: 'Four out of five consecutive points beyond 1 sigma (same side)',
+        7: 'Fifteen consecutive points within 1 sigma of the centre line (stratification)',
+        8: 'Eight consecutive points beyond 1 sigma on both sides (mixture)',
+    }
+
+    # ----- public API --------------------------------------------------
+
+    def analyze(
+        self,
+        data: List[float],
+        target_mean: Optional[float] = None,
+        target_std: Optional[float] = None,
+    ) -> SPCAnalysis:
+        """Run all eight Nelson rules and return an :class:`SPCAnalysis`.
+
+        Parameters
+        ----------
+        data:
+            Sequence of measured values (at least 1 element).
+        target_mean:
+            Known process mean.  If *None* the sample mean is used.
+        target_std:
+            Known process standard deviation.  If *None* the sample std
+            is used (ddof=1 when len > 1).
+        """
+        n = len(data)
+        if n == 0:
+            return SPCAnalysis(
+                mean=0.0, std=0.0, ucl=0.0, lcl=0.0,
+                violations=[], in_control=True, total_points=0,
+            )
+
+        mean = target_mean if target_mean is not None else sum(data) / n
+        if target_std is not None:
+            std = target_std
+        elif n > 1:
+            variance = sum((x - mean) ** 2 for x in data) / (n - 1)
+            std = variance ** 0.5
+        else:
+            std = 0.0
+
+        ucl = mean + 3.0 * std
+        lcl = mean - 3.0 * std
+
+        violations: List[RunRuleViolation] = []
+        for rule_num in range(1, 9):
+            violations.extend(self.check_rule(rule_num, data, mean, std))
+
+        in_control = len(violations) == 0
+
+        return SPCAnalysis(
+            mean=mean,
+            std=std,
+            ucl=ucl,
+            lcl=lcl,
+            violations=violations,
+            in_control=in_control,
+            total_points=n,
+        )
+
+    def check_rule(
+        self,
+        rule_number: int,
+        data: List[float],
+        mean: float,
+        std: float,
+    ) -> List[RunRuleViolation]:
+        """Evaluate a single Nelson rule and return any violations."""
+        handler = {
+            1: self._rule_1,
+            2: self._rule_2,
+            3: self._rule_3,
+            4: self._rule_4,
+            5: self._rule_5,
+            6: self._rule_6,
+            7: self._rule_7,
+            8: self._rule_8,
+        }.get(rule_number)
+        if handler is None:
+            raise ValueError(f'Unknown rule number: {rule_number}')
+        return handler(data, mean, std)
+
+    def get_rule_description(self, rule_number: int) -> str:
+        """Return a human-readable description for *rule_number*."""
+        desc = self._RULE_DESCRIPTIONS.get(rule_number)
+        if desc is None:
+            raise ValueError(f'Unknown rule number: {rule_number}')
+        return desc
+
+    # ----- individual rules -------------------------------------------
+
+    def _rule_1(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 1: Any single point beyond 3 sigma."""
+        violations: List[RunRuleViolation] = []
+        if std == 0:
+            return violations
+        for i, x in enumerate(data):
+            if abs(x - mean) > 3.0 * std:
+                violations.append(RunRuleViolation(
+                    rule_number=1,
+                    rule_name='Beyond 3 sigma',
+                    start_index=i,
+                    end_index=i,
+                    severity='action',
+                    description=self._RULE_DESCRIPTIONS[1],
+                    values=[x],
+                ))
+        return violations
+
+    def _rule_2(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 2: Nine consecutive points on the same side of the mean."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        run_length = 9
+        if n < run_length:
+            return violations
+        for i in range(n - run_length + 1):
+            window = data[i:i + run_length]
+            above = all(x > mean for x in window)
+            below = all(x < mean for x in window)
+            if above or below:
+                violations.append(RunRuleViolation(
+                    rule_number=2,
+                    rule_name='9 points same side',
+                    start_index=i,
+                    end_index=i + run_length - 1,
+                    severity='action',
+                    description=self._RULE_DESCRIPTIONS[2],
+                    values=list(window),
+                ))
+        return violations
+
+    def _rule_3(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 3: Six consecutive points steadily increasing or decreasing."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        run_length = 6
+        if n < run_length:
+            return violations
+        for i in range(n - run_length + 1):
+            window = data[i:i + run_length]
+            increasing = all(window[j + 1] > window[j] for j in range(run_length - 1))
+            decreasing = all(window[j + 1] < window[j] for j in range(run_length - 1))
+            if increasing or decreasing:
+                violations.append(RunRuleViolation(
+                    rule_number=3,
+                    rule_name='6 points trending',
+                    start_index=i,
+                    end_index=i + run_length - 1,
+                    severity='warning',
+                    description=self._RULE_DESCRIPTIONS[3],
+                    values=list(window),
+                ))
+        return violations
+
+    def _rule_4(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 4: Fourteen consecutive points alternating up and down."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        run_length = 14
+        if n < run_length:
+            return violations
+        for i in range(n - run_length + 1):
+            window = data[i:i + run_length]
+            alternating = True
+            for j in range(run_length - 2):
+                d1 = window[j + 1] - window[j]
+                d2 = window[j + 2] - window[j + 1]
+                if d1 == 0 or d2 == 0 or (d1 > 0) == (d2 > 0):
+                    alternating = False
+                    break
+            if alternating:
+                violations.append(RunRuleViolation(
+                    rule_number=4,
+                    rule_name='14 points alternating',
+                    start_index=i,
+                    end_index=i + run_length - 1,
+                    severity='warning',
+                    description=self._RULE_DESCRIPTIONS[4],
+                    values=list(window),
+                ))
+        return violations
+
+    def _rule_5(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 5: Two of three consecutive points beyond 2 sigma (same side)."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        if n < 3 or std == 0:
+            return violations
+        two_sigma = 2.0 * std
+        for i in range(n - 2):
+            window = data[i:i + 3]
+            above_count = sum(1 for x in window if x - mean > two_sigma)
+            below_count = sum(1 for x in window if mean - x > two_sigma)
+            if above_count >= 2 or below_count >= 2:
+                violations.append(RunRuleViolation(
+                    rule_number=5,
+                    rule_name='2 of 3 beyond 2 sigma',
+                    start_index=i,
+                    end_index=i + 2,
+                    severity='warning',
+                    description=self._RULE_DESCRIPTIONS[5],
+                    values=list(window),
+                ))
+        return violations
+
+    def _rule_6(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 6: Four of five consecutive points beyond 1 sigma (same side)."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        if n < 5 or std == 0:
+            return violations
+        one_sigma = 1.0 * std
+        for i in range(n - 4):
+            window = data[i:i + 5]
+            above_count = sum(1 for x in window if x - mean > one_sigma)
+            below_count = sum(1 for x in window if mean - x > one_sigma)
+            if above_count >= 4 or below_count >= 4:
+                violations.append(RunRuleViolation(
+                    rule_number=6,
+                    rule_name='4 of 5 beyond 1 sigma',
+                    start_index=i,
+                    end_index=i + 4,
+                    severity='warning',
+                    description=self._RULE_DESCRIPTIONS[6],
+                    values=list(window),
+                ))
+        return violations
+
+    def _rule_7(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 7: Fifteen consecutive points within 1 sigma (stratification)."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        run_length = 15
+        if n < run_length or std == 0:
+            return violations
+        one_sigma = 1.0 * std
+        for i in range(n - run_length + 1):
+            window = data[i:i + run_length]
+            if all(abs(x - mean) <= one_sigma for x in window):
+                violations.append(RunRuleViolation(
+                    rule_number=7,
+                    rule_name='15 points within 1 sigma',
+                    start_index=i,
+                    end_index=i + run_length - 1,
+                    severity='warning',
+                    description=self._RULE_DESCRIPTIONS[7],
+                    values=list(window),
+                ))
+        return violations
+
+    def _rule_8(self, data: List[float], mean: float, std: float) -> List[RunRuleViolation]:
+        """Rule 8: Eight consecutive points beyond 1 sigma on both sides (mixture)."""
+        violations: List[RunRuleViolation] = []
+        n = len(data)
+        run_length = 8
+        if n < run_length or std == 0:
+            return violations
+        one_sigma = 1.0 * std
+        for i in range(n - run_length + 1):
+            window = data[i:i + run_length]
+            all_beyond = all(abs(x - mean) > one_sigma for x in window)
+            if not all_beyond:
+                continue
+            has_above = any(x > mean for x in window)
+            has_below = any(x < mean for x in window)
+            if has_above and has_below:
+                violations.append(RunRuleViolation(
+                    rule_number=8,
+                    rule_name='8 points beyond 1 sigma (mixture)',
+                    start_index=i,
+                    end_index=i + run_length - 1,
+                    severity='action',
+                    description=self._RULE_DESCRIPTIONS[8],
+                    values=list(window),
+                ))
+        return violations
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

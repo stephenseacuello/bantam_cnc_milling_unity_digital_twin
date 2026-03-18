@@ -1528,6 +1528,280 @@ class AdaptiveLearningScheduler:
         return self._episodes_since_improvement >= no_improve_limit
 
 
+# ---------------------------------------------------------------------------
+# Causal Impact Analyzer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParameterChange:
+    """A recorded change to a manufacturing parameter."""
+    parameter_name: str
+    old_value: float
+    new_value: float
+    timestamp: float
+    change_type: str  # 'manual' | 'automatic' | 'drift'
+
+    @property
+    def magnitude(self) -> float:
+        """Absolute magnitude of the change."""
+        return abs(self.new_value - self.old_value)
+
+    @property
+    def direction_sign(self) -> float:
+        """Sign of the change: +1, -1, or 0."""
+        diff = self.new_value - self.old_value
+        if diff > 0:
+            return 1.0
+        elif diff < 0:
+            return -1.0
+        return 0.0
+
+
+@dataclass
+class OutcomeObservation:
+    """An observed outcome metric at a point in time."""
+    metric_name: str
+    value: float
+    timestamp: float
+
+
+@dataclass
+class ImpactResult:
+    """Result of analysing the impact of a parameter on an outcome metric."""
+    parameter_name: str
+    metric_name: str
+    correlation: float
+    impact_magnitude: float
+    confidence: float
+    direction: str  # 'positive' | 'negative' | 'neutral'
+    lag_sec: float
+
+
+@dataclass
+class ImpactReport:
+    """Aggregated report of parameter impacts on manufacturing outcomes."""
+    changes: List['ParameterChange']
+    impacts: List[ImpactResult]
+    summary: str
+    timestamp: float
+
+
+class CausalImpactAnalyzer:
+    """Analyses the impact of parameter changes on manufacturing outcomes.
+
+    Records parameter changes and outcome metric observations, then computes
+    Pearson correlation between change magnitudes and outcome deltas within
+    configurable time windows. This enables operators to understand which
+    parameter adjustments have the largest effect on quality, throughput, and
+    other KPIs.
+    """
+
+    def __init__(self) -> None:
+        self._changes: List[ParameterChange] = []
+        self._outcomes: List[OutcomeObservation] = []
+        self._lock = threading.Lock()
+
+    # -- recording --
+
+    def record_change(self, change: ParameterChange) -> None:
+        """Record a parameter change event."""
+        with self._lock:
+            self._changes.append(change)
+
+    def record_outcome(self, observation: OutcomeObservation) -> None:
+        """Record an outcome metric observation."""
+        with self._lock:
+            self._outcomes.append(observation)
+
+    # -- analysis helpers --
+
+    @staticmethod
+    def _pearson(xs: List[float], ys: List[float]) -> float:
+        """Compute Pearson correlation coefficient for two equal-length lists.
+
+        Returns 0.0 when the inputs are too short or have zero variance.
+        """
+        n = len(xs)
+        if n < 2 or n != len(ys):
+            return 0.0
+
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+        var_x = sum((x - mean_x) ** 2 for x in xs)
+        var_y = sum((y - mean_y) ** 2 for y in ys)
+
+        denom = math.sqrt(var_x * var_y)
+        if denom == 0.0:
+            return 0.0
+        return cov / denom
+
+    def _outcomes_for_metric(self, metric_name: str) -> List[OutcomeObservation]:
+        """Return outcome observations for the given metric, sorted by time."""
+        return sorted(
+            [o for o in self._outcomes if o.metric_name == metric_name],
+            key=lambda o: o.timestamp,
+        )
+
+    def _outcome_delta_after(
+        self, metric_name: str, t_start: float, window_sec: float,
+    ) -> Optional[float]:
+        """Compute the outcome metric change within a window after *t_start*.
+
+        Returns the difference between the last and first observations found
+        in the interval ``[t_start, t_start + window_sec]``, or *None* if
+        fewer than two observations fall inside the window.
+        """
+        t_end = t_start + window_sec
+        relevant = [
+            o for o in self._outcomes
+            if o.metric_name == metric_name and t_start <= o.timestamp <= t_end
+        ]
+        relevant.sort(key=lambda o: o.timestamp)
+        if len(relevant) < 2:
+            return None
+        return relevant[-1].value - relevant[0].value
+
+    # -- public analysis API --
+
+    def analyze_impact(
+        self,
+        parameter_name: str,
+        metric_name: str,
+        window_sec: float = 60.0,
+    ) -> ImpactResult:
+        """Compute the impact of *parameter_name* changes on *metric_name*.
+
+        For every recorded change of *parameter_name*, the method looks at the
+        outcome metric delta within *window_sec* seconds after the change.  It
+        then computes the Pearson correlation between change magnitudes and
+        outcome deltas.
+
+        Parameters
+        ----------
+        parameter_name : str
+            Name of the manufacturing parameter whose changes to analyse.
+        metric_name : str
+            Name of the outcome metric to correlate against.
+        window_sec : float
+            Duration (seconds) after each change within which to measure
+            outcome deltas.
+
+        Returns
+        -------
+        ImpactResult
+        """
+        with self._lock:
+            changes = [
+                c for c in self._changes
+                if c.parameter_name == parameter_name
+            ]
+            changes.sort(key=lambda c: c.timestamp)
+
+            change_magnitudes: List[float] = []
+            outcome_deltas: List[float] = []
+            lags: List[float] = []
+
+            for c in changes:
+                delta = self._outcome_delta_after(metric_name, c.timestamp, window_sec)
+                if delta is not None:
+                    change_magnitudes.append(c.new_value - c.old_value)
+                    outcome_deltas.append(delta)
+                    # Lag is the midpoint of the observation window used
+                    t_end = c.timestamp + window_sec
+                    relevant = [
+                        o for o in self._outcomes
+                        if o.metric_name == metric_name
+                        and c.timestamp <= o.timestamp <= t_end
+                    ]
+                    if relevant:
+                        avg_ts = sum(o.timestamp for o in relevant) / len(relevant)
+                        lags.append(avg_ts - c.timestamp)
+                    else:
+                        lags.append(window_sec / 2.0)
+
+            correlation = self._pearson(change_magnitudes, outcome_deltas)
+
+            if outcome_deltas:
+                impact_magnitude = sum(abs(d) for d in outcome_deltas) / len(outcome_deltas)
+            else:
+                impact_magnitude = 0.0
+
+            n = len(change_magnitudes)
+            confidence = min(1.0, n / 10.0) if n > 0 else 0.0
+
+            if abs(correlation) < 0.1:
+                direction = 'neutral'
+            elif correlation > 0:
+                direction = 'positive'
+            else:
+                direction = 'negative'
+
+            avg_lag = sum(lags) / len(lags) if lags else 0.0
+
+            return ImpactResult(
+                parameter_name=parameter_name,
+                metric_name=metric_name,
+                correlation=correlation,
+                impact_magnitude=impact_magnitude,
+                confidence=confidence,
+                direction=direction,
+                lag_sec=avg_lag,
+            )
+
+    def get_impact_report(self, window_sec: float = 60.0) -> ImpactReport:
+        """Analyse all recorded parameter changes against all observed metrics.
+
+        Returns an :class:`ImpactReport` with a list of :class:`ImpactResult`
+        entries for every (parameter, metric) combination that has data.
+        """
+        with self._lock:
+            param_names = list({c.parameter_name for c in self._changes})
+            metric_names = list({o.metric_name for o in self._outcomes})
+            all_changes = list(self._changes)
+
+        impacts: List[ImpactResult] = []
+        for pname in param_names:
+            for mname in metric_names:
+                result = self.analyze_impact(pname, mname, window_sec)
+                impacts.append(result)
+
+        impacts.sort(key=lambda r: abs(r.correlation), reverse=True)
+
+        if impacts:
+            top = impacts[0]
+            summary = (
+                f"Top impact: '{top.parameter_name}' -> '{top.metric_name}' "
+                f"(correlation={top.correlation:.3f}, "
+                f"magnitude={top.impact_magnitude:.3f})"
+            )
+        else:
+            summary = "No impacts detected — insufficient data."
+
+        return ImpactReport(
+            changes=all_changes,
+            impacts=impacts,
+            summary=summary,
+            timestamp=time.time(),
+        )
+
+    def get_most_impactful_change(self) -> Optional[ImpactResult]:
+        """Return the :class:`ImpactResult` with the highest absolute impact.
+
+        Impact is ranked first by ``abs(correlation)`` and then by
+        ``impact_magnitude`` as a tiebreaker.  Returns *None* when no impacts
+        have been computed yet.
+        """
+        report = self.get_impact_report()
+        if not report.impacts:
+            return None
+        return max(
+            report.impacts,
+            key=lambda r: (abs(r.correlation), r.impact_magnitude),
+        )
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

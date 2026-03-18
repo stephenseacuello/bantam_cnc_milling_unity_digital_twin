@@ -2440,6 +2440,252 @@ class RateLimiterFactory:
             return stats
 
 
+# ---------------------------------------------------------------------------
+# Retry Policy Manager
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RetryPolicy:
+    """Configurable retry policy for failed operations."""
+    name: str
+    max_retries: int = 3
+    base_delay_sec: float = 1.0
+    max_delay_sec: float = 60.0
+    backoff_strategy: str = 'exponential'  # fixed, linear, exponential, jitter
+    retry_on_exceptions: List[str] = field(default_factory=lambda: ['Exception'])
+    timeout_sec: float = 300.0
+
+
+@dataclass
+class RetryAttempt:
+    """Record of a single retry attempt."""
+    attempt_number: int
+    delay_sec: float
+    error_type: str
+    error_message: str
+    timestamp: float
+    succeeded: bool
+
+
+@dataclass
+class RetryResult:
+    """Outcome of executing a function under a retry policy."""
+    succeeded: bool
+    result: Any
+    attempts: List[RetryAttempt] = field(default_factory=list)
+    total_time_sec: float = 0.0
+    policy_name: str = ''
+
+
+class RetryPolicyManager:
+    """Manages configurable retry policies and executes operations with retry logic.
+
+    Supports fixed, linear, exponential, and jitter backoff strategies.
+    Tracks statistics across all executions for observability.
+    """
+
+    # Default policies
+    FAST_RETRY = RetryPolicy(
+        name='FAST_RETRY',
+        max_retries=3,
+        base_delay_sec=0.5,
+        backoff_strategy='exponential',
+    )
+    PATIENT_RETRY = RetryPolicy(
+        name='PATIENT_RETRY',
+        max_retries=5,
+        base_delay_sec=2.0,
+        backoff_strategy='exponential',
+    )
+    CRITICAL_RETRY = RetryPolicy(
+        name='CRITICAL_RETRY',
+        max_retries=10,
+        base_delay_sec=1.0,
+        backoff_strategy='jitter',
+    )
+
+    def __init__(self) -> None:
+        self._policies: Dict[str, RetryPolicy] = {}
+        self._execution_history: List[RetryResult] = []
+        self._lock = threading.Lock()
+
+        # Register default policies
+        self.register_policy(copy.deepcopy(self.FAST_RETRY))
+        self.register_policy(copy.deepcopy(self.PATIENT_RETRY))
+        self.register_policy(copy.deepcopy(self.CRITICAL_RETRY))
+
+    def register_policy(self, policy: RetryPolicy) -> None:
+        """Register a retry policy by name."""
+        with self._lock:
+            self._policies[policy.name] = policy
+
+    def get_policy(self, name: str) -> Optional[RetryPolicy]:
+        """Look up a retry policy by name."""
+        with self._lock:
+            return self._policies.get(name)
+
+    def compute_delay(self, policy: RetryPolicy, attempt_number: int) -> float:
+        """Compute the delay for a given attempt based on the backoff strategy.
+
+        Args:
+            policy: The retry policy with backoff configuration.
+            attempt_number: 1-based attempt number.
+
+        Returns:
+            Delay in seconds (capped at policy.max_delay_sec).
+        """
+        import random
+
+        strategy = policy.backoff_strategy
+        base = policy.base_delay_sec
+
+        if strategy == 'fixed':
+            delay = base
+        elif strategy == 'linear':
+            delay = base * attempt_number
+        elif strategy == 'exponential':
+            delay = base * (2 ** (attempt_number - 1))
+        elif strategy == 'jitter':
+            exponential = base * (2 ** (attempt_number - 1))
+            delay = exponential + random.uniform(0, base)
+        else:
+            delay = base
+
+        return min(delay, policy.max_delay_sec)
+
+    def execute_with_retry(
+        self,
+        policy: RetryPolicy,
+        func: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> RetryResult:
+        """Execute *func* under the given retry policy.
+
+        The function is attempted up to ``policy.max_retries + 1`` times
+        (the initial call plus retries).  Only exceptions whose type name
+        appears in ``policy.retry_on_exceptions`` trigger a retry.
+
+        Args:
+            policy: Retry policy to follow.
+            func: Callable to execute.
+            *args, **kwargs: Forwarded to *func*.
+
+        Returns:
+            A :class:`RetryResult` summarising the outcome.
+        """
+        attempts: List[RetryAttempt] = []
+        start_time = time.monotonic()
+        last_result: Any = None
+
+        for attempt_num in range(1, policy.max_retries + 2):  # +2 for initial + retries
+            elapsed = time.monotonic() - start_time
+            if elapsed > policy.timeout_sec and attempt_num > 1:
+                break
+
+            delay = 0.0
+            if attempt_num > 1:
+                delay = self.compute_delay(policy, attempt_num - 1)
+                time.sleep(delay)
+
+            try:
+                last_result = func(*args, **kwargs)
+                attempt = RetryAttempt(
+                    attempt_number=attempt_num,
+                    delay_sec=delay,
+                    error_type='',
+                    error_message='',
+                    timestamp=time.time(),
+                    succeeded=True,
+                )
+                attempts.append(attempt)
+                result = RetryResult(
+                    succeeded=True,
+                    result=last_result,
+                    attempts=attempts,
+                    total_time_sec=time.monotonic() - start_time,
+                    policy_name=policy.name,
+                )
+                with self._lock:
+                    self._execution_history.append(result)
+                return result
+
+            except Exception as exc:
+                exc_type_name = type(exc).__name__
+                # Check if we should retry this exception
+                should_retry = any(
+                    exc_type_name == allowed or allowed == 'Exception'
+                    for allowed in policy.retry_on_exceptions
+                )
+                attempt = RetryAttempt(
+                    attempt_number=attempt_num,
+                    delay_sec=delay,
+                    error_type=exc_type_name,
+                    error_message=str(exc),
+                    timestamp=time.time(),
+                    succeeded=False,
+                )
+                attempts.append(attempt)
+
+                if not should_retry:
+                    break
+
+        total_time = time.monotonic() - start_time
+        result = RetryResult(
+            succeeded=False,
+            result=None,
+            attempts=attempts,
+            total_time_sec=total_time,
+            policy_name=policy.name,
+        )
+        with self._lock:
+            self._execution_history.append(result)
+        return result
+
+    def get_retry_stats(self) -> Dict[str, Any]:
+        """Return aggregate statistics across all executions.
+
+        Returns a dict with:
+            - total_executions: number of execute_with_retry calls
+            - total_attempts: sum of attempts across all executions
+            - successful_executions: count of executions that succeeded
+            - failed_executions: count of executions that failed
+            - success_rate: fraction of successful executions (0.0 - 1.0)
+            - avg_retries: average number of attempts per execution
+        """
+        with self._lock:
+            total_executions = len(self._execution_history)
+            if total_executions == 0:
+                return {
+                    'total_executions': 0,
+                    'total_attempts': 0,
+                    'successful_executions': 0,
+                    'failed_executions': 0,
+                    'success_rate': 0.0,
+                    'avg_retries': 0.0,
+                }
+
+            total_attempts = sum(
+                len(r.attempts) for r in self._execution_history
+            )
+            successful = sum(
+                1 for r in self._execution_history if r.succeeded
+            )
+            failed = total_executions - successful
+            success_rate = successful / total_executions
+            avg_retries = total_attempts / total_executions
+
+            return {
+                'total_executions': total_executions,
+                'total_attempts': total_attempts,
+                'successful_executions': successful,
+                'failed_executions': failed,
+                'success_rate': success_rate,
+                'avg_retries': avg_retries,
+            }
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

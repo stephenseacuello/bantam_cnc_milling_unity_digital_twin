@@ -2656,6 +2656,232 @@ class EventSourcingStore:
             return sorted(self._streams.keys())
 
 
+# ---------------------------------------------------------------------------
+# Metric Aggregation Service
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetricPoint:
+    """A single time-series data point."""
+    name: str
+    value: float
+    timestamp: float
+    tags: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class AggregatedMetric:
+    """Result of aggregating metric points over a time interval."""
+    name: str
+    period_start: float
+    period_end: float
+    count: int
+    mean: float
+    min_val: float
+    max_val: float
+    std_dev: float
+    sum_val: float
+    p50: float
+    p95: float
+    p99: float
+
+
+class MetricAggregationService:
+    """Aggregates time-series metrics with configurable granularity.
+
+    Thread-safe service that stores :class:`MetricPoint` instances and
+    provides aggregation, percentile, rate-of-change, and pruning
+    operations on the recorded data.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # metric name -> sorted list of MetricPoint (by timestamp)
+        self._points: Dict[str, List[MetricPoint]] = {}
+
+    # -- recording ---------------------------------------------------------
+
+    def record(self, point: MetricPoint) -> None:
+        """Store a metric data point."""
+        with self._lock:
+            bucket = self._points.setdefault(point.name, [])
+            bucket.append(point)
+
+    # -- query helpers (internal, lock must be held) -----------------------
+
+    @staticmethod
+    def _percentile(sorted_values: List[float], p: float) -> float:
+        """Compute the *p*-th percentile (0-100) using linear interpolation."""
+        n = len(sorted_values)
+        if n == 0:
+            return 0.0
+        if n == 1:
+            return sorted_values[0]
+        k = (p / 100.0) * (n - 1)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return sorted_values[int(k)]
+        d0 = sorted_values[int(f)] * (c - k)
+        d1 = sorted_values[int(c)] * (k - f)
+        return d0 + d1
+
+    def _filter_points(
+        self, name: str, start_time: float, end_time: float,
+    ) -> List[MetricPoint]:
+        """Return points for *name* within [start_time, end_time]."""
+        pts = self._points.get(name, [])
+        return [p for p in pts if start_time <= p.timestamp <= end_time]
+
+    # -- public API --------------------------------------------------------
+
+    def aggregate(
+        self,
+        name: str,
+        start_time: float,
+        end_time: float,
+        interval_sec: float,
+    ) -> List[AggregatedMetric]:
+        """Aggregate metrics into fixed-width time buckets.
+
+        Args:
+            name: Metric name to aggregate.
+            start_time: Start of the query window (inclusive).
+            end_time: End of the query window (inclusive).
+            interval_sec: Width of each bucket in seconds.
+
+        Returns:
+            A list of :class:`AggregatedMetric`, one per bucket that
+            contains at least one data point.
+        """
+        with self._lock:
+            pts = self._filter_points(name, start_time, end_time)
+
+        if not pts or interval_sec <= 0:
+            return []
+
+        results: List[AggregatedMetric] = []
+        bucket_start = start_time
+        while bucket_start < end_time:
+            bucket_end = min(bucket_start + interval_sec, end_time)
+            bucket_pts = [
+                p for p in pts
+                if bucket_start <= p.timestamp < bucket_end
+                or (bucket_end == end_time and p.timestamp == end_time
+                    and bucket_start <= p.timestamp)
+            ]
+            if bucket_pts:
+                values = [p.value for p in bucket_pts]
+                sorted_vals = sorted(values)
+                n = len(values)
+                mean = sum(values) / n
+                variance = sum((v - mean) ** 2 for v in values) / n
+                std_dev = math.sqrt(variance)
+                results.append(AggregatedMetric(
+                    name=name,
+                    period_start=bucket_start,
+                    period_end=bucket_end,
+                    count=n,
+                    mean=mean,
+                    min_val=min(values),
+                    max_val=max(values),
+                    std_dev=std_dev,
+                    sum_val=sum(values),
+                    p50=self._percentile(sorted_vals, 50),
+                    p95=self._percentile(sorted_vals, 95),
+                    p99=self._percentile(sorted_vals, 99),
+                ))
+            bucket_start = bucket_start + interval_sec
+        return results
+
+    def get_latest(self, name: str, count: int = 10) -> List[MetricPoint]:
+        """Return the last *count* raw points for the given metric name."""
+        with self._lock:
+            pts = self._points.get(name, [])
+            return list(pts[-count:])
+
+    def get_percentile(
+        self,
+        name: str,
+        percentile: float,
+        start_time: float,
+        end_time: float,
+    ) -> float:
+        """Compute a specific percentile for the named metric.
+
+        Args:
+            name: Metric name.
+            percentile: Percentile value in range [0, 100].
+            start_time: Window start (inclusive).
+            end_time: Window end (inclusive).
+
+        Returns:
+            The computed percentile value, or 0.0 if no data.
+        """
+        with self._lock:
+            pts = self._filter_points(name, start_time, end_time)
+        if not pts:
+            return 0.0
+        sorted_vals = sorted(p.value for p in pts)
+        return self._percentile(sorted_vals, percentile)
+
+    def get_rate(
+        self,
+        name: str,
+        start_time: float,
+        end_time: float,
+    ) -> float:
+        """Compute rate of change (value delta per second).
+
+        Uses the first and last data points within the window to compute
+        the slope ``(last_value - first_value) / (last_ts - first_ts)``.
+
+        Returns:
+            Rate of change in value-per-second, or 0.0 if fewer than 2
+            points or zero time span.
+        """
+        with self._lock:
+            pts = self._filter_points(name, start_time, end_time)
+        if len(pts) < 2:
+            return 0.0
+        sorted_pts = sorted(pts, key=lambda p: p.timestamp)
+        first, last = sorted_pts[0], sorted_pts[-1]
+        dt = last.timestamp - first.timestamp
+        if dt == 0.0:
+            return 0.0
+        return (last.value - first.value) / dt
+
+    def get_metric_names(self) -> List[str]:
+        """Return a sorted list of all known metric names."""
+        with self._lock:
+            return sorted(self._points.keys())
+
+    def prune(self, max_age_sec: float, current_time: Optional[float] = None) -> int:
+        """Remove data points older than *max_age_sec*.
+
+        Args:
+            max_age_sec: Maximum age in seconds.
+            current_time: Reference time; defaults to ``time.time()``.
+
+        Returns:
+            Total number of points removed.
+        """
+        if current_time is None:
+            current_time = time.time()
+        cutoff = current_time - max_age_sec
+        removed = 0
+        with self._lock:
+            for name in list(self._points.keys()):
+                before = len(self._points[name])
+                self._points[name] = [
+                    p for p in self._points[name] if p.timestamp >= cutoff
+                ]
+                removed += before - len(self._points[name])
+                if not self._points[name]:
+                    del self._points[name]
+        return removed
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

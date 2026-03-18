@@ -4327,3 +4327,286 @@ class PowerConsumptionModel:
             cost_estimate=0.0,
             carbon_kg=0.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Vibration FFT Analyzer — pure-Python DFT chatter detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FrequencyComponent:
+    """A single frequency bin from the DFT."""
+    frequency_hz: float
+    amplitude: float
+    phase_rad: float
+    is_harmonic: bool = False
+
+
+@dataclass
+class FFTResult:
+    """Result of a vibration FFT analysis."""
+    components: List[FrequencyComponent]
+    dominant_frequency_hz: float
+    dominant_amplitude: float
+    total_rms: float
+    chatter_detected: bool
+    chatter_frequency_hz: Optional[float]
+    tooth_passing_frequency_hz: float
+
+
+@dataclass
+class VibrationAnalysisReport:
+    """Full vibration analysis report with recommendation."""
+    timestamp: float
+    fft_result: FFTResult
+    spindle_rpm: float
+    num_flutes: int
+    stability_margin: float
+    recommendation: str
+
+
+class VibrationFFTAnalyzer:
+    """Performs frequency analysis on vibration data for chatter detection.
+
+    Uses a pure-Python DFT implementation (no numpy/scipy) to decompose a
+    time-domain vibration signal into frequency components, then checks for
+    chatter by comparing non-harmonic peaks against tooth-passing-frequency
+    harmonics.
+    """
+
+    # How many harmonics of the tooth-passing frequency to consider
+    _NUM_HARMONICS = 6
+    # Frequency tolerance when matching a bin to a harmonic (Hz)
+    _HARMONIC_TOL_HZ = 5.0
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_tooth_passing_frequency(spindle_rpm: float, num_flutes: int) -> float:
+        """Return the tooth-passing frequency in Hz.
+
+        TPF = RPM * num_flutes / 60
+        """
+        return spindle_rpm * num_flutes / 60.0
+
+    # ------------------------------------------------------------------
+    # Core DFT
+    # ------------------------------------------------------------------
+
+    def analyze(
+        self,
+        signal: List[float],
+        sample_rate_hz: float,
+        spindle_rpm: float,
+        num_flutes: int,
+    ) -> FFTResult:
+        """Perform a pure-Python DFT on *signal* and return an ``FFTResult``.
+
+        Parameters
+        ----------
+        signal:
+            Time-domain vibration samples.
+        sample_rate_hz:
+            Sampling rate in Hz.
+        spindle_rpm:
+            Current spindle speed in RPM.
+        num_flutes:
+            Number of cutter flutes / teeth.
+
+        Returns
+        -------
+        ``FFTResult`` with frequency components, RMS, and chatter info.
+        """
+        N = len(signal)
+        if N == 0:
+            tpf = self.get_tooth_passing_frequency(spindle_rpm, num_flutes)
+            return FFTResult(
+                components=[],
+                dominant_frequency_hz=0.0,
+                dominant_amplitude=0.0,
+                total_rms=0.0,
+                chatter_detected=False,
+                chatter_frequency_hz=None,
+                tooth_passing_frequency_hz=tpf,
+            )
+
+        # --- Compute one-sided DFT (DC to Nyquist) ---
+        num_bins = N // 2 + 1
+        freq_resolution = sample_rate_hz / N
+        tpf = self.get_tooth_passing_frequency(spindle_rpm, num_flutes)
+
+        components: List[FrequencyComponent] = []
+        sum_sq = 0.0
+        dominant_amp = 0.0
+        dominant_freq = 0.0
+
+        for k in range(num_bins):
+            re = 0.0
+            im = 0.0
+            for n in range(N):
+                angle = 2.0 * math.pi * k * n / N
+                re += signal[n] * math.cos(angle)
+                im -= signal[n] * math.sin(angle)
+
+            # Amplitude (single-sided scaling)
+            amp = math.sqrt(re * re + im * im) / N
+            if 0 < k < N // 2:
+                amp *= 2.0  # double non-DC, non-Nyquist bins
+
+            phase = math.atan2(im, re)
+            freq = k * freq_resolution
+
+            # Determine if this bin is a harmonic of the TPF
+            is_harm = False
+            if tpf > 0:
+                for h in range(1, self._NUM_HARMONICS + 1):
+                    if abs(freq - h * tpf) <= self._HARMONIC_TOL_HZ:
+                        is_harm = True
+                        break
+
+            components.append(FrequencyComponent(
+                frequency_hz=freq,
+                amplitude=amp,
+                phase_rad=phase,
+                is_harmonic=is_harm,
+            ))
+
+            sum_sq += amp * amp
+
+            if k > 0 and amp > dominant_amp:
+                dominant_amp = amp
+                dominant_freq = freq
+
+        total_rms = math.sqrt(sum_sq)
+
+        # Chatter detection on the computed components
+        chatter_detected, chatter_freq = self._find_chatter(
+            components, tpf, threshold_ratio=0.5,
+        )
+
+        return FFTResult(
+            components=components,
+            dominant_frequency_hz=dominant_freq,
+            dominant_amplitude=dominant_amp,
+            total_rms=total_rms,
+            chatter_detected=chatter_detected,
+            chatter_frequency_hz=chatter_freq,
+            tooth_passing_frequency_hz=tpf,
+        )
+
+    # ------------------------------------------------------------------
+    # Chatter detection
+    # ------------------------------------------------------------------
+
+    def detect_chatter(
+        self,
+        fft_result: FFTResult,
+        spindle_rpm: float,
+        num_flutes: int,
+        threshold_ratio: float = 0.5,
+    ) -> Tuple[bool, Optional[float]]:
+        """Detect chatter from a previously computed ``FFTResult``.
+
+        A non-harmonic peak whose amplitude exceeds *threshold_ratio* times
+        the largest harmonic amplitude is flagged as chatter.
+
+        Returns
+        -------
+        (chatter_detected, chatter_frequency_hz)
+        """
+        tpf = self.get_tooth_passing_frequency(spindle_rpm, num_flutes)
+        return self._find_chatter(fft_result.components, tpf, threshold_ratio)
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
+
+    def generate_report(
+        self,
+        signal: List[float],
+        sample_rate: float,
+        spindle_rpm: float,
+        num_flutes: int,
+    ) -> VibrationAnalysisReport:
+        """Run full analysis and produce a ``VibrationAnalysisReport``."""
+        fft_result = self.analyze(signal, sample_rate, spindle_rpm, num_flutes)
+
+        # Stability margin: ratio of largest harmonic amplitude to largest
+        # non-harmonic amplitude.  >1 means harmonics dominate (stable).
+        max_harmonic = 0.0
+        max_non_harmonic = 0.0
+        for c in fft_result.components:
+            if c.frequency_hz == 0.0:
+                continue
+            if c.is_harmonic:
+                max_harmonic = max(max_harmonic, c.amplitude)
+            else:
+                max_non_harmonic = max(max_non_harmonic, c.amplitude)
+
+        if max_non_harmonic > 0:
+            stability_margin = max_harmonic / max_non_harmonic
+        else:
+            stability_margin = float('inf')
+
+        # Recommendation
+        if fft_result.chatter_detected:
+            recommendation = (
+                f"Chatter detected at {fft_result.chatter_frequency_hz:.1f} Hz. "
+                "Reduce spindle speed or depth of cut to improve stability."
+            )
+        elif stability_margin < 1.5:
+            recommendation = (
+                "Marginal stability. Consider reducing depth of cut or "
+                "adjusting spindle speed to move away from stability boundary."
+            )
+        else:
+            recommendation = "Stable cutting conditions. No corrective action required."
+
+        return VibrationAnalysisReport(
+            timestamp=time.time(),
+            fft_result=fft_result,
+            spindle_rpm=spindle_rpm,
+            num_flutes=num_flutes,
+            stability_margin=round(stability_margin, 4),
+            recommendation=recommendation,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _find_chatter(
+        self,
+        components: List[FrequencyComponent],
+        tpf: float,
+        threshold_ratio: float,
+    ) -> Tuple[bool, Optional[float]]:
+        """Return (detected, freq) for the largest non-harmonic peak that
+        exceeds *threshold_ratio* times the largest harmonic amplitude."""
+        max_harmonic_amp = 0.0
+        max_non_harmonic_amp = 0.0
+        chatter_freq: Optional[float] = None
+
+        for c in components:
+            if c.frequency_hz == 0.0:
+                continue  # skip DC
+            if c.is_harmonic:
+                if c.amplitude > max_harmonic_amp:
+                    max_harmonic_amp = c.amplitude
+            else:
+                if c.amplitude > max_non_harmonic_amp:
+                    max_non_harmonic_amp = c.amplitude
+                    chatter_freq = c.frequency_hz
+
+        if max_harmonic_amp == 0.0:
+            # No harmonic energy — can't compare, flag if any peak exists
+            if max_non_harmonic_amp > 0.0:
+                return True, chatter_freq
+            return False, None
+
+        if max_non_harmonic_amp >= threshold_ratio * max_harmonic_amp:
+            return True, chatter_freq
+
+        return False, None

@@ -2359,4 +2359,251 @@ namespace MiracleTwin.Cutting
             return _pockets[pocketNumber - 1];
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Coordinate System Manager
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Represents a single work coordinate system (WCS) such as G54, G55, or
+    /// an extended G54.1 Pn system.  Each WCS stores an XYZ offset from the
+    /// machine origin plus an optional rotation about the Z-axis.
+    /// </summary>
+    [Serializable]
+    public class WorkCoordinateSystem
+    {
+        /// <summary>Name of the coordinate system (e.g. "G54", "G54.1 P1").</summary>
+        public string name;
+        /// <summary>X offset from machine origin (mm).</summary>
+        public float offsetX;
+        /// <summary>Y offset from machine origin (mm).</summary>
+        public float offsetY;
+        /// <summary>Z offset from machine origin (mm).</summary>
+        public float offsetZ;
+        /// <summary>Rotation about the Z-axis (degrees).</summary>
+        public float rotationDeg;
+        /// <summary>Whether this WCS is the currently active one.</summary>
+        public bool isActive;
+        /// <summary>Human-readable description / label for the WCS.</summary>
+        public string description;
+
+        public WorkCoordinateSystem() { }
+
+        public WorkCoordinateSystem(string name, float offsetX = 0f, float offsetY = 0f,
+                                     float offsetZ = 0f, float rotationDeg = 0f,
+                                     bool isActive = false, string description = "")
+        {
+            this.name = name;
+            this.offsetX = offsetX;
+            this.offsetY = offsetY;
+            this.offsetZ = offsetZ;
+            this.rotationDeg = rotationDeg;
+            this.isActive = isActive;
+            this.description = description;
+        }
+    }
+
+    /// <summary>
+    /// Describes the transform required to convert a point expressed in one
+    /// coordinate system to another.  The delta values represent the vector
+    /// difference (toSystem.offset - fromSystem.offset).
+    /// </summary>
+    [Serializable]
+    public class CoordinateTransform
+    {
+        /// <summary>Source coordinate system name.</summary>
+        public string fromSystem;
+        /// <summary>Target coordinate system name.</summary>
+        public string toSystem;
+        /// <summary>Delta X between the two systems (mm).</summary>
+        public float deltaX;
+        /// <summary>Delta Y between the two systems (mm).</summary>
+        public float deltaY;
+        /// <summary>Delta Z between the two systems (mm).</summary>
+        public float deltaZ;
+
+        public CoordinateTransform() { }
+
+        public CoordinateTransform(string fromSystem, string toSystem,
+                                    float deltaX, float deltaY, float deltaZ)
+        {
+            this.fromSystem = fromSystem;
+            this.toSystem = toSystem;
+            this.deltaX = deltaX;
+            this.deltaY = deltaY;
+            this.deltaZ = deltaZ;
+        }
+    }
+
+    /// <summary>
+    /// Manages multiple work coordinate systems (G54-G59 and extended
+    /// G54.1 P1-P48).  Provides methods to set/get offsets, activate a
+    /// system, transform points between systems, and register custom
+    /// coordinate systems.
+    /// </summary>
+    public class CoordinateSystemManager
+    {
+        private readonly Dictionary<string, WorkCoordinateSystem> _systems = new();
+        private static readonly string[] StandardNames = { "G54", "G55", "G56", "G57", "G58", "G59" };
+
+        /// <summary>
+        /// Constructs a CoordinateSystemManager with the six standard work
+        /// coordinate systems (G54-G59) initialized at zero offsets.
+        /// G54 is set as the active system by default.
+        /// </summary>
+        public CoordinateSystemManager()
+        {
+            for (int i = 0; i < StandardNames.Length; i++)
+            {
+                var wcs = new WorkCoordinateSystem(
+                    name: StandardNames[i],
+                    description: $"Standard work coordinate system {StandardNames[i]}"
+                );
+                if (i == 0) wcs.isActive = true; // G54 active by default
+                _systems[StandardNames[i]] = wcs;
+            }
+        }
+
+        // ── Set / Get offsets ─────────────────────────────────────────
+
+        /// <summary>
+        /// Sets the XYZ offset of a named coordinate system.
+        /// </summary>
+        /// <param name="name">System name (e.g. "G54").</param>
+        /// <param name="x">X offset (mm).</param>
+        /// <param name="y">Y offset (mm).</param>
+        /// <param name="z">Z offset (mm).</param>
+        public void SetOffset(string name, float x, float y, float z)
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("name must not be null or empty", nameof(name));
+            if (!_systems.TryGetValue(name, out var wcs))
+                throw new KeyNotFoundException($"Coordinate system '{name}' not found");
+
+            wcs.offsetX = x;
+            wcs.offsetY = y;
+            wcs.offsetZ = z;
+        }
+
+        /// <summary>
+        /// Gets the current XYZ offset of a named coordinate system.
+        /// </summary>
+        /// <returns>Tuple of (offsetX, offsetY, offsetZ).</returns>
+        public (float x, float y, float z) GetOffset(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("name must not be null or empty", nameof(name));
+            if (!_systems.TryGetValue(name, out var wcs))
+                throw new KeyNotFoundException($"Coordinate system '{name}' not found");
+
+            return (wcs.offsetX, wcs.offsetY, wcs.offsetZ);
+        }
+
+        // ── Active system ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Activates the named coordinate system and deactivates all others.
+        /// </summary>
+        public void SetActiveSystem(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("name must not be null or empty", nameof(name));
+            if (!_systems.ContainsKey(name))
+                throw new KeyNotFoundException($"Coordinate system '{name}' not found");
+
+            foreach (var wcs in _systems.Values)
+                wcs.isActive = false;
+
+            _systems[name].isActive = true;
+        }
+
+        // ── Transform ─────────────────────────────────────────────────
+
+        /// <summary>
+        /// Transforms a point from one coordinate system to another by
+        /// converting through machine coordinates (subtracting fromSystem
+        /// offset, then adding toSystem offset).
+        /// </summary>
+        /// <returns>Tuple of (x, y, z) in the target system.</returns>
+        public (float x, float y, float z) TransformPoint(
+            float x, float y, float z, string fromSystem, string toSystem)
+        {
+            if (string.IsNullOrEmpty(fromSystem))
+                throw new ArgumentException("fromSystem must not be null or empty", nameof(fromSystem));
+            if (string.IsNullOrEmpty(toSystem))
+                throw new ArgumentException("toSystem must not be null or empty", nameof(toSystem));
+            if (!_systems.TryGetValue(fromSystem, out var from))
+                throw new KeyNotFoundException($"Coordinate system '{fromSystem}' not found");
+            if (!_systems.TryGetValue(toSystem, out var to))
+                throw new KeyNotFoundException($"Coordinate system '{toSystem}' not found");
+
+            // Point in machine coords = point_in_from + from.offset
+            float machX = x + from.offsetX;
+            float machY = y + from.offsetY;
+            float machZ = z + from.offsetZ;
+
+            // Point in target coords = machine_point - to.offset
+            return (machX - to.offsetX, machY - to.offsetY, machZ - to.offsetZ);
+        }
+
+        // ── Query ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Returns all defined coordinate systems.
+        /// </summary>
+        public List<WorkCoordinateSystem> GetAllSystems()
+        {
+            return new List<WorkCoordinateSystem>(_systems.Values);
+        }
+
+        // ── Custom systems ────────────────────────────────────────────
+
+        /// <summary>
+        /// Adds a custom coordinate system (typically G54.1 Pn).
+        /// Throws if a system with the same name already exists.
+        /// </summary>
+        public void AddCustomSystem(string name, float x, float y, float z,
+                                     string description = "")
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("name must not be null or empty", nameof(name));
+            if (_systems.ContainsKey(name))
+                throw new InvalidOperationException(
+                    $"Coordinate system '{name}' already exists");
+
+            _systems[name] = new WorkCoordinateSystem(
+                name: name,
+                offsetX: x,
+                offsetY: y,
+                offsetZ: z,
+                description: description
+            );
+        }
+
+        // ── Transform chain ──────────────────────────────────────────
+
+        /// <summary>
+        /// Returns a <see cref="CoordinateTransform"/> describing the delta
+        /// between two coordinate systems.
+        /// </summary>
+        public CoordinateTransform GetTransformChain(string fromSystem, string toSystem)
+        {
+            if (string.IsNullOrEmpty(fromSystem))
+                throw new ArgumentException("fromSystem must not be null or empty", nameof(fromSystem));
+            if (string.IsNullOrEmpty(toSystem))
+                throw new ArgumentException("toSystem must not be null or empty", nameof(toSystem));
+            if (!_systems.TryGetValue(fromSystem, out var from))
+                throw new KeyNotFoundException($"Coordinate system '{fromSystem}' not found");
+            if (!_systems.TryGetValue(toSystem, out var to))
+                throw new KeyNotFoundException($"Coordinate system '{toSystem}' not found");
+
+            return new CoordinateTransform(
+                fromSystem: fromSystem,
+                toSystem: toSystem,
+                deltaX: to.offsetX - from.offsetX,
+                deltaY: to.offsetY - from.offsetY,
+                deltaZ: to.offsetZ - from.offsetZ
+            );
+        }
+    }
 }

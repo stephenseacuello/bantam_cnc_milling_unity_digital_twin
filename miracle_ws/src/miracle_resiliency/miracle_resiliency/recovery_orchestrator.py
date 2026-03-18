@@ -2235,6 +2235,211 @@ class GracefulDegradationManager:
         return caps
 
 
+# ---------------------------------------------------------------------------
+# Rate Limiter Pattern
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RateLimitConfig:
+    """Configuration for a rate limiter instance."""
+    name: str
+    max_requests: int
+    window_sec: float
+    burst_size: int = 0  # 0 means same as max_requests
+    strategy: str = 'token_bucket'  # 'token_bucket' | 'sliding_window'
+
+    def __post_init__(self) -> None:
+        if self.burst_size <= 0:
+            self.burst_size = self.max_requests
+
+
+@dataclass
+class RateLimitResult:
+    """Result returned from a rate limit check."""
+    allowed: bool
+    remaining: int
+    retry_after_sec: float
+    limit_name: str
+
+
+class TokenBucketLimiter:
+    """Token-bucket rate limiter.
+
+    Tokens refill at a steady rate of ``max_requests / window_sec``.
+    The bucket can hold up to ``burst_size`` tokens, allowing short
+    bursts above the average rate.  Thread-safe.
+    """
+
+    def __init__(self, config: RateLimitConfig) -> None:
+        self._config = config
+        self._tokens: float = float(config.burst_size)
+        self._last_refill: float = time.time()
+        self._refill_rate: float = config.max_requests / config.window_sec
+        self._lock = threading.Lock()
+
+    def allow(self, name: Optional[str] = None) -> RateLimitResult:
+        """Try to consume one token.
+
+        Returns a :class:`RateLimitResult` indicating whether the
+        request was allowed and how many tokens remain.
+        """
+        limit_name = name or self._config.name
+        with self._lock:
+            now = time.time()
+            self._refill(now)
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return RateLimitResult(
+                    allowed=True,
+                    remaining=int(self._tokens),
+                    retry_after_sec=0.0,
+                    limit_name=limit_name,
+                )
+            # Not enough tokens — compute wait time for 1 token
+            deficit = 1.0 - self._tokens
+            retry_after = deficit / self._refill_rate
+            return RateLimitResult(
+                allowed=False,
+                remaining=0,
+                retry_after_sec=round(retry_after, 6),
+                limit_name=limit_name,
+            )
+
+    def get_remaining(self, name: Optional[str] = None) -> int:
+        """Return the number of tokens currently available."""
+        with self._lock:
+            self._refill(time.time())
+            return int(self._tokens)
+
+    # ------------------------------------------------------------------ #
+    #  Internal
+    # ------------------------------------------------------------------ #
+
+    def _refill(self, now: float) -> None:
+        """Add tokens based on elapsed time since last refill."""
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(
+                float(self._config.burst_size),
+                self._tokens + elapsed * self._refill_rate,
+            )
+            self._last_refill = now
+
+
+class SlidingWindowLimiter:
+    """Sliding-window rate limiter.
+
+    Tracks individual request timestamps and rejects requests when the
+    count of requests within the most recent ``window_sec`` seconds
+    exceeds ``max_requests``.  Thread-safe.
+    """
+
+    def __init__(self, config: RateLimitConfig) -> None:
+        self._config = config
+        self._timestamps: List[float] = []
+        self._lock = threading.Lock()
+
+    def allow(self, name: Optional[str] = None) -> RateLimitResult:
+        """Check whether a request is allowed under the sliding window.
+
+        Returns a :class:`RateLimitResult`.
+        """
+        limit_name = name or self._config.name
+        with self._lock:
+            now = time.time()
+            self._prune(now)
+            if len(self._timestamps) < self._config.max_requests:
+                self._timestamps.append(now)
+                remaining = self._config.max_requests - len(self._timestamps)
+                return RateLimitResult(
+                    allowed=True,
+                    remaining=remaining,
+                    retry_after_sec=0.0,
+                    limit_name=limit_name,
+                )
+            # Window is full — compute when the oldest entry will expire
+            oldest = self._timestamps[0]
+            retry_after = (oldest + self._config.window_sec) - now
+            retry_after = max(retry_after, 0.0)
+            return RateLimitResult(
+                allowed=False,
+                remaining=0,
+                retry_after_sec=round(retry_after, 6),
+                limit_name=limit_name,
+            )
+
+    def get_remaining(self, name: Optional[str] = None) -> int:
+        """Return remaining capacity in the current window."""
+        with self._lock:
+            self._prune(time.time())
+            return max(0, self._config.max_requests - len(self._timestamps))
+
+    # ------------------------------------------------------------------ #
+    #  Internal
+    # ------------------------------------------------------------------ #
+
+    def _prune(self, now: float) -> None:
+        """Remove timestamps that have fallen outside the window."""
+        cutoff = now - self._config.window_sec
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.pop(0)
+
+
+class RateLimiterFactory:
+    """Factory for creating and managing rate limiter instances.
+
+    Supports both :class:`TokenBucketLimiter` and
+    :class:`SlidingWindowLimiter` via the ``strategy`` field of
+    :class:`RateLimitConfig`.  Provides singleton semantics per name
+    through :meth:`get_or_create`.
+    """
+
+    def __init__(self) -> None:
+        self._limiters: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def create(config: RateLimitConfig) -> Any:
+        """Create a new limiter instance based on *config.strategy*."""
+        if config.strategy == 'token_bucket':
+            return TokenBucketLimiter(config)
+        elif config.strategy == 'sliding_window':
+            return SlidingWindowLimiter(config)
+        else:
+            raise ValueError(
+                f"Unknown rate limit strategy: '{config.strategy}'. "
+                "Must be 'token_bucket' or 'sliding_window'."
+            )
+
+    def get_or_create(self, name: str, config: RateLimitConfig) -> Any:
+        """Return the limiter for *name*, creating one if it does not exist."""
+        with self._lock:
+            if name not in self._limiters:
+                self._limiters[name] = self.create(config)
+            return self._limiters[name]
+
+    def get_all_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return stats for every managed limiter.
+
+        Each entry contains the limiter's remaining capacity and its
+        configuration summary.
+        """
+        with self._lock:
+            stats: Dict[str, Dict[str, Any]] = {}
+            for name, limiter in self._limiters.items():
+                remaining = limiter.get_remaining()
+                cfg = limiter._config
+                stats[name] = {
+                    'remaining': remaining,
+                    'max_requests': cfg.max_requests,
+                    'window_sec': cfg.window_sec,
+                    'burst_size': cfg.burst_size,
+                    'strategy': cfg.strategy,
+                }
+            return stats
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

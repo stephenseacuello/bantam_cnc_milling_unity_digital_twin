@@ -1666,4 +1666,191 @@ namespace MiracleTwin.Cutting
             return "poor";
         }
     }
+
+    // ── Axis Backlash Compensation ──────────────────────────────────────
+
+    /// <summary>
+    /// Per-axis backlash configuration including measured backlash, applied
+    /// compensation, last calibration date, and most-recent move direction.
+    /// </summary>
+    [Serializable]
+    public class AxisBacklash
+    {
+        public string axisName;           // X, Y, Z, A, B, C
+        public float backlashMm;          // measured mechanical backlash (mm)
+        public float compensationMm;      // compensation value applied (mm)
+        public string lastCalibrated;     // ISO-8601 date string
+        public int direction;             // +1 or -1 for last move direction
+
+        public AxisBacklash(string axisName, float backlashMm)
+        {
+            this.axisName = axisName;
+            this.backlashMm = backlashMm;
+            this.compensationMm = backlashMm;   // default: compensate fully
+            this.lastCalibrated = DateTime.UtcNow.ToString("o");
+            this.direction = 1;
+        }
+    }
+
+    /// <summary>
+    /// Result of a backlash verification test on a single axis.
+    /// </summary>
+    [Serializable]
+    public class BacklashTestResult
+    {
+        public string axisName;
+        public float measuredBacklash;
+        public float appliedCompensation;
+        public float residualError;
+        public string testDate;
+        public bool passed;
+    }
+
+    /// <summary>
+    /// Manages per-axis backlash compensation values for CNC machines.
+    /// Tracks mechanical backlash, applies directional compensation on
+    /// direction reversals, and supports calibration verification testing.
+    /// </summary>
+    public class BacklashCompensationManager
+    {
+        private readonly Dictionary<string, AxisBacklash> _axes =
+            new Dictionary<string, AxisBacklash>();
+
+        /// <summary>Maximum allowable residual error (mm) for a test to pass.</summary>
+        public const float PassThresholdMm = 0.005f;
+
+        public BacklashCompensationManager()
+        {
+            // Initialise standard linear axes with a conservative default backlash.
+            _axes["X"] = new AxisBacklash("X", 0.01f);
+            _axes["Y"] = new AxisBacklash("Y", 0.01f);
+            _axes["Z"] = new AxisBacklash("Z", 0.01f);
+        }
+
+        // ── Set / Get ───────────────────────────────────────────────────
+
+        /// <summary>
+        /// Set (or update) the backlash value for a given axis.  If the axis
+        /// does not yet exist it is created.
+        /// </summary>
+        public void SetBacklash(string axis, float value)
+        {
+            if (string.IsNullOrEmpty(axis))
+                throw new ArgumentException("axis must not be null or empty");
+            if (value < 0f)
+                throw new ArgumentException("backlash value must be non-negative");
+
+            if (_axes.ContainsKey(axis))
+            {
+                _axes[axis].backlashMm = value;
+                _axes[axis].compensationMm = value;
+                _axes[axis].lastCalibrated = DateTime.UtcNow.ToString("o");
+            }
+            else
+            {
+                _axes[axis] = new AxisBacklash(axis, value);
+            }
+        }
+
+        /// <summary>
+        /// Return the current backlash configuration for an axis, or null
+        /// if the axis is not registered.
+        /// </summary>
+        public AxisBacklash GetBacklash(string axis)
+        {
+            if (string.IsNullOrEmpty(axis))
+                return null;
+            return _axes.ContainsKey(axis) ? _axes[axis] : null;
+        }
+
+        // ── Compensation ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Calculate the compensation offset to apply when moving the given
+        /// axis in <paramref name="moveDirection"/> (+1 or -1).  A non-zero
+        /// offset is only returned when the direction reverses.
+        /// </summary>
+        public float ApplyCompensation(string axis, int moveDirection)
+        {
+            if (string.IsNullOrEmpty(axis))
+                throw new ArgumentException("axis must not be null or empty");
+            if (moveDirection != 1 && moveDirection != -1)
+                throw new ArgumentException("moveDirection must be +1 or -1");
+            if (!_axes.ContainsKey(axis))
+                throw new KeyNotFoundException($"Axis '{axis}' is not registered");
+
+            AxisBacklash ab = _axes[axis];
+            if (moveDirection != ab.direction)
+            {
+                ab.direction = moveDirection;
+                return ab.compensationMm;
+            }
+            return 0f;
+        }
+
+        // ── Testing / Verification ──────────────────────────────────────
+
+        /// <summary>
+        /// Run a backlash verification test.  Compares a <paramref name="measuredValue"/>
+        /// (actual backlash observed at the machine) against the currently
+        /// configured compensation and returns a <see cref="BacklashTestResult"/>.
+        /// </summary>
+        public BacklashTestResult RunBacklashTest(string axis, float measuredValue)
+        {
+            if (string.IsNullOrEmpty(axis))
+                throw new ArgumentException("axis must not be null or empty");
+            if (!_axes.ContainsKey(axis))
+                throw new KeyNotFoundException($"Axis '{axis}' is not registered");
+
+            AxisBacklash ab = _axes[axis];
+            float residual = Mathf.Abs(measuredValue - ab.compensationMm);
+
+            return new BacklashTestResult
+            {
+                axisName = axis,
+                measuredBacklash = measuredValue,
+                appliedCompensation = ab.compensationMm,
+                residualError = residual,
+                testDate = DateTime.UtcNow.ToString("o"),
+                passed = residual <= PassThresholdMm
+            };
+        }
+
+        // ── Query helpers ───────────────────────────────────────────────
+
+        /// <summary>Return all registered axis configurations.</summary>
+        public List<AxisBacklash> GetAllAxes()
+        {
+            return new List<AxisBacklash>(_axes.Values);
+        }
+
+        /// <summary>
+        /// Check whether an axis's calibration is older than
+        /// <paramref name="maxAgeDays"/> days.
+        /// </summary>
+        public bool NeedsRecalibration(string axis, int maxAgeDays)
+        {
+            if (string.IsNullOrEmpty(axis))
+                throw new ArgumentException("axis must not be null or empty");
+            if (!_axes.ContainsKey(axis))
+                throw new KeyNotFoundException($"Axis '{axis}' is not registered");
+
+            DateTime lastCal = DateTime.Parse(
+                _axes[axis].lastCalibrated,
+                null,
+                System.Globalization.DateTimeStyles.RoundtripKind);
+            return (DateTime.UtcNow - lastCal).TotalDays > maxAgeDays;
+        }
+
+        /// <summary>
+        /// Sum of compensation values across every registered axis.
+        /// </summary>
+        public float GetTotalCompensation()
+        {
+            float total = 0f;
+            foreach (var ab in _axes.Values)
+                total += ab.compensationMm;
+            return total;
+        }
+    }
 }

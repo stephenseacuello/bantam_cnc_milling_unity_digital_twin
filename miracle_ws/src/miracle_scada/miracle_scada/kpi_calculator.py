@@ -2488,6 +2488,174 @@ class OEEDashboardProvider:
         return results
 
 
+# ---------------------------------------------------------------------------
+# Event Sourcing Store
+# ---------------------------------------------------------------------------
+
+# Valid manufacturing event types
+MANUFACTURING_EVENT_TYPES = {
+    'job_started',
+    'job_completed',
+    'tool_changed',
+    'alarm_raised',
+    'alarm_cleared',
+    'parameter_changed',
+    'measurement_taken',
+}
+
+
+@dataclass
+class ManufacturingEvent:
+    """A single immutable manufacturing event."""
+    event_id: str
+    event_type: str
+    aggregate_id: str
+    timestamp: float
+    data: Dict[str, Any]
+    version: int
+    source: str
+
+
+@dataclass
+class EventStream:
+    """An ordered sequence of events for a single aggregate."""
+    aggregate_id: str
+    events: List[ManufacturingEvent] = field(default_factory=list)
+    current_version: int = 0
+
+
+class EventSourcingStore:
+    """Append-only event store with replay capability for manufacturing events.
+
+    Events are organised into *streams* keyed by ``aggregate_id`` (typically a
+    machine or job identifier).  Each event carries a monotonically increasing
+    ``version`` within its stream which is validated on append.  The store also
+    maintains a global log for cross-aggregate queries by type or time range.
+
+    Snapshot reconstruction is performed by replaying all events for a given
+    aggregate and folding their ``data`` dicts together.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # aggregate_id -> EventStream
+        self._streams: Dict[str, EventStream] = {}
+        # global ordered log (append-only)
+        self._global_log: List[ManufacturingEvent] = []
+
+    # -- mutators -------------------------------------------------------------
+
+    def append_event(self, event: ManufacturingEvent) -> None:
+        """Append *event* to the store.
+
+        Raises ``ValueError`` if the event type is unknown or the version does
+        not follow the expected ordering for its aggregate stream.
+        """
+        if event.event_type not in MANUFACTURING_EVENT_TYPES:
+            raise ValueError(
+                f"Unknown event type '{event.event_type}'. "
+                f"Must be one of {sorted(MANUFACTURING_EVENT_TYPES)}."
+            )
+
+        with self._lock:
+            stream = self._streams.get(event.aggregate_id)
+            if stream is None:
+                # First event for this aggregate – version must be 1
+                if event.version != 1:
+                    raise ValueError(
+                        f"First event for aggregate '{event.aggregate_id}' "
+                        f"must have version 1, got {event.version}."
+                    )
+                stream = EventStream(
+                    aggregate_id=event.aggregate_id,
+                    events=[],
+                    current_version=0,
+                )
+                self._streams[event.aggregate_id] = stream
+            else:
+                expected = stream.current_version + 1
+                if event.version != expected:
+                    raise ValueError(
+                        f"Version mismatch for aggregate '{event.aggregate_id}': "
+                        f"expected {expected}, got {event.version}."
+                    )
+
+            stream.events.append(event)
+            stream.current_version = event.version
+            self._global_log.append(event)
+
+    # -- queries --------------------------------------------------------------
+
+    def get_events(self, aggregate_id: str) -> List[ManufacturingEvent]:
+        """Return all events for *aggregate_id* in version order."""
+        with self._lock:
+            stream = self._streams.get(aggregate_id)
+            if stream is None:
+                return []
+            return list(stream.events)
+
+    def get_events_by_type(self, event_type: str) -> List[ManufacturingEvent]:
+        """Return all events across all aggregates with the given *event_type*."""
+        with self._lock:
+            return [e for e in self._global_log if e.event_type == event_type]
+
+    def get_events_in_range(
+        self, start_time: float, end_time: float
+    ) -> List[ManufacturingEvent]:
+        """Return events whose timestamp is in [*start_time*, *end_time*]."""
+        with self._lock:
+            return [
+                e for e in self._global_log
+                if start_time <= e.timestamp <= end_time
+            ]
+
+    def replay(
+        self, aggregate_id: str, up_to_version: Optional[int] = None
+    ) -> List[ManufacturingEvent]:
+        """Replay events for *aggregate_id* up to (and including) *up_to_version*.
+
+        If *up_to_version* is ``None`` all events are returned.
+        """
+        with self._lock:
+            stream = self._streams.get(aggregate_id)
+            if stream is None:
+                return []
+            if up_to_version is None:
+                return list(stream.events)
+            return [e for e in stream.events if e.version <= up_to_version]
+
+    def get_snapshot(self, aggregate_id: str) -> Dict[str, Any]:
+        """Build current state by replaying all events and merging their data.
+
+        Returns a dict with ``aggregate_id``, ``current_version``,
+        ``event_count``, and ``state`` (the merged data).
+        """
+        events = self.replay(aggregate_id)
+        if not events:
+            return {}
+        state: Dict[str, Any] = {}
+        for evt in events:
+            state.update(evt.data)
+        return {
+            'aggregate_id': aggregate_id,
+            'current_version': events[-1].version,
+            'event_count': len(events),
+            'state': state,
+        }
+
+    # -- statistics -----------------------------------------------------------
+
+    def get_event_count(self) -> int:
+        """Return the total number of events across all aggregates."""
+        with self._lock:
+            return len(self._global_log)
+
+    def get_aggregate_ids(self) -> List[str]:
+        """Return a sorted list of all known aggregate ids."""
+        with self._lock:
+            return sorted(self._streams.keys())
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

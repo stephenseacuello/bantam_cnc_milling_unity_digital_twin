@@ -2410,6 +2410,282 @@ class OperatorSkillMatrix:
         return summary
 
 
+# ---------------------------------------------------------------------------
+# Quality Gate Checker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QualityCheck:
+    """A single dimensional or parametric check within a quality gate."""
+    check_id: str
+    parameter: str
+    nominal: float
+    tolerance_plus: float
+    tolerance_minus: float
+    unit: str
+    is_critical: bool
+
+
+@dataclass
+class QualityGate:
+    """A quality checkpoint that parts must pass during manufacturing."""
+    gate_id: str
+    name: str
+    stage: str
+    checks: List[QualityCheck] = field(default_factory=list)
+    is_mandatory: bool = True
+    pass_threshold_pct: float = 100.0
+
+
+@dataclass
+class InspectionResult:
+    """Result of a single quality check measurement."""
+    check_id: str
+    measured_value: float
+    deviation: float
+    passed: bool
+    timestamp: float
+    inspector: str
+
+
+@dataclass
+class GateResult:
+    """Aggregated result of inspecting a part at a quality gate."""
+    gate_id: str
+    part_id: str
+    results: List[InspectionResult] = field(default_factory=list)
+    overall_passed: bool = False
+    pass_rate_pct: float = 0.0
+    timestamp: float = 0.0
+
+
+class QualityGateChecker:
+    """Manages quality checkpoints (gates) that parts must pass through.
+
+    Each gate contains a set of quality checks with nominal values and
+    tolerances.  Parts are inspected against these checks and the results
+    are recorded for traceability and process analysis.
+    """
+
+    # Define a canonical stage ordering for ``can_proceed`` logic.
+    STAGE_ORDER: List[str] = [
+        'incoming',
+        'roughing',
+        'semi_finish',
+        'finishing',
+        'inspection',
+        'shipping',
+    ]
+
+    def __init__(self) -> None:
+        self._gates: Dict[str, QualityGate] = {}
+        # part_id -> list of GateResult (chronological)
+        self._part_history: Dict[str, List[GateResult]] = {}
+
+    # -- gate management -----------------------------------------------------
+
+    def add_gate(self, gate: QualityGate) -> None:
+        """Register a quality gate."""
+        self._gates[gate.gate_id] = gate
+
+    def get_gate(self, gate_id: str) -> Optional[QualityGate]:
+        """Return a gate by id, or ``None`` if not found."""
+        return self._gates.get(gate_id)
+
+    def get_all_gates(self) -> List[QualityGate]:
+        """Return all registered gates."""
+        return list(self._gates.values())
+
+    # -- inspection ----------------------------------------------------------
+
+    def inspect(
+        self,
+        gate_id: str,
+        part_id: str,
+        measurements: Dict[str, float],
+        inspector: str,
+    ) -> GateResult:
+        """Evaluate *measurements* against the checks defined in *gate_id*.
+
+        Parameters
+        ----------
+        gate_id:
+            The quality gate to inspect against.
+        part_id:
+            Identifier of the part being inspected.
+        measurements:
+            Mapping of ``check_id`` -> ``measured_value``.
+        inspector:
+            Name or id of the person/system performing the inspection.
+
+        Returns
+        -------
+        GateResult
+            Aggregated inspection result with per-check details.
+
+        Raises
+        ------
+        KeyError
+            If *gate_id* is not registered.
+        """
+        gate = self._gates.get(gate_id)
+        if gate is None:
+            raise KeyError(f"Unknown gate: {gate_id}")
+
+        now = time.time()
+        results: List[InspectionResult] = []
+
+        for check in gate.checks:
+            measured = measurements.get(check.check_id)
+            if measured is None:
+                # Missing measurement counts as a failure.
+                results.append(InspectionResult(
+                    check_id=check.check_id,
+                    measured_value=float('nan'),
+                    deviation=float('nan'),
+                    passed=False,
+                    timestamp=now,
+                    inspector=inspector,
+                ))
+                continue
+
+            deviation = measured - check.nominal
+            lower = check.nominal - check.tolerance_minus
+            upper = check.nominal + check.tolerance_plus
+            passed = lower <= measured <= upper
+
+            results.append(InspectionResult(
+                check_id=check.check_id,
+                measured_value=measured,
+                deviation=deviation,
+                passed=passed,
+                timestamp=now,
+                inspector=inspector,
+            ))
+
+        total = len(results)
+        passed_count = sum(1 for r in results if r.passed)
+        pass_rate = (passed_count / total * 100.0) if total > 0 else 0.0
+        overall_passed = pass_rate >= gate.pass_threshold_pct
+
+        # If any critical check failed, the gate fails regardless of threshold.
+        critical_ids = {c.check_id for c in gate.checks if c.is_critical}
+        for r in results:
+            if r.check_id in critical_ids and not r.passed:
+                overall_passed = False
+                break
+
+        gate_result = GateResult(
+            gate_id=gate_id,
+            part_id=part_id,
+            results=results,
+            overall_passed=overall_passed,
+            pass_rate_pct=pass_rate,
+            timestamp=now,
+        )
+
+        self._part_history.setdefault(part_id, []).append(gate_result)
+        return gate_result
+
+    # -- history & statistics ------------------------------------------------
+
+    def get_part_history(self, part_id: str) -> List[GateResult]:
+        """Return all gate results for *part_id* in chronological order."""
+        return list(self._part_history.get(part_id, []))
+
+    def get_gate_statistics(self, gate_id: str) -> Dict[str, Any]:
+        """Compute aggregate statistics for a gate across all inspections.
+
+        Returns a dict with keys:
+        - ``total_inspections`` (int)
+        - ``pass_rate_pct`` (float)
+        - ``most_failed_check`` (str or None)
+        - ``avg_deviation`` (dict of check_id -> float)
+        """
+        all_results: List[GateResult] = []
+        for history in self._part_history.values():
+            for gr in history:
+                if gr.gate_id == gate_id:
+                    all_results.append(gr)
+
+        total = len(all_results)
+        if total == 0:
+            return {
+                'total_inspections': 0,
+                'pass_rate_pct': 0.0,
+                'most_failed_check': None,
+                'avg_deviation': {},
+            }
+
+        passed = sum(1 for gr in all_results if gr.overall_passed)
+
+        # Per-check failure counts and deviation sums.
+        fail_counts: Dict[str, int] = {}
+        deviation_sums: Dict[str, float] = {}
+        deviation_counts: Dict[str, int] = {}
+
+        for gr in all_results:
+            for ir in gr.results:
+                if not ir.passed:
+                    fail_counts[ir.check_id] = fail_counts.get(ir.check_id, 0) + 1
+                if not math.isnan(ir.deviation):
+                    deviation_sums[ir.check_id] = (
+                        deviation_sums.get(ir.check_id, 0.0) + ir.deviation
+                    )
+                    deviation_counts[ir.check_id] = (
+                        deviation_counts.get(ir.check_id, 0) + 1
+                    )
+
+        most_failed = max(fail_counts, key=fail_counts.get) if fail_counts else None  # type: ignore[arg-type]
+
+        avg_deviation: Dict[str, float] = {}
+        for cid, s in deviation_sums.items():
+            avg_deviation[cid] = s / deviation_counts[cid]
+
+        return {
+            'total_inspections': total,
+            'pass_rate_pct': passed / total * 100.0,
+            'most_failed_check': most_failed,
+            'avg_deviation': avg_deviation,
+        }
+
+    # -- stage gating --------------------------------------------------------
+
+    def can_proceed(self, part_id: str, next_stage: str) -> bool:
+        """Check whether *part_id* may advance to *next_stage*.
+
+        A part can proceed only if it has passed **all mandatory gates**
+        whose stage precedes *next_stage* in ``STAGE_ORDER``.
+
+        If *next_stage* is not in ``STAGE_ORDER`` (custom stage), this
+        method returns ``True`` (permissive by default).
+        """
+        if next_stage not in self.STAGE_ORDER:
+            return True
+
+        next_idx = self.STAGE_ORDER.index(next_stage)
+        prior_stages = set(self.STAGE_ORDER[:next_idx])
+
+        # Collect mandatory gates for prior stages.
+        required_gate_ids: Set[str] = set()
+        for gate in self._gates.values():
+            if gate.is_mandatory and gate.stage in prior_stages:
+                required_gate_ids.add(gate.gate_id)
+
+        if not required_gate_ids:
+            return True
+
+        # Check part history for passed results.
+        history = self._part_history.get(part_id, [])
+        passed_gates: Set[str] = set()
+        for gr in history:
+            if gr.overall_passed:
+                passed_gates.add(gr.gate_id)
+
+        return required_gate_ids.issubset(passed_gates)
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

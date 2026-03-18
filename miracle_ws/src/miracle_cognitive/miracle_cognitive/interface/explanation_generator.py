@@ -2514,6 +2514,203 @@ class AnomalyScoringModel:
         return ' '.join(parts)
 
 
+@dataclass
+class PriorDistribution:
+    """Prior distribution specification for a manufacturing process parameter."""
+    parameter_name: str
+    mean: float
+    std: float
+    distribution_type: str = 'normal'  # 'normal' or 'uniform'
+    lower_bound: Optional[float] = None
+    upper_bound: Optional[float] = None
+
+    def __post_init__(self):
+        if self.distribution_type not in ('normal', 'uniform'):
+            raise ValueError(
+                f"distribution_type must be 'normal' or 'uniform', "
+                f"got '{self.distribution_type}'"
+            )
+        if self.std <= 0:
+            raise ValueError("std must be positive")
+
+
+@dataclass
+class PosteriorEstimate:
+    """Posterior estimate for a single parameter after Bayesian updates."""
+    parameter_name: str
+    mean: float
+    std: float
+    credible_interval_95: Tuple[float, float]
+    n_observations: int
+    prior_mean: float
+    prior_std: float
+
+
+@dataclass
+class EstimationReport:
+    """Report covering posterior estimates for all tracked parameters."""
+    parameters: Dict[str, PosteriorEstimate]
+    convergence_score: float  # 0-1
+    total_observations: int
+    timestamp: float
+
+
+class BayesianParameterEstimator:
+    """Bayesian estimation of manufacturing process parameters.
+
+    Uses conjugate Normal-Normal updates to maintain posterior distributions
+    over CNC process parameters (feed rate, spindle speed, depth of cut, etc.).
+    Each parameter is tracked independently with its own prior and accumulated
+    observations.
+
+    Conjugate Normal-Normal update (known observation variance assumed equal
+    to prior variance unless refined by data):
+
+        posterior_mean = (prior_precision * prior_mean
+                          + n * sample_precision * sample_mean)
+                         / (prior_precision + n * sample_precision)
+
+        posterior_precision = prior_precision + n * sample_precision
+    """
+
+    def __init__(self, observation_noise_std: Optional[float] = None):
+        """Initialise the estimator.
+
+        Args:
+            observation_noise_std: Standard deviation of observation noise.
+                If ``None``, defaults to the prior std for each parameter.
+        """
+        self._priors: Dict[str, PriorDistribution] = {}
+        self._observations: Dict[str, List[float]] = {}
+        self._observation_noise_std: Optional[float] = observation_noise_std
+
+    # -- Prior management ---------------------------------------------------
+
+    def set_prior(self, prior: PriorDistribution) -> None:
+        """Set (or replace) the prior distribution for a parameter."""
+        self._priors[prior.parameter_name] = prior
+        # Reset observations when prior changes
+        self._observations[prior.parameter_name] = []
+
+    # -- Update -------------------------------------------------------------
+
+    def update(self, parameter_name: str, observation: float) -> None:
+        """Incorporate a single new observation via Bayesian update."""
+        if parameter_name not in self._priors:
+            raise KeyError(
+                f"No prior set for parameter '{parameter_name}'. "
+                f"Call set_prior() first."
+            )
+        self._observations.setdefault(parameter_name, []).append(observation)
+
+    def update_batch(self, parameter_name: str, observations: List[float]) -> None:
+        """Incorporate multiple observations at once."""
+        if parameter_name not in self._priors:
+            raise KeyError(
+                f"No prior set for parameter '{parameter_name}'. "
+                f"Call set_prior() first."
+            )
+        self._observations.setdefault(parameter_name, []).extend(observations)
+
+    # -- Estimation ---------------------------------------------------------
+
+    def _compute_posterior(self, parameter_name: str) -> PosteriorEstimate:
+        """Run the conjugate Normal-Normal update for *parameter_name*."""
+        prior = self._priors[parameter_name]
+        obs = self._observations.get(parameter_name, [])
+        n = len(obs)
+
+        prior_mean = prior.mean
+        prior_std = prior.std
+        prior_precision = 1.0 / (prior_std ** 2)
+
+        if n == 0:
+            post_mean = prior_mean
+            post_std = prior_std
+        else:
+            # Observation noise std: explicit or fallback to prior std
+            noise_std = (
+                self._observation_noise_std
+                if self._observation_noise_std is not None
+                else prior_std
+            )
+            sample_precision = 1.0 / (noise_std ** 2)
+            sample_mean = sum(obs) / n
+
+            post_precision = prior_precision + n * sample_precision
+            post_mean = (
+                (prior_precision * prior_mean + n * sample_precision * sample_mean)
+                / post_precision
+            )
+            post_std = math.sqrt(1.0 / post_precision)
+
+        # 95% credible interval  (mean +/- 1.96 * std)
+        ci_low = post_mean - 1.96 * post_std
+        ci_high = post_mean + 1.96 * post_std
+
+        return PosteriorEstimate(
+            parameter_name=parameter_name,
+            mean=post_mean,
+            std=post_std,
+            credible_interval_95=(ci_low, ci_high),
+            n_observations=n,
+            prior_mean=prior_mean,
+            prior_std=prior_std,
+        )
+
+    def get_estimate(self, parameter_name: str) -> PosteriorEstimate:
+        """Return the current posterior estimate for *parameter_name*."""
+        if parameter_name not in self._priors:
+            raise KeyError(
+                f"No prior set for parameter '{parameter_name}'. "
+                f"Call set_prior() first."
+            )
+        return self._compute_posterior(parameter_name)
+
+    def get_report(self) -> EstimationReport:
+        """Return an :class:`EstimationReport` covering all tracked parameters."""
+        estimates: Dict[str, PosteriorEstimate] = {}
+        total_obs = 0
+        convergence_scores: List[float] = []
+
+        for name in self._priors:
+            est = self._compute_posterior(name)
+            estimates[name] = est
+            total_obs += est.n_observations
+
+            # Convergence: ratio of posterior std to prior std.
+            # Smaller posterior std relative to prior means more convergence.
+            if est.prior_std > 0:
+                ratio = est.std / est.prior_std
+                conv = max(0.0, min(1.0, 1.0 - ratio))
+            else:
+                conv = 1.0
+            convergence_scores.append(conv)
+
+        if convergence_scores:
+            avg_convergence = sum(convergence_scores) / len(convergence_scores)
+        else:
+            avg_convergence = 0.0
+
+        return EstimationReport(
+            parameters=estimates,
+            convergence_score=round(avg_convergence, 6),
+            total_observations=total_obs,
+            timestamp=time.time(),
+        )
+
+    # -- Reset --------------------------------------------------------------
+
+    def reset(self, parameter_name: str) -> None:
+        """Reset *parameter_name* back to its prior (discard observations)."""
+        if parameter_name not in self._priors:
+            raise KeyError(
+                f"No prior set for parameter '{parameter_name}'. "
+                f"Call set_prior() first."
+            )
+        self._observations[parameter_name] = []
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

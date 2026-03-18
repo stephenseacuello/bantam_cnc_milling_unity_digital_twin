@@ -4064,3 +4064,266 @@ class SurfaceFinishPredictor:
         List of ``SurfaceFinishResult`` in the same order as *inputs*.
         """
         return [self.predict_ra(inp, target_ra) for inp in inputs]
+
+
+# ===================================================================
+# Power Consumption Model
+# ===================================================================
+
+
+@dataclass
+class PowerReading:
+    """A single instantaneous power measurement."""
+
+    timestamp: float = 0.0
+    spindle_power_kw: float = 0.0
+    axis_power_kw: float = 0.0
+    coolant_power_kw: float = 0.0
+    auxiliary_power_kw: float = 0.0
+    total_power_kw: float = 0.0
+
+
+@dataclass
+class PowerProfile:
+    """Machine power consumption profile parameters."""
+
+    idle_power_kw: float = 1.5
+    spindle_constant_kw: float = 2.0
+    spindle_load_factor: float = 0.15
+    axis_power_per_feed: float = 0.0001
+    coolant_power_kw: float = 0.75
+    auxiliary_power_kw: float = 0.5
+
+
+@dataclass
+class PowerSummary:
+    """Aggregated energy/power statistics for a machining session or job."""
+
+    total_energy_kwh: float = 0.0
+    peak_power_kw: float = 0.0
+    avg_power_kw: float = 0.0
+    idle_energy_kwh: float = 0.0
+    cutting_energy_kwh: float = 0.0
+    cost_estimate: float = 0.0
+    carbon_kg: float = 0.0
+
+
+class PowerConsumptionModel:
+    """Models and predicts CNC machine power consumption.
+
+    The model decomposes total machine power into four components:
+
+    * **Spindle** — constant draw plus a load-proportional term.
+    * **Axis drives** — proportional to commanded feed rate.
+    * **Coolant pump** — on/off depending on coolant state.
+    * **Auxiliary** — fixed draw for control electronics, lighting, etc.
+
+    An idle machine still consumes the auxiliary and a base idle power.
+    """
+
+    def __init__(self, profile: Optional[PowerProfile] = None) -> None:
+        self._profile = profile or PowerProfile()
+        self._readings: List[PowerReading] = []
+
+    # ------------------------------------------------------------------
+    # Instantaneous estimation
+    # ------------------------------------------------------------------
+
+    def estimate_power(
+        self,
+        spindle_rpm: float,
+        spindle_load_pct: float,
+        feed_mm_min: float,
+        coolant_on: bool,
+    ) -> PowerReading:
+        """Estimate instantaneous power draw.
+
+        Parameters
+        ----------
+        spindle_rpm:
+            Current spindle speed in RPM.  When 0 the spindle is off and
+            only idle / auxiliary power is drawn.
+        spindle_load_pct:
+            Spindle load as a percentage (0-100).
+        feed_mm_min:
+            Commanded feed rate in mm/min.
+        coolant_on:
+            Whether the coolant pump is active.
+
+        Returns
+        -------
+        A ``PowerReading`` with the computed breakdown and total.
+        """
+        p = self._profile
+
+        # Spindle power: constant portion when spinning + load-dependent
+        if spindle_rpm > 0:
+            spindle_kw = p.spindle_constant_kw + p.spindle_load_factor * (spindle_load_pct / 100.0) * spindle_rpm / 1000.0
+        else:
+            spindle_kw = 0.0
+
+        # Axis power: proportional to feed rate
+        axis_kw = p.axis_power_per_feed * feed_mm_min
+
+        # Coolant power
+        coolant_kw = p.coolant_power_kw if coolant_on else 0.0
+
+        # Auxiliary (always on)
+        aux_kw = p.auxiliary_power_kw
+
+        total_kw = p.idle_power_kw + spindle_kw + axis_kw + coolant_kw + aux_kw
+
+        return PowerReading(
+            timestamp=time.time(),
+            spindle_power_kw=round(spindle_kw, 6),
+            axis_power_kw=round(axis_kw, 6),
+            coolant_power_kw=round(coolant_kw, 6),
+            auxiliary_power_kw=round(aux_kw, 6),
+            total_power_kw=round(total_kw, 6),
+        )
+
+    # ------------------------------------------------------------------
+    # Recording
+    # ------------------------------------------------------------------
+
+    def record_reading(self, reading: PowerReading) -> None:
+        """Store a power reading for later summarisation."""
+        self._readings.append(reading)
+
+    # ------------------------------------------------------------------
+    # Summary / reporting
+    # ------------------------------------------------------------------
+
+    def get_summary(
+        self,
+        electricity_rate_per_kwh: float = 0.12,
+        carbon_factor_kg_per_kwh: float = 0.5,
+    ) -> PowerSummary:
+        """Generate a ``PowerSummary`` from recorded readings.
+
+        Parameters
+        ----------
+        electricity_rate_per_kwh:
+            Cost per kWh for electricity cost estimation.
+        carbon_factor_kg_per_kwh:
+            kg CO2 emitted per kWh of electricity.
+
+        Returns
+        -------
+        ``PowerSummary`` with aggregated statistics.  If fewer than two
+        readings are available, all values are zero.
+        """
+        readings = self._readings
+        if len(readings) < 2:
+            return PowerSummary()
+
+        total_energy = 0.0
+        idle_energy = 0.0
+        cutting_energy = 0.0
+        peak = 0.0
+
+        for i in range(1, len(readings)):
+            dt_h = (readings[i].timestamp - readings[i - 1].timestamp) / 3600.0
+            if dt_h <= 0:
+                continue
+            avg_total = (readings[i].total_power_kw + readings[i - 1].total_power_kw) / 2.0
+            energy = avg_total * dt_h
+            total_energy += energy
+
+            # Classify as idle vs cutting based on spindle power
+            avg_spindle = (readings[i].spindle_power_kw + readings[i - 1].spindle_power_kw) / 2.0
+            if avg_spindle > 0:
+                cutting_energy += energy
+            else:
+                idle_energy += energy
+
+            if readings[i].total_power_kw > peak:
+                peak = readings[i].total_power_kw
+
+        # Also check first reading for peak
+        if readings[0].total_power_kw > peak:
+            peak = readings[0].total_power_kw
+
+        n = len(readings)
+        avg_power = sum(r.total_power_kw for r in readings) / n
+
+        return PowerSummary(
+            total_energy_kwh=round(total_energy, 6),
+            peak_power_kw=round(peak, 6),
+            avg_power_kw=round(avg_power, 6),
+            idle_energy_kwh=round(idle_energy, 6),
+            cutting_energy_kwh=round(cutting_energy, 6),
+            cost_estimate=round(total_energy * electricity_rate_per_kwh, 6),
+            carbon_kg=round(total_energy * carbon_factor_kg_per_kwh, 6),
+        )
+
+    # ------------------------------------------------------------------
+    # Profile access
+    # ------------------------------------------------------------------
+
+    def get_power_profile(self) -> PowerProfile:
+        """Return the current ``PowerProfile``."""
+        return self._profile
+
+    # ------------------------------------------------------------------
+    # Job energy prediction
+    # ------------------------------------------------------------------
+
+    def predict_job_energy(
+        self,
+        cutting_time_min: float,
+        rapid_time_min: float,
+        idle_time_min: float,
+        avg_spindle_load: float,
+        coolant_on: bool,
+    ) -> PowerSummary:
+        """Predict total energy consumption for a planned job.
+
+        Parameters
+        ----------
+        cutting_time_min:
+            Expected time spent cutting in minutes.
+        rapid_time_min:
+            Expected time in rapid (non-cutting) moves in minutes.
+        idle_time_min:
+            Expected idle / dwell time in minutes.
+        avg_spindle_load:
+            Average spindle load percentage during cutting (0-100).
+        coolant_on:
+            Whether the coolant pump will be active during cutting.
+
+        Returns
+        -------
+        ``PowerSummary`` with predicted energy, cost, and carbon.
+        """
+        p = self._profile
+
+        # -- Cutting phase --
+        spindle_kw = p.spindle_constant_kw + p.spindle_load_factor * (avg_spindle_load / 100.0)
+        coolant_kw = p.coolant_power_kw if coolant_on else 0.0
+        cutting_power = p.idle_power_kw + spindle_kw + coolant_kw + p.auxiliary_power_kw
+        cutting_energy = cutting_power * (cutting_time_min / 60.0)
+
+        # -- Rapid phase (spindle on at no load, no coolant) --
+        rapid_power = p.idle_power_kw + p.spindle_constant_kw + p.auxiliary_power_kw
+        rapid_energy = rapid_power * (rapid_time_min / 60.0)
+
+        # -- Idle phase --
+        idle_power = p.idle_power_kw + p.auxiliary_power_kw
+        idle_energy = idle_power * (idle_time_min / 60.0)
+
+        total_energy = cutting_energy + rapid_energy + idle_energy
+        peak_power = cutting_power  # cutting is the highest draw phase
+
+        total_time_min = cutting_time_min + rapid_time_min + idle_time_min
+        avg_power = total_energy / (total_time_min / 60.0) if total_time_min > 0 else 0.0
+
+        return PowerSummary(
+            total_energy_kwh=round(total_energy, 6),
+            peak_power_kw=round(peak_power, 6),
+            avg_power_kw=round(avg_power, 6),
+            idle_energy_kwh=round(idle_energy, 6),
+            cutting_energy_kwh=round(cutting_energy + rapid_energy, 6),
+            cost_estimate=0.0,
+            carbon_kg=0.0,
+        )

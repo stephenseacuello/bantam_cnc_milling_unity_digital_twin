@@ -1662,6 +1662,541 @@ class HypothesisTestEngine:
         return handler(**kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Natural Language Explanation Generator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExplanationContext:
+    """Context surrounding a CNC event that needs explanation."""
+    event_type: str
+    severity: float
+    parameters: Dict[str, Any]
+    timestamp: float
+    machine_id: str
+
+
+@dataclass
+class NLGExplanation:
+    """A structured, human-readable explanation."""
+    title: str
+    summary: str
+    details: List[str]
+    recommendations: List[str]
+    confidence: float
+    audience: str  # 'operator' | 'engineer' | 'manager'
+
+
+class NaturalLanguageExplainer:
+    """Generates human-readable explanations for CNC events, alerts,
+    and recommendations tailored to different audience levels.
+
+    Supports three audience levels:
+      - **operator**: concise, action-oriented language
+      - **engineer**: includes technical root-cause detail
+      - **manager**: high-level impact and cost/downtime focus
+
+    Uses a template system keyed by alarm type with severity-based
+    urgency wording.
+    """
+
+    # Severity thresholds mapped to urgency words
+    _URGENCY_WORDS: List[Tuple[float, str]] = [
+        (0.9, 'CRITICAL'),
+        (0.7, 'HIGH'),
+        (0.5, 'MODERATE'),
+        (0.3, 'LOW'),
+        (0.0, 'INFORMATIONAL'),
+    ]
+
+    # Alarm templates keyed by alarm type
+    ALARM_TEMPLATES: Dict[str, Dict[str, Any]] = {
+        'CHATTER': {
+            'title': '{urgency}: Regenerative chatter detected',
+            'summary': (
+                'Regenerative chatter vibration has been detected on '
+                '{machine_id}. This self-excited vibration can damage the '
+                'tool and degrade surface finish.'
+            ),
+            'details_operator': [
+                'Vibration is outside normal operating range.',
+                'Surface finish may be affected on the current workpiece.',
+            ],
+            'details_engineer': [
+                'Regenerative chatter at a non-tooth-passing frequency indicates '
+                'instability in the cutting process stability lobe diagram.',
+                'Phase shift between successive tooth passes causes exponential '
+                'growth of vibration amplitude.',
+                'Dominant frequency does not align with spindle harmonics.',
+            ],
+            'details_manager': [
+                'Machine vibration issue may cause scrap parts if not addressed.',
+                'Potential impact on delivery schedule for current batch.',
+            ],
+            'recommendations': [
+                'Reduce spindle speed by 10-15% to move into a stable lobe.',
+                'Reduce depth of cut to lower cutting force.',
+                'Check tool stickout length and minimize if possible.',
+            ],
+        },
+        'TOOL_WEAR': {
+            'title': '{urgency}: Excessive tool wear detected',
+            'summary': (
+                'Tool wear on {machine_id} has exceeded the expected rate '
+                'based on Taylor tool life predictions. Continued operation '
+                'risks poor surface quality and potential tool breakage.'
+            ),
+            'details_operator': [
+                'The current tool is wearing faster than expected.',
+                'Part quality may drop if the tool is not replaced soon.',
+            ],
+            'details_engineer': [
+                'Flank wear VB exceeds the threshold predicted by the Taylor '
+                'tool life equation for the current cutting parameters.',
+                'Accelerated wear may indicate incorrect speed/feed combination '
+                'or workpiece material hardness variation.',
+                'Crater wear pattern suggests high cutting temperature at the '
+                'tool-chip interface.',
+            ],
+            'details_manager': [
+                'Tool replacement is needed sooner than scheduled.',
+                'Tooling cost may increase for this production run.',
+                'Risk of unplanned downtime if tool breaks during cutting.',
+            ],
+            'recommendations': [
+                'Replace the current tool with a fresh insert.',
+                'Reduce cutting speed to extend remaining tool life.',
+                'Verify workpiece material hardness matches the process plan.',
+            ],
+        },
+        'THERMAL_DRIFT': {
+            'title': '{urgency}: Thermal drift affecting positioning',
+            'summary': (
+                'Thermal expansion on {machine_id} is causing gradual '
+                'positional drift. Dimensional accuracy of machined features '
+                'may be compromised.'
+            ),
+            'details_operator': [
+                'Machine is warming up and dimensions may be shifting.',
+                'Check part dimensions more frequently during this period.',
+            ],
+            'details_engineer': [
+                'Spindle and column thermal growth is causing TCP drift in '
+                'the Z-axis beyond the compensation model prediction.',
+                'Temperature gradient between spindle housing and machine '
+                'base exceeds the steady-state assumption.',
+                'Current thermal compensation coefficients may need recalibration.',
+            ],
+            'details_manager': [
+                'Part dimensional accuracy may be affected.',
+                'Additional inspection time may be required.',
+                'Consider thermal stabilization period before critical features.',
+            ],
+            'recommendations': [
+                'Allow the machine to reach thermal equilibrium before critical cuts.',
+                'Enable thermal compensation if not already active.',
+                'Measure and adjust tool length offset to compensate for drift.',
+            ],
+        },
+        'FORCE_OVERLOAD': {
+            'title': '{urgency}: Cutting force overload detected',
+            'summary': (
+                'Cutting forces on {machine_id} have exceeded safe operating '
+                'limits. This may cause tool breakage, workpiece movement, or '
+                'spindle damage.'
+            ),
+            'details_operator': [
+                'Cutting forces are dangerously high.',
+                'Stop the operation if forces continue to climb.',
+            ],
+            'details_engineer': [
+                'Measured cutting forces exceed the Altintas mechanistic model '
+                'prediction by a significant margin.',
+                'Force spike pattern is consistent with a hard inclusion in the '
+                'workpiece material or a dull cutting edge.',
+                'Torque on the spindle is approaching the drive motor limit.',
+            ],
+            'details_manager': [
+                'Risk of tool breakage which could damage the workpiece.',
+                'Potential for expensive spindle repair if forces are not reduced.',
+                'Production may need to be paused for safety.',
+            ],
+            'recommendations': [
+                'Immediately reduce feed rate by 30-50%.',
+                'Inspect the tool for damage or excessive wear.',
+                'Check workpiece material for unexpected hard spots.',
+            ],
+        },
+        'SURFACE_QUALITY': {
+            'title': '{urgency}: Surface quality degradation',
+            'summary': (
+                'Surface roughness on parts from {machine_id} has exceeded '
+                'acceptable limits. Finished parts may not meet specification.'
+            ),
+            'details_operator': [
+                'Surface finish on recent parts is rougher than required.',
+                'Check the tool edge for wear or built-up edge.',
+            ],
+            'details_engineer': [
+                'Measured Ra exceeds the drawing specification for the current '
+                'feature being machined.',
+                'Contributing factors may include tool wear, vibration, or '
+                'incorrect feed-per-tooth for the desired finish.',
+                'Chip re-cutting due to poor chip evacuation may be a factor.',
+            ],
+            'details_manager': [
+                'Parts may need rework or additional finishing operations.',
+                'Scrap rate may increase if the root cause is not addressed.',
+                'Customer quality requirements are at risk.',
+            ],
+            'recommendations': [
+                'Replace the tool or re-hone the cutting edge.',
+                'Reduce feed per tooth for finishing passes.',
+                'Verify coolant flow is adequate for chip evacuation.',
+            ],
+        },
+        'COOLANT_LOW': {
+            'title': '{urgency}: Coolant level or flow low',
+            'summary': (
+                'Coolant system on {machine_id} reports low flow or level. '
+                'Insufficient coolant accelerates tool wear and risks thermal '
+                'damage to the workpiece.'
+            ),
+            'details_operator': [
+                'Coolant level is low or flow rate has dropped.',
+                'Top up coolant or check for blockages in the nozzle.',
+            ],
+            'details_engineer': [
+                'Coolant flow rate has dropped below the minimum threshold '
+                'required for the current operation and material combination.',
+                'Reduced coolant may cause a spike in tool-chip interface '
+                'temperature, accelerating diffusion wear.',
+                'Check pump pressure, filter condition, and nozzle alignment.',
+            ],
+            'details_manager': [
+                'Risk of accelerated tool wear increasing tooling costs.',
+                'Potential for thermal damage to high-value workpieces.',
+                'Coolant system maintenance may be needed.',
+            ],
+            'recommendations': [
+                'Refill coolant reservoir to the correct level.',
+                'Check coolant pump and filters for blockage.',
+                'Reduce cutting speed until coolant flow is restored.',
+            ],
+        },
+    }
+
+    _DEFAULT_ALARM_TEMPLATE: Dict[str, Any] = {
+        'title': '{urgency}: Alarm on {machine_id}',
+        'summary': (
+            'An alarm of type {alarm_type} has been raised on {machine_id} '
+            'with severity {severity_pct}%.'
+        ),
+        'details_operator': [
+            'An alarm condition has been detected.',
+            'Monitor the machine and follow standard procedures.',
+        ],
+        'details_engineer': [
+            'An unrecognised alarm type was raised.',
+            'Investigate sensor data and logs for root cause.',
+        ],
+        'details_manager': [
+            'A machine alarm requires attention.',
+            'Production may be affected until resolved.',
+        ],
+        'recommendations': [
+            'Investigate the alarm and consult the machine manual.',
+            'Contact maintenance if the condition persists.',
+        ],
+    }
+
+    def __init__(self, audience: str = 'operator') -> None:
+        self._audience = self._validate_audience(audience)
+
+    # -- Public API --------------------------------------------------------
+
+    def set_audience(self, audience: str) -> None:
+        """Adjust the detail level for the target audience.
+
+        Args:
+            audience: One of 'operator', 'engineer', or 'manager'.
+        """
+        self._audience = self._validate_audience(audience)
+
+    @property
+    def audience(self) -> str:
+        return self._audience
+
+    def explain_alarm(
+        self,
+        alarm_type: str,
+        severity: float,
+        context: Optional['ExplanationContext'] = None,
+    ) -> 'NLGExplanation':
+        """Generate a plain-language explanation for a CNC alarm.
+
+        Args:
+            alarm_type: Alarm identifier (e.g. 'CHATTER', 'TOOL_WEAR').
+            severity: Severity on a 0-1 scale.
+            context: Optional additional context about the event.
+
+        Returns:
+            An NLGExplanation tailored to the current audience.
+        """
+        template = self.ALARM_TEMPLATES.get(
+            alarm_type, self._DEFAULT_ALARM_TEMPLATE,
+        )
+        urgency = self._urgency_word(severity)
+        machine_id = context.machine_id if context else 'unknown'
+        severity_pct = int(severity * 100)
+
+        fmt = {
+            'urgency': urgency,
+            'machine_id': machine_id,
+            'alarm_type': alarm_type,
+            'severity_pct': severity_pct,
+        }
+
+        title = template['title'].format(**fmt)
+        summary = template['summary'].format(**fmt)
+        details = list(self._details_for_audience(template))
+        recommendations = list(template.get('recommendations', []))
+
+        # Trim recommendations for non-technical audiences
+        if self._audience == 'manager':
+            recommendations = recommendations[:1]
+
+        confidence = min(1.0, 0.6 + severity * 0.35)
+
+        return NLGExplanation(
+            title=title,
+            summary=summary,
+            details=details,
+            recommendations=recommendations,
+            confidence=round(confidence, 3),
+            audience=self._audience,
+        )
+
+    def explain_process_change(
+        self,
+        parameter: str,
+        old_value: float,
+        new_value: float,
+        reason: str,
+    ) -> 'NLGExplanation':
+        """Explain why a process parameter was changed.
+
+        Args:
+            parameter: Name of the changed parameter (e.g. 'feed_rate').
+            old_value: Previous value.
+            new_value: New value.
+            reason: Brief reason string from the control system.
+
+        Returns:
+            An NLGExplanation describing the change.
+        """
+        direction = 'increased' if new_value > old_value else 'decreased'
+        pct_change = abs(new_value - old_value) / max(abs(old_value), 1e-9) * 100
+
+        title = f'Process parameter change: {parameter}'
+        summary = (
+            f'{parameter} was {direction} from {old_value:.4g} to '
+            f'{new_value:.4g} ({pct_change:.1f}% change). Reason: {reason}.'
+        )
+
+        details_map = {
+            'operator': [
+                f'The {parameter} setting has been adjusted automatically.',
+                f'The change was made because: {reason}.',
+            ],
+            'engineer': [
+                f'{parameter} {direction} by {pct_change:.1f}% '
+                f'(from {old_value:.4g} to {new_value:.4g}).',
+                f'Root cause for adjustment: {reason}.',
+                f'Verify downstream process stability after this change.',
+            ],
+            'manager': [
+                f'An automated parameter adjustment was made to maintain '
+                f'process quality.',
+                f'Reason: {reason}.',
+            ],
+        }
+
+        details = details_map.get(self._audience, details_map['operator'])
+        recommendations = [
+            f'Monitor process stability after the {parameter} change.',
+            'Verify part quality on the next inspection.',
+        ]
+
+        confidence = 0.85
+
+        return NLGExplanation(
+            title=title,
+            summary=summary,
+            details=details,
+            recommendations=recommendations,
+            confidence=confidence,
+            audience=self._audience,
+        )
+
+    def explain_prediction(
+        self,
+        prediction_type: str,
+        predicted_value: float,
+        confidence: float,
+        factors: List[str],
+    ) -> 'NLGExplanation':
+        """Explain a predictive model output in plain language.
+
+        Args:
+            prediction_type: What is being predicted (e.g. 'tool_life').
+            predicted_value: The predicted numeric value.
+            confidence: Model confidence (0-1).
+            factors: List of contributing factor names.
+
+        Returns:
+            An NLGExplanation describing the prediction.
+        """
+        conf_word = 'high' if confidence > 0.8 else (
+            'moderate' if confidence > 0.5 else 'low'
+        )
+
+        title = f'Prediction: {prediction_type}'
+        summary = (
+            f'The system predicts {prediction_type} = {predicted_value:.4g} '
+            f'with {conf_word} confidence ({confidence:.0%}).'
+        )
+
+        factor_str = ', '.join(factors) if factors else 'general process data'
+        details_map = {
+            'operator': [
+                f'Predicted {prediction_type}: {predicted_value:.4g}.',
+                f'Confidence: {conf_word}.',
+            ],
+            'engineer': [
+                f'Predicted {prediction_type}: {predicted_value:.4g} '
+                f'(confidence: {confidence:.1%}).',
+                f'Key contributing factors: {factor_str}.',
+                f'Model uncertainty may be higher if operating conditions '
+                f'have changed recently.',
+            ],
+            'manager': [
+                f'The AI system predicts {prediction_type} at '
+                f'{predicted_value:.4g} with {conf_word} confidence.',
+                f'Based on analysis of: {factor_str}.',
+            ],
+        }
+
+        details = details_map.get(self._audience, details_map['operator'])
+
+        recommendations = []
+        if confidence < 0.5:
+            recommendations.append(
+                'Low confidence — treat this prediction as tentative and '
+                'verify with additional measurements.'
+            )
+        if confidence < 0.8:
+            recommendations.append(
+                'Consider collecting more data to improve prediction accuracy.'
+            )
+        recommendations.append(
+            f'Review the prediction after the next {prediction_type} observation.'
+        )
+
+        return NLGExplanation(
+            title=title,
+            summary=summary,
+            details=details,
+            recommendations=recommendations,
+            confidence=round(confidence, 3),
+            audience=self._audience,
+        )
+
+    def explain_recommendation(
+        self,
+        action: str,
+        expected_benefit: str,
+        risk: str,
+        context: Optional['ExplanationContext'] = None,
+    ) -> 'NLGExplanation':
+        """Explain why a specific recommendation is being made.
+
+        Args:
+            action: The recommended action.
+            expected_benefit: What improvement is expected.
+            risk: Risk of not taking the action.
+            context: Optional event context.
+
+        Returns:
+            An NLGExplanation justifying the recommendation.
+        """
+        machine_id = context.machine_id if context else 'unknown'
+
+        title = f'Recommendation: {action}'
+        summary = (
+            f'It is recommended to {action} on {machine_id}. '
+            f'Expected benefit: {expected_benefit}. '
+            f'Risk if not addressed: {risk}.'
+        )
+
+        details_map = {
+            'operator': [
+                f'Action needed: {action}.',
+                f'This will help: {expected_benefit}.',
+                f'If not done: {risk}.',
+            ],
+            'engineer': [
+                f'Recommended action: {action}.',
+                f'Expected benefit: {expected_benefit}.',
+                f'Risk assessment: {risk}.',
+                f'Machine: {machine_id}.',
+            ],
+            'manager': [
+                f'A maintenance or process action is recommended.',
+                f'Benefit: {expected_benefit}.',
+                f'Business risk if deferred: {risk}.',
+            ],
+        }
+
+        details = details_map.get(self._audience, details_map['operator'])
+        recommendations = [action]
+
+        severity = context.severity if context else 0.5
+        confidence = min(1.0, 0.65 + severity * 0.3)
+
+        return NLGExplanation(
+            title=title,
+            summary=summary,
+            details=details,
+            recommendations=recommendations,
+            confidence=round(confidence, 3),
+            audience=self._audience,
+        )
+
+    # -- Private helpers ---------------------------------------------------
+
+    @staticmethod
+    def _validate_audience(audience: str) -> str:
+        valid = ('operator', 'engineer', 'manager')
+        if audience not in valid:
+            raise ValueError(
+                f"Invalid audience '{audience}'. Must be one of {valid}."
+            )
+        return audience
+
+    def _urgency_word(self, severity: float) -> str:
+        """Map a 0-1 severity to an urgency word."""
+        for threshold, word in self._URGENCY_WORDS:
+            if severity >= threshold:
+                return word
+        return 'INFORMATIONAL'
+
+    def _details_for_audience(self, template: dict) -> List[str]:
+        """Select the appropriate detail list from a template."""
+        key = f'details_{self._audience}'
+        return list(template.get(key, template.get('details_operator', [])))
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

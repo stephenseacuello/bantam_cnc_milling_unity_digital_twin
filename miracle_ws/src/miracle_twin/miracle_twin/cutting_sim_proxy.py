@@ -3044,3 +3044,293 @@ class SpindleWarmupManager:
             thermal_stability_pct=stability,
             is_complete=is_complete,
         )
+
+
+# ---------------------------------------------------------------------------
+# G-code Tool Path Simulator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolPosition:
+    """Recorded tool position at a point along the simulated path."""
+    x: float
+    y: float
+    z: float
+    feed_mm_min: float
+    is_rapid: bool
+    timestamp_sec: float
+
+
+@dataclass
+class SimulationState:
+    """Live state of the tool-path simulator."""
+    current_position: Tuple[float, float, float]
+    elapsed_time_sec: float
+    total_distance_mm: float
+    material_removed_mm3: float
+    active_tool: str
+    spindle_rpm: float
+    coolant_on: bool
+
+
+@dataclass
+class SimulationSummary:
+    """Summary produced after executing a full G-code program."""
+    total_time_sec: float
+    cutting_time_sec: float
+    rapid_time_sec: float
+    idle_time_sec: float
+    total_distance_mm: float
+    cutting_distance_mm: float
+    rapid_distance_mm: float
+    max_feed_used: float
+    tools_used: List[str]
+    tool_changes: int
+
+
+class ToolPathSimulator:
+    """Simulates G-code execution, tracking tool position, material removal, and time.
+
+    Supported codes
+    ---------------
+    G0  — rapid positioning
+    G1  — linear interpolation (cutting)
+    G2  — circular CW  (simplified as linear segment)
+    G3  — circular CCW (simplified as linear segment)
+    M3  — spindle on (CW)
+    M5  — spindle off
+    M6  — tool change
+    M8  — coolant on
+    M9  — coolant off
+    F   — set feed rate (mm/min)
+    S   — set spindle speed (rpm)
+    T   — select tool
+    """
+
+    # Default rapid traverse rate (mm/min) used when G0 is active
+    RAPID_RATE_MM_MIN: float = 15000.0
+    # Assumed radial depth of cut for MRR estimation (mm)
+    DEFAULT_RADIAL_DEPTH_MM: float = 3.175
+    # Assumed axial depth of cut for MRR estimation (mm)
+    DEFAULT_AXIAL_DEPTH_MM: float = 1.5
+    # Dwell for a tool change (seconds)
+    TOOL_CHANGE_DWELL_SEC: float = 5.0
+
+    def __init__(self) -> None:
+        self.reset()
+
+    # -- public API ----------------------------------------------------------
+
+    def reset(self) -> None:
+        """Reset the simulator to its initial (power-on) state."""
+        self._x: float = 0.0
+        self._y: float = 0.0
+        self._z: float = 0.0
+        self._feed_mm_min: float = 0.0
+        self._spindle_rpm: float = 0.0
+        self._spindle_on: bool = False
+        self._coolant_on: bool = False
+        self._active_tool: str = 'T0'
+        self._selected_tool: str = 'T0'
+        self._elapsed_sec: float = 0.0
+        self._total_distance: float = 0.0
+        self._cutting_distance: float = 0.0
+        self._rapid_distance: float = 0.0
+        self._cutting_time: float = 0.0
+        self._rapid_time: float = 0.0
+        self._idle_time: float = 0.0
+        self._material_removed: float = 0.0
+        self._max_feed: float = 0.0
+        self._tools_used: List[str] = []
+        self._tool_changes: int = 0
+        self._position_history: List[ToolPosition] = []
+        self._motion_mode: Optional[str] = None  # 'G0', 'G1', 'G2', 'G3'
+
+        # Record initial position
+        self._record_position(is_rapid=False)
+
+    def execute_block(self, gcode_line: str) -> None:
+        """Parse and execute a single G-code line, updating internal state."""
+        line = gcode_line.split(';')[0].split('(')[0].strip().upper()
+        if not line or line.startswith('%') or line.startswith('O'):
+            return
+
+        words = self._tokenize(line)
+        # First pass — extract modal / preparatory codes
+        target_x: Optional[float] = None
+        target_y: Optional[float] = None
+        target_z: Optional[float] = None
+        has_motion = False
+
+        for code, value in words:
+            if code == 'G':
+                g = int(value) if value == int(value) else value
+                if g in (0, 1, 2, 3):
+                    self._motion_mode = f'G{g}'
+                    has_motion = True
+                # other G codes silently ignored
+            elif code == 'M':
+                m = int(value)
+                self._handle_m_code(m)
+            elif code == 'F':
+                self._feed_mm_min = value
+                if value > self._max_feed:
+                    self._max_feed = value
+            elif code == 'S':
+                self._spindle_rpm = value
+            elif code == 'T':
+                self._selected_tool = f'T{int(value)}'
+            elif code == 'X':
+                target_x = value
+                has_motion = True
+            elif code == 'Y':
+                target_y = value
+                has_motion = True
+            elif code == 'Z':
+                target_z = value
+                has_motion = True
+
+        # If coordinate words present but no explicit G code, use current mode
+        if has_motion and self._motion_mode is not None:
+            nx = target_x if target_x is not None else self._x
+            ny = target_y if target_y is not None else self._y
+            nz = target_z if target_z is not None else self._z
+            self._execute_move(nx, ny, nz)
+
+    def execute_program(self, lines: List[str]) -> SimulationSummary:
+        """Execute a list of G-code lines and return a summary."""
+        self.reset()
+        for line in lines:
+            self.execute_block(line)
+        return SimulationSummary(
+            total_time_sec=self._elapsed_sec,
+            cutting_time_sec=self._cutting_time,
+            rapid_time_sec=self._rapid_time,
+            idle_time_sec=self._idle_time,
+            total_distance_mm=self._total_distance,
+            cutting_distance_mm=self._cutting_distance,
+            rapid_distance_mm=self._rapid_distance,
+            max_feed_used=self._max_feed,
+            tools_used=list(dict.fromkeys(self._tools_used)),  # unique, ordered
+            tool_changes=self._tool_changes,
+        )
+
+    def get_position_history(self) -> List[ToolPosition]:
+        """Return the full list of recorded ToolPosition records."""
+        return list(self._position_history)
+
+    def get_state(self) -> SimulationState:
+        """Return a snapshot of the current simulation state."""
+        return SimulationState(
+            current_position=(self._x, self._y, self._z),
+            elapsed_time_sec=self._elapsed_sec,
+            total_distance_mm=self._total_distance,
+            material_removed_mm3=self._material_removed,
+            active_tool=self._active_tool,
+            spindle_rpm=self._spindle_rpm,
+            coolant_on=self._coolant_on,
+        )
+
+    # -- internal helpers ----------------------------------------------------
+
+    @staticmethod
+    def _tokenize(line: str) -> List[Tuple[str, float]]:
+        """Split a G-code line into (letter, value) pairs."""
+        tokens: List[Tuple[str, float]] = []
+        i = 0
+        while i < len(line):
+            if line[i].isalpha():
+                letter = line[i]
+                i += 1
+                num_start = i
+                # consume optional sign
+                if i < len(line) and line[i] in '+-':
+                    i += 1
+                # consume digits and one decimal point
+                has_dot = False
+                while i < len(line) and (line[i].isdigit() or (line[i] == '.' and not has_dot)):
+                    if line[i] == '.':
+                        has_dot = True
+                    i += 1
+                if num_start < i:
+                    tokens.append((letter, float(line[num_start:i])))
+            else:
+                i += 1  # skip whitespace / unexpected chars
+        return tokens
+
+    def _handle_m_code(self, m: int) -> None:
+        """Process M-code side effects."""
+        if m == 3:
+            self._spindle_on = True
+        elif m == 5:
+            self._spindle_on = False
+            self._spindle_rpm = 0.0
+        elif m == 6:
+            # Tool change — apply selected tool
+            if self._selected_tool != self._active_tool:
+                self._active_tool = self._selected_tool
+                self._tool_changes += 1
+                if self._active_tool not in self._tools_used:
+                    self._tools_used.append(self._active_tool)
+                # Add dwell time for tool change
+                self._idle_time += self.TOOL_CHANGE_DWELL_SEC
+                self._elapsed_sec += self.TOOL_CHANGE_DWELL_SEC
+        elif m == 8:
+            self._coolant_on = True
+        elif m == 9:
+            self._coolant_on = False
+
+    def _execute_move(self, nx: float, ny: float, nz: float) -> None:
+        """Move the tool from current position to (nx, ny, nz)."""
+        dx = nx - self._x
+        dy = ny - self._y
+        dz = nz - self._z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        if dist < 1e-9:
+            return  # no actual movement
+
+        is_rapid = self._motion_mode == 'G0'
+        is_cutting = self._motion_mode in ('G1', 'G2', 'G3')
+
+        if is_rapid:
+            rate = self.RAPID_RATE_MM_MIN
+        else:
+            rate = self._feed_mm_min if self._feed_mm_min > 0 else 1.0  # avoid /0
+
+        move_time_sec = (dist / rate) * 60.0  # rate is mm/min
+
+        # Update position
+        self._x = nx
+        self._y = ny
+        self._z = nz
+
+        # Update accumulators
+        self._total_distance += dist
+        self._elapsed_sec += move_time_sec
+
+        if is_rapid:
+            self._rapid_distance += dist
+            self._rapid_time += move_time_sec
+        elif is_cutting:
+            self._cutting_distance += dist
+            self._cutting_time += move_time_sec
+            # MRR estimation: cross-section * distance
+            if self._spindle_on:
+                cross_section = self.DEFAULT_RADIAL_DEPTH_MM * self.DEFAULT_AXIAL_DEPTH_MM
+                self._material_removed += cross_section * dist
+
+        # Record new position
+        self._record_position(is_rapid=is_rapid)
+
+    def _record_position(self, is_rapid: bool) -> None:
+        """Append a ToolPosition record to the history."""
+        feed = self.RAPID_RATE_MM_MIN if is_rapid else self._feed_mm_min
+        self._position_history.append(ToolPosition(
+            x=self._x,
+            y=self._y,
+            z=self._z,
+            feed_mm_min=feed,
+            is_rapid=is_rapid,
+            timestamp_sec=self._elapsed_sec,
+        ))

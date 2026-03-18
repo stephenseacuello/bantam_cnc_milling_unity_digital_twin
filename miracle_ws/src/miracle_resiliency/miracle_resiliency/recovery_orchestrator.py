@@ -1350,6 +1350,262 @@ class HeartbeatHealthScorer:
         return bonuses.get(trend, 50.0)
 
 
+# ---------------------------------------------------------------------------
+# Service Mesh Health Monitor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ServiceEndpoint:
+    """A service endpoint in the MIRACLE service mesh."""
+    service_id: str
+    service_name: str
+    endpoint_url: str
+    protocol: str
+    health_status: str = 'unknown'  # healthy, degraded, unhealthy, unknown
+    last_check: float = 0.0
+    response_time_ms: float = 0.0
+    error_count: int = 0
+    success_count: int = 0
+
+
+@dataclass
+class ServiceDependency:
+    """A dependency relationship between two services in the mesh."""
+    source_service: str
+    target_service: str
+    is_critical: bool = False
+    timeout_ms: float = 5000.0
+    retry_count: int = 3
+
+
+@dataclass
+class MeshHealthReport:
+    """A point-in-time health report for the entire service mesh."""
+    timestamp: float
+    total_services: int
+    healthy_count: int
+    degraded_count: int
+    unhealthy_count: int
+    overall_health_pct: float
+    critical_path_healthy: bool
+    slowest_service: str
+    avg_response_ms: float
+
+
+class ServiceMeshMonitor:
+    """Monitors health of inter-service communication in the MIRACLE system.
+
+    Tracks :class:`ServiceEndpoint` instances and their
+    :class:`ServiceDependency` relationships.  Health checks are recorded
+    via :meth:`record_health_check` which updates per-service counters
+    and status.  The monitor can then produce a :class:`MeshHealthReport`,
+    identify critical-path services, compute per-service availability, and
+    detect cascading failure risks.
+    """
+
+    # Thresholds for status classification
+    _DEGRADED_RESPONSE_MS = 500.0
+    _UNHEALTHY_ERROR_RATIO = 0.5
+
+    def __init__(self) -> None:
+        # service_id -> ServiceEndpoint
+        self._services: Dict[str, ServiceEndpoint] = {}
+        # list of dependency edges
+        self._dependencies: List[ServiceDependency] = []
+
+    # ------------------------------------------------------------------ #
+    #  Service registration
+    # ------------------------------------------------------------------ #
+
+    def register_service(self, endpoint: ServiceEndpoint) -> None:
+        """Register a service endpoint in the mesh."""
+        self._services[endpoint.service_id] = endpoint
+
+    def remove_service(self, service_id: str) -> bool:
+        """Remove a service from the mesh. Returns True if the service existed."""
+        if service_id in self._services:
+            del self._services[service_id]
+            # Also remove any dependencies that reference this service
+            self._dependencies = [
+                dep for dep in self._dependencies
+                if dep.source_service != service_id
+                and dep.target_service != service_id
+            ]
+            return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Dependency management
+    # ------------------------------------------------------------------ #
+
+    def add_dependency(self, dependency: ServiceDependency) -> None:
+        """Register a service dependency edge."""
+        self._dependencies.append(dependency)
+
+    # ------------------------------------------------------------------ #
+    #  Health check recording
+    # ------------------------------------------------------------------ #
+
+    def record_health_check(
+        self,
+        service_id: str,
+        is_healthy: bool,
+        response_time_ms: float,
+    ) -> None:
+        """Record the result of a health check for *service_id*.
+
+        Updates the endpoint's counters, response time, and derives a
+        new ``health_status`` based on error ratio and latency.
+        """
+        endpoint = self._services.get(service_id)
+        if endpoint is None:
+            return
+
+        endpoint.last_check = time.time()
+        endpoint.response_time_ms = response_time_ms
+
+        if is_healthy:
+            endpoint.success_count += 1
+        else:
+            endpoint.error_count += 1
+
+        # Derive status from accumulated counters
+        total = endpoint.success_count + endpoint.error_count
+        error_ratio = endpoint.error_count / total if total > 0 else 0.0
+
+        if error_ratio >= self._UNHEALTHY_ERROR_RATIO:
+            endpoint.health_status = 'unhealthy'
+        elif response_time_ms > self._DEGRADED_RESPONSE_MS:
+            endpoint.health_status = 'degraded'
+        elif error_ratio > 0.0:
+            endpoint.health_status = 'degraded'
+        else:
+            endpoint.health_status = 'healthy'
+
+    # ------------------------------------------------------------------ #
+    #  Reporting
+    # ------------------------------------------------------------------ #
+
+    def get_health_report(self) -> MeshHealthReport:
+        """Generate a :class:`MeshHealthReport` reflecting current state."""
+        total = len(self._services)
+        healthy = 0
+        degraded = 0
+        unhealthy = 0
+        response_times: List[float] = []
+        slowest_service = ''
+        max_response = -1.0
+
+        for svc in self._services.values():
+            if svc.health_status == 'healthy':
+                healthy += 1
+            elif svc.health_status == 'degraded':
+                degraded += 1
+            elif svc.health_status == 'unhealthy':
+                unhealthy += 1
+            # 'unknown' is not counted in any bucket
+
+            if svc.last_check > 0:
+                response_times.append(svc.response_time_ms)
+            if svc.response_time_ms > max_response:
+                max_response = svc.response_time_ms
+                slowest_service = svc.service_id
+
+        overall_health_pct = (healthy / total * 100.0) if total > 0 else 0.0
+        avg_response = (
+            sum(response_times) / len(response_times)
+            if response_times else 0.0
+        )
+
+        critical_path_healthy = all(
+            self._services[sid].health_status == 'healthy'
+            for sid in self.get_critical_path_services()
+            if sid in self._services
+        )
+
+        return MeshHealthReport(
+            timestamp=time.time(),
+            total_services=total,
+            healthy_count=healthy,
+            degraded_count=degraded,
+            unhealthy_count=unhealthy,
+            overall_health_pct=round(overall_health_pct, 2),
+            critical_path_healthy=critical_path_healthy,
+            slowest_service=slowest_service,
+            avg_response_ms=round(avg_response, 2),
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Critical path & availability
+    # ------------------------------------------------------------------ #
+
+    def get_critical_path_services(self) -> List[str]:
+        """Return service IDs that lie on a critical dependency path.
+
+        A service is on the critical path if it is either the source or
+        target of a dependency marked ``is_critical=True``.
+        """
+        critical_ids: set = set()
+        for dep in self._dependencies:
+            if dep.is_critical:
+                critical_ids.add(dep.source_service)
+                critical_ids.add(dep.target_service)
+        return sorted(critical_ids)
+
+    def get_service_availability(self, service_id: str) -> float:
+        """Return the availability percentage for *service_id*.
+
+        Computed as ``success_count / (success_count + error_count) * 100``.
+        Returns 0.0 if the service is unknown or has no recorded checks.
+        """
+        endpoint = self._services.get(service_id)
+        if endpoint is None:
+            return 0.0
+        total = endpoint.success_count + endpoint.error_count
+        if total == 0:
+            return 0.0
+        return round(endpoint.success_count / total * 100.0, 2)
+
+    # ------------------------------------------------------------------ #
+    #  Cascading failure detection
+    # ------------------------------------------------------------------ #
+
+    def detect_cascading_failure(self) -> List[str]:
+        """Detect services at risk of cascading failure.
+
+        If an unhealthy service is the *target* of a dependency, all
+        services that depend on it (the *source* services) are at risk.
+        Returns a sorted list of at-risk service IDs.
+        """
+        unhealthy_ids: set = set()
+        for svc in self._services.values():
+            if svc.health_status == 'unhealthy':
+                unhealthy_ids.add(svc.service_id)
+
+        if not unhealthy_ids:
+            return []
+
+        at_risk: set = set()
+        for dep in self._dependencies:
+            if dep.target_service in unhealthy_ids:
+                at_risk.add(dep.source_service)
+
+        # Propagate: if an at-risk service is itself a target for others,
+        # those sources are also at risk (transitive).
+        changed = True
+        while changed:
+            changed = False
+            for dep in self._dependencies:
+                if dep.target_service in at_risk and dep.source_service not in at_risk:
+                    at_risk.add(dep.source_service)
+                    changed = True
+
+        # Remove services that are already unhealthy (they are the root
+        # cause, not "at risk").
+        at_risk -= unhealthy_ids
+        return sorted(at_risk)
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

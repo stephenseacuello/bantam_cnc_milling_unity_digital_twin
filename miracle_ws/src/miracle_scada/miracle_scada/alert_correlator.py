@@ -406,6 +406,303 @@ class AnomalyPatternLibrary:
         return 0.5 * type_score + 0.3 * order_score + 0.2 * window_score
 
 
+@dataclass
+class AlarmCorrelationRule:
+    """A user-defined correlation rule for linking related alarms."""
+    rule_id: str
+    name: str
+    conditions: List[Dict[str, Any]]
+    time_window_sec: float
+    min_matches: int
+    action: str  # 'group' | 'suppress_secondary' | 'escalate'
+    priority: int
+    description: str = ''
+
+
+@dataclass
+class AlarmEvent:
+    """An alarm event submitted for correlation evaluation."""
+    alarm_id: str
+    alarm_type: str
+    source: str
+    severity: float
+    timestamp: float
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CorrelationMatch:
+    """Result of a successful correlation rule match."""
+    rule_id: str
+    matched_alarms: List[str]
+    root_alarm_id: str
+    action: str
+    confidence: float
+    timestamp: float
+
+
+class AlarmCorrelationRuleEngine:
+    """Evaluates user-defined correlation rules to link related alarms.
+
+    Maintains a set of correlation rules and a sliding window of recent
+    alarms.  When a new alarm is submitted via ``submit_alarm``, all rules
+    are evaluated against the recent alarm history.  Matches are recorded
+    and can be retrieved via ``get_correlation_history``.
+
+    Three built-in rules are registered on construction:
+
+    * **THERMAL_CASCADE** -- temperature + vibration within 30 s
+    * **TOOL_FAILURE_CHAIN** -- force + wear + quality within 60 s
+    * **POWER_SEQUENCE** -- power + spindle + feed within 10 s
+    """
+
+    def __init__(self) -> None:
+        self._rules: Dict[str, AlarmCorrelationRule] = {}
+        self._recent_alarms: List[AlarmEvent] = []
+        self._correlation_history: List[CorrelationMatch] = []
+        self._lock = threading.Lock()
+        self._register_builtin_rules()
+
+    # ------------------------------------------------------------------
+    # Built-in rules
+    # ------------------------------------------------------------------
+
+    def _register_builtin_rules(self) -> None:
+        """Register the three default correlation rules."""
+        self.add_rule(AlarmCorrelationRule(
+            rule_id='THERMAL_CASCADE',
+            name='Thermal Cascade',
+            conditions=[
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'temperature'},
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'vibration'},
+            ],
+            time_window_sec=30.0,
+            min_matches=2,
+            action='group',
+            priority=10,
+            description='Temperature and vibration alarms within 30s indicate thermal cascade',
+        ))
+
+        self.add_rule(AlarmCorrelationRule(
+            rule_id='TOOL_FAILURE_CHAIN',
+            name='Tool Failure Chain',
+            conditions=[
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'force'},
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'wear'},
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'quality'},
+            ],
+            time_window_sec=60.0,
+            min_matches=3,
+            action='escalate',
+            priority=20,
+            description='Force, wear, and quality alarms within 60s indicate tool failure chain',
+        ))
+
+        self.add_rule(AlarmCorrelationRule(
+            rule_id='POWER_SEQUENCE',
+            name='Power Sequence',
+            conditions=[
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'power'},
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'spindle'},
+                {'field': 'alarm_type', 'operator': 'eq', 'value': 'feed'},
+            ],
+            time_window_sec=10.0,
+            min_matches=3,
+            action='suppress_secondary',
+            priority=30,
+            description='Power, spindle, and feed alarms within 10s indicate power sequence',
+        ))
+
+    # ------------------------------------------------------------------
+    # Rule management
+    # ------------------------------------------------------------------
+
+    def add_rule(self, rule: AlarmCorrelationRule) -> None:
+        """Add or replace a correlation rule.
+
+        Args:
+            rule: The correlation rule to register.
+        """
+        with self._lock:
+            self._rules[rule.rule_id] = rule
+
+    def remove_rule(self, rule_id: str) -> bool:
+        """Remove a correlation rule by id.
+
+        Args:
+            rule_id: Identifier of the rule to remove.
+
+        Returns:
+            ``True`` if the rule was found and removed, ``False`` otherwise.
+        """
+        with self._lock:
+            if rule_id in self._rules:
+                del self._rules[rule_id]
+                return True
+            return False
+
+    def get_rules(self) -> List[AlarmCorrelationRule]:
+        """Return all registered correlation rules, sorted by priority descending."""
+        with self._lock:
+            return sorted(self._rules.values(), key=lambda r: r.priority, reverse=True)
+
+    # ------------------------------------------------------------------
+    # Alarm submission & evaluation
+    # ------------------------------------------------------------------
+
+    def submit_alarm(self, alarm: AlarmEvent) -> List[CorrelationMatch]:
+        """Submit an alarm for correlation evaluation.
+
+        The alarm is added to the recent-alarm buffer and all rules are
+        evaluated against the updated buffer.
+
+        Args:
+            alarm: The alarm event to evaluate.
+
+        Returns:
+            A list of ``CorrelationMatch`` objects for any rules that
+            matched.
+        """
+        with self._lock:
+            self._recent_alarms.append(alarm)
+            matches = self._evaluate_rules_locked(alarm)
+            self._correlation_history.extend(matches)
+            return list(matches)
+
+    def evaluate_rules(self, alarm: AlarmEvent) -> List[CorrelationMatch]:
+        """Check all rules against recent alarms within their time windows.
+
+        Unlike ``submit_alarm`` this does **not** add the alarm to the
+        buffer or record matches in the history.
+
+        Args:
+            alarm: The alarm event to evaluate against.
+
+        Returns:
+            A list of ``CorrelationMatch`` objects for matching rules.
+        """
+        with self._lock:
+            return self._evaluate_rules_locked(alarm)
+
+    def _evaluate_rules_locked(self, alarm: AlarmEvent) -> List[CorrelationMatch]:
+        """Evaluate all rules (must be called while holding ``_lock``)."""
+        matches: List[CorrelationMatch] = []
+        # Sort rules by priority descending so higher-priority rules are evaluated first
+        sorted_rules = sorted(self._rules.values(), key=lambda r: r.priority, reverse=True)
+
+        for rule in sorted_rules:
+            match = self._evaluate_single_rule(rule, alarm)
+            if match is not None:
+                matches.append(match)
+
+        return matches
+
+    def _evaluate_single_rule(
+        self, rule: AlarmCorrelationRule, trigger_alarm: AlarmEvent,
+    ) -> Optional[CorrelationMatch]:
+        """Evaluate a single rule against the recent alarm buffer.
+
+        Returns a ``CorrelationMatch`` if the rule conditions are
+        satisfied, otherwise ``None``.
+        """
+        cutoff = trigger_alarm.timestamp - rule.time_window_sec
+        window_alarms = [
+            a for a in self._recent_alarms
+            if a.timestamp >= cutoff and a.timestamp <= trigger_alarm.timestamp
+        ]
+
+        if len(window_alarms) < rule.min_matches:
+            return None
+
+        # For each condition, find at least one alarm that satisfies it
+        satisfied_conditions: List[List[AlarmEvent]] = []
+        for condition in rule.conditions:
+            matching_alarms = [
+                a for a in window_alarms
+                if self._check_condition(a, condition)
+            ]
+            if not matching_alarms:
+                return None
+            satisfied_conditions.append(matching_alarms)
+
+        # Collect unique alarm ids from all matched conditions
+        matched_alarm_ids: List[str] = []
+        seen_ids: set = set()
+        for alarm_group in satisfied_conditions:
+            for a in alarm_group:
+                if a.alarm_id not in seen_ids:
+                    seen_ids.add(a.alarm_id)
+                    matched_alarm_ids.append(a.alarm_id)
+
+        if len(matched_alarm_ids) < rule.min_matches:
+            return None
+
+        # Determine root alarm (earliest in the window)
+        matched_alarms_objs = [
+            a for a in window_alarms if a.alarm_id in seen_ids
+        ]
+        root_alarm = min(matched_alarms_objs, key=lambda a: a.timestamp)
+
+        # Confidence: based on ratio of satisfied conditions, average severity,
+        # and how many alarms matched relative to min_matches
+        condition_ratio = len(rule.conditions) / max(len(rule.conditions), 1)
+        avg_severity = sum(a.severity for a in matched_alarms_objs) / len(matched_alarms_objs)
+        count_ratio = min(len(matched_alarm_ids) / max(rule.min_matches, 1), 2.0)
+        confidence = min(1.0, condition_ratio * avg_severity * count_ratio)
+
+        return CorrelationMatch(
+            rule_id=rule.rule_id,
+            matched_alarms=matched_alarm_ids,
+            root_alarm_id=root_alarm.alarm_id,
+            action=rule.action,
+            confidence=confidence,
+            timestamp=trigger_alarm.timestamp,
+        )
+
+    @staticmethod
+    def _check_condition(alarm: AlarmEvent, condition: Dict[str, Any]) -> bool:
+        """Check whether an alarm satisfies a single condition dict.
+
+        Supported operators: ``eq``, ``ne``, ``gt``, ``lt``, ``contains``.
+
+        The *field* key is looked up first on the ``AlarmEvent`` attributes
+        and then in ``alarm.properties``.
+        """
+        field_name = condition.get('field', '')
+        operator = condition.get('operator', '')
+        expected = condition.get('value')
+
+        # Resolve field value from alarm attributes or properties
+        if hasattr(alarm, field_name) and field_name != 'properties':
+            actual = getattr(alarm, field_name)
+        else:
+            actual = alarm.properties.get(field_name)
+
+        if actual is None:
+            return False
+
+        if operator == 'eq':
+            return actual == expected
+        elif operator == 'ne':
+            return actual != expected
+        elif operator == 'gt':
+            return actual > expected
+        elif operator == 'lt':
+            return actual < expected
+        elif operator == 'contains':
+            return expected in actual
+        return False
+
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    def get_correlation_history(self) -> List[CorrelationMatch]:
+        """Return all past correlation matches."""
+        with self._lock:
+            return list(self._correlation_history)
+
+
 class AlertCorrelatorNode(MiracleLifecycleNode):
     """Correlates related alerts from anomaly and security topics.
 

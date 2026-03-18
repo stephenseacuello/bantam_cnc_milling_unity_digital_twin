@@ -1163,6 +1163,262 @@ class BatchTraceabilityManager:
             return expiring
 
 
+# ------------------------------------------------------------------
+# Production order scheduling
+# ------------------------------------------------------------------
+
+@dataclass
+class ProductionOrder:
+    """A production order to be scheduled across available machines."""
+
+    order_id: str
+    part_number: str
+    quantity: int
+    due_date: float
+    priority: int  # 1 (highest) to 5 (lowest)
+    estimated_time_per_part_min: float
+    required_operations: List[str] = field(default_factory=list)
+    material_type: str = ''
+    customer: str = ''
+    status: str = 'pending'  # pending | scheduled | in_progress | completed | late
+
+
+@dataclass
+class ScheduleEntry:
+    """An assignment of a production order (or portion) to a machine."""
+
+    order_id: str
+    machine_id: str
+    start_time: float
+    end_time: float
+    quantity: int
+
+
+@dataclass
+class ScheduleResult:
+    """The output of a scheduling run."""
+
+    entries: List[ScheduleEntry] = field(default_factory=list)
+    unscheduled_orders: List[str] = field(default_factory=list)
+    total_makespan_min: float = 0.0
+    machine_utilization: Dict[str, float] = field(default_factory=dict)
+    on_time_pct: float = 0.0
+
+
+class ProductionOrderScheduler:
+    """Schedules production orders across available machines.
+
+    Uses an earliest-due-date-first strategy with priority as a
+    tiebreaker (lower priority value == higher urgency).  Maintains
+    an internal order store, schedule entries, and provides queries
+    for late orders, per-machine schedules, and production summaries.
+    """
+
+    def __init__(self) -> None:
+        self._orders: Dict[str, ProductionOrder] = {}
+        self._schedule_entries: List[ScheduleEntry] = []
+        self._lock = threading.Lock()
+
+    # -- order management --------------------------------------------
+
+    def add_order(self, order: ProductionOrder) -> None:
+        """Add a production order to the scheduler."""
+        with self._lock:
+            self._orders[order.order_id] = order
+
+    def remove_order(self, order_id: str) -> bool:
+        """Remove a production order by ID.  Returns True if found."""
+        with self._lock:
+            if order_id in self._orders:
+                del self._orders[order_id]
+                # Also remove associated schedule entries
+                self._schedule_entries = [
+                    e for e in self._schedule_entries
+                    if e.order_id != order_id
+                ]
+                return True
+            return False
+
+    def get_order(self, order_id: str) -> Optional[ProductionOrder]:
+        """Retrieve a production order by ID, or None if not found."""
+        with self._lock:
+            return self._orders.get(order_id)
+
+    def update_order_status(self, order_id: str, status: str) -> bool:
+        """Update the status of a production order.
+
+        Valid statuses: pending, scheduled, in_progress, completed, late.
+        Returns True if the order was found and updated.
+        """
+        valid_statuses = {'pending', 'scheduled', 'in_progress', 'completed', 'late'}
+        if status not in valid_statuses:
+            return False
+        with self._lock:
+            order = self._orders.get(order_id)
+            if order is None:
+                return False
+            order.status = status
+            return True
+
+    # -- scheduling --------------------------------------------------
+
+    def schedule(
+        self,
+        machine_ids: List[str],
+        current_time: float,
+    ) -> ScheduleResult:
+        """Schedule all pending orders using earliest-due-date-first.
+
+        Orders are sorted by due date ascending, with priority (lower
+        is more urgent) as the tiebreaker.  Each order is assigned to
+        the machine with the earliest available end time.
+
+        Args:
+            machine_ids: Available machine identifiers.
+            current_time: The reference "now" timestamp (epoch seconds).
+
+        Returns:
+            A *ScheduleResult* with entries, unscheduled orders,
+            makespan, machine utilisation, and on-time percentage.
+        """
+        with self._lock:
+            pending = [
+                o for o in self._orders.values()
+                if o.status == 'pending'
+            ]
+
+        if not pending or not machine_ids:
+            unscheduled = [o.order_id for o in pending] if not machine_ids else []
+            return ScheduleResult(
+                entries=[],
+                unscheduled_orders=unscheduled,
+                total_makespan_min=0.0,
+                machine_utilization={mid: 0.0 for mid in machine_ids},
+                on_time_pct=100.0 if not pending else 0.0,
+            )
+
+        # Sort: earliest due date first, then lower priority value first
+        pending.sort(key=lambda o: (o.due_date, o.priority))
+
+        # Track machine availability (next free timestamp)
+        machine_avail: Dict[str, float] = {mid: current_time for mid in machine_ids}
+        entries: List[ScheduleEntry] = []
+        unscheduled: List[str] = []
+
+        for order in pending:
+            # Pick the machine with the earliest availability
+            best_machine = min(machine_avail, key=machine_avail.get)  # type: ignore[arg-type]
+            start = machine_avail[best_machine]
+            total_time_min = order.estimated_time_per_part_min * order.quantity
+            end = start + total_time_min * 60.0  # convert minutes to seconds
+
+            entry = ScheduleEntry(
+                order_id=order.order_id,
+                machine_id=best_machine,
+                start_time=start,
+                end_time=end,
+                quantity=order.quantity,
+            )
+            entries.append(entry)
+            machine_avail[best_machine] = end
+
+            # Update order status
+            with self._lock:
+                order.status = 'scheduled'
+
+        # Store schedule entries
+        with self._lock:
+            self._schedule_entries = list(entries)
+
+        # Compute makespan (in minutes)
+        if entries:
+            latest_end = max(e.end_time for e in entries)
+            total_makespan_min = (latest_end - current_time) / 60.0
+        else:
+            total_makespan_min = 0.0
+
+        # Machine utilisation (% of makespan that each machine is busy)
+        machine_utilization: Dict[str, float] = {}
+        for mid in machine_ids:
+            busy_sec = sum(
+                e.end_time - e.start_time
+                for e in entries
+                if e.machine_id == mid
+            )
+            if total_makespan_min > 0:
+                machine_utilization[mid] = (
+                    busy_sec / (total_makespan_min * 60.0) * 100.0
+                )
+            else:
+                machine_utilization[mid] = 0.0
+
+        # On-time percentage
+        on_time_count = sum(
+            1 for e in entries
+            if e.end_time <= self._orders[e.order_id].due_date
+        )
+        on_time_pct = (on_time_count / len(entries) * 100.0) if entries else 100.0
+
+        return ScheduleResult(
+            entries=entries,
+            unscheduled_orders=unscheduled,
+            total_makespan_min=total_makespan_min,
+            machine_utilization=machine_utilization,
+            on_time_pct=on_time_pct,
+        )
+
+    # -- queries -----------------------------------------------------
+
+    def get_late_orders(self, current_time: float) -> List[ProductionOrder]:
+        """Return orders whose due date has passed and are not completed."""
+        with self._lock:
+            return [
+                o for o in self._orders.values()
+                if o.due_date < current_time and o.status not in ('completed',)
+            ]
+
+    def get_schedule_for_machine(self, machine_id: str) -> List[ScheduleEntry]:
+        """Return all schedule entries assigned to a specific machine."""
+        with self._lock:
+            return [
+                e for e in self._schedule_entries
+                if e.machine_id == machine_id
+            ]
+
+    def get_production_summary(self) -> Dict[str, Any]:
+        """Return a summary of all production orders.
+
+        Returns:
+            {
+                'total_orders': int,
+                'by_status': {status: count, ...},
+                'avg_lead_time_min': float,
+            }
+        """
+        with self._lock:
+            orders = list(self._orders.values())
+
+        total = len(orders)
+        by_status: Dict[str, int] = {}
+        for order in orders:
+            by_status[order.status] = by_status.get(order.status, 0) + 1
+
+        # Average lead time: estimated total production time per order
+        if orders:
+            lead_times = [
+                o.estimated_time_per_part_min * o.quantity for o in orders
+            ]
+            avg_lead_time = sum(lead_times) / len(lead_times)
+        else:
+            avg_lead_time = 0.0
+
+        return {
+            'total_orders': total,
+            'by_status': by_status,
+            'avg_lead_time_min': avg_lead_time,
+        }
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

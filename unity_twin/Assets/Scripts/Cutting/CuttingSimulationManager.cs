@@ -912,4 +912,412 @@ namespace MiracleTwin.Cutting
             return (float)(totalHours / (dates.Count - 1));
         }
     }
+
+    // ── Touch Probe Measurement Simulator ─────────────────────────────
+
+    /// <summary>
+    /// A single probed point captured during a G38.2 touch probe cycle.
+    /// </summary>
+    [Serializable]
+    public class ProbePoint
+    {
+        public Vector3 position;
+        public Vector3 normal;
+        public float measuredValue;
+        public float nominalValue;
+        public float deviation;
+        public string timestamp;
+    }
+
+    /// <summary>
+    /// Result of a probe measurement cycle for a single feature.
+    /// </summary>
+    [Serializable]
+    public class ProbeResult
+    {
+        public List<ProbePoint> points;
+        public string featureType;          // bore, boss, plane, edge, slot
+        public float measuredDiameter;
+        public Vector3 measuredPosition;
+        public float formError;
+        public float positionError;
+        public bool passed;
+    }
+
+    /// <summary>
+    /// Encapsulates a complete probe measurement cycle including nominal
+    /// specification, captured points, and the computed result.
+    /// </summary>
+    [Serializable]
+    public class ProbeCycle
+    {
+        public string cycleId;
+        public string featureType;
+        public float nominalDiameter;
+        public Vector3 nominalPosition;
+        public float tolerance;
+        public List<ProbePoint> points;
+        public ProbeResult result;
+    }
+
+    /// <summary>
+    /// Simulates touch probe measurement cycles (G38.2 probing moves) for
+    /// bore, boss, and plane features.  Generates synthetic probe data with
+    /// configurable Gaussian noise, computes form errors (circularity /
+    /// flatness), and produces formatted measurement reports.
+    /// </summary>
+    public class ProbeMeasurementSimulator
+    {
+        /// <summary>Standard deviation of measurement noise in mm.</summary>
+        private float noiseStdDev;
+
+        /// <summary>Random number generator used for Gaussian noise.</summary>
+        private System.Random rng;
+
+        /// <summary>Running counter for cycle IDs.</summary>
+        private int cycleCounter;
+
+        public ProbeMeasurementSimulator(float noiseStdDev = 0.002f, int? seed = null)
+        {
+            this.noiseStdDev = noiseStdDev;
+            this.rng = seed.HasValue ? new System.Random(seed.Value) : new System.Random();
+            this.cycleCounter = 0;
+        }
+
+        // ── Noise Generation ──────────────────────────────────────────
+
+        /// <summary>
+        /// Generate a Gaussian-distributed random value using the Box-Muller transform.
+        /// </summary>
+        private float GaussianNoise()
+        {
+            double u1 = 1.0 - rng.NextDouble(); // avoid log(0)
+            double u2 = rng.NextDouble();
+            double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            return (float)(z * noiseStdDev);
+        }
+
+        /// <summary>Generate the next unique cycle identifier.</summary>
+        private string NextCycleId()
+        {
+            cycleCounter++;
+            return $"PROBE-{cycleCounter:D4}";
+        }
+
+        // ── Bore Measurement ──────────────────────────────────────────
+
+        /// <summary>
+        /// Simulate a bore (internal cylinder) probing cycle.
+        /// Points are distributed evenly around the bore circumference with
+        /// Gaussian noise applied to the radial measurement.
+        /// </summary>
+        public ProbeCycle SimulateBoreMeasurement(
+            Vector3 center,
+            float nominalDia,
+            float tolerance,
+            int numPoints = 8)
+        {
+            if (numPoints < 3)
+                throw new ArgumentException("At least 3 points are required for bore measurement.");
+
+            float nominalRadius = nominalDia / 2f;
+            var points = new List<ProbePoint>();
+            string ts = DateTime.UtcNow.ToString("o");
+
+            for (int i = 0; i < numPoints; i++)
+            {
+                float angle = (2f * Mathf.PI * i) / numPoints;
+                float noise = GaussianNoise();
+                float measuredRadius = nominalRadius + noise;
+
+                Vector3 normal = new Vector3(Mathf.Cos(angle), Mathf.Sin(angle), 0f);
+                Vector3 pos = center + normal * measuredRadius;
+
+                points.Add(new ProbePoint
+                {
+                    position = pos,
+                    normal = normal,
+                    measuredValue = measuredRadius * 2f,
+                    nominalValue = nominalDia,
+                    deviation = noise * 2f,
+                    timestamp = ts
+                });
+            }
+
+            float formError = CalculateFormError(points, "bore");
+            float measuredDia = points.Average(p => p.measuredValue);
+            float positionError = Vector3.Distance(
+                CalculateMeasuredCenter(points, center),
+                center);
+            bool passed = Mathf.Abs(measuredDia - nominalDia) <= tolerance && formError <= tolerance;
+
+            var result = new ProbeResult
+            {
+                points = points,
+                featureType = "bore",
+                measuredDiameter = measuredDia,
+                measuredPosition = CalculateMeasuredCenter(points, center),
+                formError = formError,
+                positionError = positionError,
+                passed = passed
+            };
+
+            return new ProbeCycle
+            {
+                cycleId = NextCycleId(),
+                featureType = "bore",
+                nominalDiameter = nominalDia,
+                nominalPosition = center,
+                tolerance = tolerance,
+                points = points,
+                result = result
+            };
+        }
+
+        // ── Boss Measurement ──────────────────────────────────────────
+
+        /// <summary>
+        /// Simulate a boss (external cylinder) probing cycle.
+        /// Points are probed inward from outside the boss circumference.
+        /// </summary>
+        public ProbeCycle SimulateBossMeasurement(
+            Vector3 center,
+            float nominalDia,
+            float tolerance,
+            int numPoints = 8)
+        {
+            if (numPoints < 3)
+                throw new ArgumentException("At least 3 points are required for boss measurement.");
+
+            float nominalRadius = nominalDia / 2f;
+            var points = new List<ProbePoint>();
+            string ts = DateTime.UtcNow.ToString("o");
+
+            for (int i = 0; i < numPoints; i++)
+            {
+                float angle = (2f * Mathf.PI * i) / numPoints;
+                float noise = GaussianNoise();
+                float measuredRadius = nominalRadius + noise;
+
+                // Normal points inward (toward center) for boss measurement
+                Vector3 outward = new Vector3(Mathf.Cos(angle), Mathf.Sin(angle), 0f);
+                Vector3 normal = -outward;
+                Vector3 pos = center + outward * measuredRadius;
+
+                points.Add(new ProbePoint
+                {
+                    position = pos,
+                    normal = normal,
+                    measuredValue = measuredRadius * 2f,
+                    nominalValue = nominalDia,
+                    deviation = noise * 2f,
+                    timestamp = ts
+                });
+            }
+
+            float formError = CalculateFormError(points, "boss");
+            float measuredDia = points.Average(p => p.measuredValue);
+            float positionError = Vector3.Distance(
+                CalculateMeasuredCenter(points, center),
+                center);
+            bool passed = Mathf.Abs(measuredDia - nominalDia) <= tolerance && formError <= tolerance;
+
+            var result = new ProbeResult
+            {
+                points = points,
+                featureType = "boss",
+                measuredDiameter = measuredDia,
+                measuredPosition = CalculateMeasuredCenter(points, center),
+                formError = formError,
+                positionError = positionError,
+                passed = passed
+            };
+
+            return new ProbeCycle
+            {
+                cycleId = NextCycleId(),
+                featureType = "boss",
+                nominalDiameter = nominalDia,
+                nominalPosition = center,
+                tolerance = tolerance,
+                points = points,
+                result = result
+            };
+        }
+
+        // ── Plane Measurement ─────────────────────────────────────────
+
+        /// <summary>
+        /// Simulate a surface flatness probing cycle.
+        /// Points are distributed in a grid across the plane surface with
+        /// Gaussian noise applied along the surface normal.
+        /// </summary>
+        public ProbeCycle SimulatePlaneMeasurement(
+            Vector3 origin,
+            Vector3 normal,
+            float width,
+            float length,
+            int numPoints = 9)
+        {
+            if (numPoints < 3)
+                throw new ArgumentException("At least 3 points are required for plane measurement.");
+
+            normal = normal.normalized;
+
+            // Build a local coordinate frame on the plane
+            Vector3 tangent1 = Vector3.Cross(normal, Vector3.right).normalized;
+            if (tangent1.magnitude < 0.01f)
+                tangent1 = Vector3.Cross(normal, Vector3.forward).normalized;
+            Vector3 tangent2 = Vector3.Cross(normal, tangent1).normalized;
+
+            var points = new List<ProbePoint>();
+            string ts = DateTime.UtcNow.ToString("o");
+
+            int gridSize = Mathf.Max(2, Mathf.CeilToInt(Mathf.Sqrt(numPoints)));
+            int generated = 0;
+
+            for (int i = 0; i < gridSize && generated < numPoints; i++)
+            {
+                for (int j = 0; j < gridSize && generated < numPoints; j++)
+                {
+                    float u = gridSize > 1 ? (float)i / (gridSize - 1) : 0.5f;
+                    float v = gridSize > 1 ? (float)j / (gridSize - 1) : 0.5f;
+
+                    Vector3 localOffset = tangent1 * (u - 0.5f) * width
+                                        + tangent2 * (v - 0.5f) * length;
+                    float noise = GaussianNoise();
+                    Vector3 pos = origin + localOffset + normal * noise;
+
+                    points.Add(new ProbePoint
+                    {
+                        position = pos,
+                        normal = normal,
+                        measuredValue = noise,
+                        nominalValue = 0f,
+                        deviation = noise,
+                        timestamp = ts
+                    });
+                    generated++;
+                }
+            }
+
+            float formError = CalculateFormError(points, "plane");
+
+            var result = new ProbeResult
+            {
+                points = points,
+                featureType = "plane",
+                measuredDiameter = 0f,
+                measuredPosition = origin,
+                formError = formError,
+                positionError = 0f,
+                passed = formError <= 0.01f  // default 10 µm flatness tolerance
+            };
+
+            return new ProbeCycle
+            {
+                cycleId = NextCycleId(),
+                featureType = "plane",
+                nominalDiameter = 0f,
+                nominalPosition = origin,
+                tolerance = 0.01f,
+                points = points,
+                result = result
+            };
+        }
+
+        // ── Form Error Calculation ────────────────────────────────────
+
+        /// <summary>
+        /// Calculate the form error for a set of probed points.
+        /// For bore/boss features: circularity (max radius − min radius).
+        /// For plane features: flatness (max deviation − min deviation).
+        /// </summary>
+        public float CalculateFormError(List<ProbePoint> points, string featureType)
+        {
+            if (points == null || points.Count == 0)
+                return 0f;
+
+            switch (featureType)
+            {
+                case "bore":
+                case "boss":
+                    // Circularity: difference between max and min measured radii
+                    float maxRadius = points.Max(p => p.measuredValue / 2f);
+                    float minRadius = points.Min(p => p.measuredValue / 2f);
+                    return maxRadius - minRadius;
+
+                case "plane":
+                    // Flatness: range of deviations along the normal
+                    float maxDev = points.Max(p => p.deviation);
+                    float minDev = points.Min(p => p.deviation);
+                    return maxDev - minDev;
+
+                default:
+                    // Generic: range of deviations
+                    float maxD = points.Max(p => Mathf.Abs(p.deviation));
+                    return maxD;
+            }
+        }
+
+        // ── Measurement Report ────────────────────────────────────────
+
+        /// <summary>
+        /// Generate a formatted measurement report for a probe cycle.
+        /// Includes feature type, nominal / measured values, form error,
+        /// position error, and a PASS/FAIL verdict.
+        /// </summary>
+        public string GetMeasurementReport(ProbeCycle cycle)
+        {
+            if (cycle == null)
+                throw new ArgumentNullException(nameof(cycle));
+            if (cycle.result == null)
+                throw new ArgumentException("ProbeCycle has no result.");
+
+            var r = cycle.result;
+            var lines = new List<string>
+            {
+                "═══════════════════════════════════════════════════",
+                $"  PROBE MEASUREMENT REPORT — {cycle.cycleId}",
+                "═══════════════════════════════════════════════════",
+                $"  Feature Type    : {cycle.featureType}",
+            };
+
+            if (cycle.featureType == "bore" || cycle.featureType == "boss")
+            {
+                lines.Add($"  Nominal Diameter: {cycle.nominalDiameter:F4} mm");
+                lines.Add($"  Measured Diameter: {r.measuredDiameter:F4} mm");
+                lines.Add($"  Diameter Error  : {Mathf.Abs(r.measuredDiameter - cycle.nominalDiameter):F4} mm");
+            }
+
+            lines.Add($"  Nominal Position: ({cycle.nominalPosition.x:F4}, {cycle.nominalPosition.y:F4}, {cycle.nominalPosition.z:F4})");
+            lines.Add($"  Measured Position: ({r.measuredPosition.x:F4}, {r.measuredPosition.y:F4}, {r.measuredPosition.z:F4})");
+            lines.Add($"  Form Error      : {r.formError:F4} mm");
+            lines.Add($"  Position Error  : {r.positionError:F4} mm");
+            lines.Add($"  Tolerance       : {cycle.tolerance:F4} mm");
+            lines.Add($"  Points Measured : {r.points.Count}");
+            lines.Add($"  Verdict         : {(r.passed ? "PASS" : "FAIL")}");
+            lines.Add("═══════════════════════════════════════════════════");
+
+            return string.Join("\n", lines);
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────
+
+        /// <summary>
+        /// Compute the centre of the measured points by averaging positions,
+        /// projected back along each point's normal to account for radial
+        /// measurement geometry.
+        /// </summary>
+        private Vector3 CalculateMeasuredCenter(List<ProbePoint> points, Vector3 nominalCenter)
+        {
+            if (points.Count == 0) return nominalCenter;
+
+            Vector3 sum = Vector3.zero;
+            foreach (var p in points)
+                sum += p.position;
+
+            return sum / points.Count;
+        }
+    }
 }

@@ -2703,3 +2703,197 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+# ---------------------------------------------------------------------------
+# Bulkhead Isolation Pattern
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BulkheadConfig:
+    """Configuration for a single bulkhead partition."""
+    name: str
+    max_concurrent: int
+    queue_size: int = 10
+    timeout_sec: float = 30.0
+
+
+@dataclass
+class BulkheadStatus:
+    """Runtime status snapshot of a bulkhead."""
+    name: str
+    active_count: int
+    queued_count: int
+    max_concurrent: int
+    queue_size: int
+    available_slots: int
+    rejected_count: int
+    completed_count: int
+    is_full: bool
+
+
+class BulkheadRejectedError(Exception):
+    """Raised when a bulkhead cannot accept more work."""
+
+
+class _BulkheadPartition:
+    """Internal bookkeeping for one bulkhead."""
+
+    def __init__(self, config: BulkheadConfig) -> None:
+        self.config = config
+        self._lock = threading.Lock()
+        self._semaphore = threading.Semaphore(config.max_concurrent)
+        self._active_count: int = 0
+        self._queued_count: int = 0
+        self._rejected_count: int = 0
+        self._completed_count: int = 0
+
+    # -- public helpers -----------------------------------------------------
+
+    def acquire(self) -> None:
+        """Acquire a concurrency slot, queuing if necessary.
+
+        Raises ``BulkheadRejectedError`` when both the active slots and the
+        waiting queue are exhausted.
+        """
+        with self._lock:
+            if self._active_count < self.config.max_concurrent:
+                # Fast path – slot available immediately.
+                self._active_count += 1
+                acquired = self._semaphore.acquire(blocking=False)
+                if not acquired:
+                    # Semaphore should be available; defensive fallback.
+                    self._active_count -= 1
+                    raise BulkheadRejectedError(
+                        f"Bulkhead '{self.config.name}' semaphore unavailable"
+                    )
+                return
+            # No active slot – try to queue.
+            if self._queued_count >= self.config.queue_size:
+                self._rejected_count += 1
+                raise BulkheadRejectedError(
+                    f"Bulkhead '{self.config.name}' is full "
+                    f"(active={self._active_count}, queued={self._queued_count})"
+                )
+            self._queued_count += 1
+
+        # Blocking wait outside the lock (respects timeout).
+        acquired = self._semaphore.acquire(timeout=self.config.timeout_sec)
+        with self._lock:
+            self._queued_count -= 1
+            if not acquired:
+                self._rejected_count += 1
+                raise BulkheadRejectedError(
+                    f"Bulkhead '{self.config.name}' timed out after "
+                    f"{self.config.timeout_sec}s"
+                )
+            self._active_count += 1
+
+    def release(self) -> None:
+        """Release a previously-acquired slot."""
+        with self._lock:
+            if self._active_count > 0:
+                self._active_count -= 1
+                self._completed_count += 1
+        self._semaphore.release()
+
+    def status(self) -> BulkheadStatus:
+        with self._lock:
+            available = max(
+                0, self.config.max_concurrent - self._active_count
+            )
+            return BulkheadStatus(
+                name=self.config.name,
+                active_count=self._active_count,
+                queued_count=self._queued_count,
+                max_concurrent=self.config.max_concurrent,
+                queue_size=self.config.queue_size,
+                available_slots=available,
+                rejected_count=self._rejected_count,
+                completed_count=self._completed_count,
+                is_full=(available == 0 and
+                         self._queued_count >= self.config.queue_size),
+            )
+
+
+# Default bulkhead definitions for CNC subsystems.
+_DEFAULT_BULKHEADS: List[BulkheadConfig] = [
+    BulkheadConfig(name='SPINDLE_CONTROL', max_concurrent=2),
+    BulkheadConfig(name='SENSOR_READING', max_concurrent=10),
+    BulkheadConfig(name='ALARM_PROCESSING', max_concurrent=5),
+    BulkheadConfig(name='DATABASE_WRITE', max_concurrent=3),
+]
+
+
+class BulkheadIsolator:
+    """Bulkhead pattern implementation that isolates resource pools and
+    prevents cascading failures across CNC subsystems.
+
+    Each named bulkhead maintains an independent concurrency limit and
+    overflow queue so that a slow or failing subsystem cannot starve
+    other subsystems of threads/resources.
+    """
+
+    def __init__(self, install_defaults: bool = True) -> None:
+        self._lock = threading.Lock()
+        self._partitions: Dict[str, _BulkheadPartition] = {}
+        if install_defaults:
+            for cfg in _DEFAULT_BULKHEADS:
+                self.create_bulkhead(cfg)
+
+    # -- bulkhead management ------------------------------------------------
+
+    def create_bulkhead(self, config: BulkheadConfig) -> None:
+        """Register a new bulkhead partition.
+
+        If a bulkhead with the same name already exists it will be replaced.
+        """
+        with self._lock:
+            self._partitions[config.name] = _BulkheadPartition(config)
+
+    # -- slot lifecycle -----------------------------------------------------
+
+    def acquire(self, name: str) -> None:
+        """Acquire a concurrency slot in the named bulkhead.
+
+        Raises ``KeyError`` if the bulkhead does not exist and
+        ``BulkheadRejectedError`` if the bulkhead is full.
+        """
+        partition = self._get_partition(name)
+        partition.acquire()
+
+    def release(self, name: str) -> None:
+        """Release a concurrency slot in the named bulkhead."""
+        partition = self._get_partition(name)
+        partition.release()
+
+    # -- execution helper ---------------------------------------------------
+
+    def execute_in_bulkhead(self, name: str, func, *args, **kwargs):
+        """Acquire a slot, execute *func*, and release – even on error."""
+        self.acquire(name)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            self.release(name)
+
+    # -- status queries -----------------------------------------------------
+
+    def get_status(self, name: str) -> BulkheadStatus:
+        """Return the current ``BulkheadStatus`` for the named bulkhead."""
+        return self._get_partition(name).status()
+
+    def get_all_statuses(self) -> List[BulkheadStatus]:
+        """Return statuses for every registered bulkhead."""
+        with self._lock:
+            partitions = list(self._partitions.values())
+        return [p.status() for p in partitions]
+
+    # -- internals ----------------------------------------------------------
+
+    def _get_partition(self, name: str) -> '_BulkheadPartition':
+        with self._lock:
+            partition = self._partitions.get(name)
+        if partition is None:
+            raise KeyError(f"No bulkhead named '{name}'")
+        return partition

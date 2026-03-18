@@ -2882,6 +2882,223 @@ class MetricAggregationService:
         return removed
 
 
+# ---------------------------------------------------------------------------
+# Gauge R&R (Repeatability & Reproducibility) Analyzer — AIAG MSA
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GRRStudyData:
+    """Input data for a Gauge R&R study.
+
+    Attributes:
+        parts: list of part identifiers used in the study.
+        operators: list of operator identifiers.
+        trials: number of repeated measurements per (part, operator) pair.
+        measurements: mapping from (part, operator, trial) -> measured value.
+            *trial* is 1-based (1 .. trials).
+    """
+    parts: List[str]
+    operators: List[str]
+    trials: int
+    measurements: Dict[Tuple[str, str, int], float]
+
+
+@dataclass
+class GRRResult:
+    """Result of a Gauge R&R analysis.
+
+    All variation values are expressed as standard deviations (sigma units).
+    """
+    repeatability: float       # Equipment Variation (EV)
+    reproducibility: float     # Appraiser Variation (AV)
+    grr: float                 # Gauge R&R = sqrt(EV² + AV²)
+    part_variation: float      # Part Variation (PV)
+    total_variation: float     # Total Variation = sqrt(GRR² + PV²)
+    grr_pct: float             # %GRR = (GRR / TV) * 100
+    ndc: int                   # Number of Distinct Categories
+    acceptable: bool           # True when grr_pct < 10
+    assessment: str            # 'acceptable' | 'marginal' | 'unacceptable'
+
+
+class GaugeRRAnalyzer:
+    """Performs Gauge R&R analysis per AIAG MSA (Measurement Systems Analysis)
+    guidelines using an ANOVA-based approach.
+
+    Typical usage::
+
+        study = GRRStudyData(
+            parts=['P1', 'P2', 'P3'],
+            operators=['Op1', 'Op2'],
+            trials=3,
+            measurements={(p, o, t): value ...},
+        )
+        analyzer = GaugeRRAnalyzer()
+        result = analyzer.analyze(study)
+    """
+
+    # -----------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------
+
+    def analyze(self, study_data: 'GRRStudyData') -> 'GRRResult':
+        """Perform a full ANOVA-based Gauge R&R analysis.
+
+        Returns a :class:`GRRResult` with all variance components, %GRR,
+        NDC and an overall assessment.
+        """
+        var_repeatability, var_reproducibility, var_part, var_total = (
+            self.get_variance_components(study_data)
+        )
+
+        # Convert variances to standard deviations
+        sd_repeatability = math.sqrt(var_repeatability)
+        sd_reproducibility = math.sqrt(var_reproducibility)
+        sd_grr = math.sqrt(var_repeatability + var_reproducibility)
+        sd_part = math.sqrt(var_part)
+        sd_total = math.sqrt(var_total)
+
+        grr_pct = (sd_grr / sd_total * 100.0) if sd_total > 0.0 else 0.0
+        ndc = self.calculate_ndc(sd_part, sd_grr)
+        assessment = self.assess_measurement_system(grr_pct)
+
+        return GRRResult(
+            repeatability=sd_repeatability,
+            reproducibility=sd_reproducibility,
+            grr=sd_grr,
+            part_variation=sd_part,
+            total_variation=sd_total,
+            grr_pct=grr_pct,
+            ndc=ndc,
+            acceptable=(assessment == 'acceptable'),
+            assessment=assessment,
+        )
+
+    # -----------------------------------------------------------------
+    # Assessment helpers
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def assess_measurement_system(grr_pct: float) -> str:
+        """Classify the measurement system per AIAG guidelines.
+
+        * < 10 %  -> ``'acceptable'``
+        * 10–30 % -> ``'marginal'``
+        * > 30 %  -> ``'unacceptable'``
+        """
+        if grr_pct < 10.0:
+            return 'acceptable'
+        if grr_pct <= 30.0:
+            return 'marginal'
+        return 'unacceptable'
+
+    @staticmethod
+    def calculate_ndc(part_variation: float, grr: float) -> int:
+        """Calculate Number of Distinct Categories.
+
+        NDC = floor(1.41 * PV / GRR), minimum 1.
+        """
+        if grr <= 0.0:
+            return 1
+        ndc = int(1.41 * part_variation / grr)
+        return max(ndc, 1)
+
+    # -----------------------------------------------------------------
+    # ANOVA variance-component estimation
+    # -----------------------------------------------------------------
+
+    def get_variance_components(
+        self,
+        study_data: 'GRRStudyData',
+    ) -> Tuple[float, float, float, float]:
+        """Compute variance components via ANOVA decomposition.
+
+        Returns:
+            (var_repeatability, var_reproducibility, var_part, var_total)
+        """
+        parts = study_data.parts
+        operators = study_data.operators
+        trials = study_data.trials
+        meas = study_data.measurements
+
+        n_parts = len(parts)
+        n_ops = len(operators)
+        n_total = n_parts * n_ops * trials
+
+        # Grand mean
+        grand_mean = sum(meas.values()) / n_total
+
+        # Part means
+        part_means: Dict[str, float] = {}
+        for p in parts:
+            vals = [meas[(p, o, t)] for o in operators for t in range(1, trials + 1)]
+            part_means[p] = sum(vals) / len(vals)
+
+        # Operator means
+        op_means: Dict[str, float] = {}
+        for o in operators:
+            vals = [meas[(p, o, t)] for p in parts for t in range(1, trials + 1)]
+            op_means[o] = sum(vals) / len(vals)
+
+        # Cell means (part x operator)
+        cell_means: Dict[Tuple[str, str], float] = {}
+        for p in parts:
+            for o in operators:
+                vals = [meas[(p, o, t)] for t in range(1, trials + 1)]
+                cell_means[(p, o)] = sum(vals) / len(vals)
+
+        # Sum of Squares ------------------------------------------------
+        ss_part = n_ops * trials * sum(
+            (part_means[p] - grand_mean) ** 2 for p in parts
+        )
+        ss_operator = n_parts * trials * sum(
+            (op_means[o] - grand_mean) ** 2 for o in operators
+        )
+        ss_interaction = trials * sum(
+            (cell_means[(p, o)] - part_means[p] - op_means[o] + grand_mean) ** 2
+            for p in parts for o in operators
+        )
+        ss_equipment = sum(
+            (meas[(p, o, t)] - cell_means[(p, o)]) ** 2
+            for p in parts for o in operators for t in range(1, trials + 1)
+        )
+
+        # Degrees of freedom --------------------------------------------
+        df_part = n_parts - 1
+        df_operator = n_ops - 1
+        df_interaction = df_part * df_operator
+        df_equipment = n_parts * n_ops * (trials - 1)
+
+        # Mean Squares ---------------------------------------------------
+        ms_part = ss_part / df_part if df_part > 0 else 0.0
+        ms_operator = ss_operator / df_operator if df_operator > 0 else 0.0
+        ms_interaction = (
+            ss_interaction / df_interaction if df_interaction > 0 else 0.0
+        )
+        ms_equipment = ss_equipment / df_equipment if df_equipment > 0 else 0.0
+
+        # Variance components (ANOVA method) -----------------------------
+        var_repeatability = ms_equipment
+
+        var_interaction = (ms_interaction - ms_equipment) / trials
+        if var_interaction < 0.0:
+            var_interaction = 0.0
+
+        var_reproducibility_raw = (
+            (ms_operator - ms_interaction) / (n_parts * trials)
+        )
+        if var_reproducibility_raw < 0.0:
+            var_reproducibility_raw = 0.0
+        var_reproducibility = var_reproducibility_raw + var_interaction
+
+        var_part = (ms_part - ms_interaction) / (n_ops * trials)
+        if var_part < 0.0:
+            var_part = 0.0
+
+        var_total = var_repeatability + var_reproducibility + var_part
+
+        return var_repeatability, var_reproducibility, var_part, var_total
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

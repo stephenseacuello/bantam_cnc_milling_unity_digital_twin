@@ -2711,6 +2711,399 @@ class BayesianParameterEstimator:
         self._observations[parameter_name] = []
 
 
+# ===========================================================================
+# Confidence Interval Calculator
+# ===========================================================================
+
+
+@dataclass
+class IntervalResult:
+    """Result of a confidence interval calculation."""
+    mean: float
+    std: float
+    n: int
+    confidence_level: float
+    lower: float
+    upper: float
+    margin_of_error: float
+    method: str
+
+
+@dataclass
+class PredictionInterval:
+    """Prediction interval for a future observation."""
+    predicted_value: float
+    lower: float
+    upper: float
+    confidence_level: float
+    model_std_error: float
+
+
+class ConfidenceIntervalCalculator:
+    """Calculates confidence intervals for manufacturing measurements.
+
+    Supports confidence intervals for means, proportions, variances,
+    prediction intervals for future observations, tolerance intervals,
+    and sample-size determination.  Uses pure-Python approximations
+    for the t, chi-squared, and normal distributions — no scipy required.
+
+    Leverages the CDF helpers already present in ``HypothesisTestEngine``
+    and adds inverse (quantile/PPF) functions via bisection search.
+    """
+
+    # ------------------------------------------------------------------
+    # Internal helpers — reuse HypothesisTestEngine CDFs
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _t_cdf(t_val: float, df: float) -> float:
+        return HypothesisTestEngine._t_cdf(t_val, df)
+
+    @staticmethod
+    def _chi2_cdf(x: float, k: float) -> float:
+        return HypothesisTestEngine._chi2_cdf(x, k)
+
+    @staticmethod
+    def _norm_cdf(z: float) -> float:
+        """Standard normal CDF using the error function."""
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    # ------------------------------------------------------------------
+    # Inverse (quantile / PPF) functions via bisection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bisect_ppf(cdf_fn, p: float, lo: float, hi: float,
+                    tol: float = 1e-9, max_iter: int = 200) -> float:
+        """Generic bisection-based quantile finder.
+
+        Finds *x* such that ``cdf_fn(x) ≈ p`` within *tol*.
+        """
+        for _ in range(max_iter):
+            mid = 0.5 * (lo + hi)
+            if cdf_fn(mid) < p:
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo < tol:
+                break
+        return 0.5 * (lo + hi)
+
+    @classmethod
+    def _z_ppf(cls, p: float) -> float:
+        """Quantile (inverse CDF) of the standard normal distribution."""
+        if p <= 0.0:
+            return -10.0
+        if p >= 1.0:
+            return 10.0
+        return cls._bisect_ppf(cls._norm_cdf, p, -10.0, 10.0)
+
+    @classmethod
+    def _t_ppf(cls, p: float, df: float) -> float:
+        """Quantile (inverse CDF) of Student's t-distribution."""
+        if p <= 0.0:
+            return -1000.0
+        if p >= 1.0:
+            return 1000.0
+        lo, hi = -1000.0, 1000.0
+        return cls._bisect_ppf(lambda x: cls._t_cdf(x, df), p, lo, hi)
+
+    @classmethod
+    def _chi2_ppf(cls, p: float, k: float) -> float:
+        """Quantile (inverse CDF) of the chi-squared distribution."""
+        if p <= 0.0:
+            return 0.0
+        if p >= 1.0:
+            return k + 20.0 * math.sqrt(2.0 * k)
+        # Upper bound heuristic: mean + 20 * std
+        hi = max(k + 20.0 * math.sqrt(2.0 * k), 1.0)
+        return cls._bisect_ppf(lambda x: cls._chi2_cdf(x, k), p, 0.0, hi)
+
+    # ------------------------------------------------------------------
+    # Basic statistics helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mean(data: List[float]) -> float:
+        return sum(data) / len(data)
+
+    @staticmethod
+    def _variance(data: List[float], ddof: int = 1) -> float:
+        n = len(data)
+        if n <= ddof:
+            return 0.0
+        m = sum(data) / n
+        return sum((x - m) ** 2 for x in data) / (n - ddof)
+
+    @staticmethod
+    def _std(data: List[float], ddof: int = 1) -> float:
+        return math.sqrt(ConfidenceIntervalCalculator._variance(data, ddof))
+
+    # ------------------------------------------------------------------
+    # Public methods
+    # ------------------------------------------------------------------
+
+    def mean_interval(
+        self,
+        data: List[float],
+        confidence: float = 0.95,
+    ) -> IntervalResult:
+        """Confidence interval for the population mean.
+
+        Uses the t-distribution for small samples (n < 30) and the
+        standard normal (z) for larger samples.
+
+        Args:
+            data: Sample observations.
+            confidence: Confidence level in (0, 1), e.g. 0.95.
+
+        Returns:
+            IntervalResult with lower/upper bounds and margin of error.
+        """
+        n = len(data)
+        if n < 2:
+            m = data[0] if data else 0.0
+            return IntervalResult(
+                mean=m, std=0.0, n=n,
+                confidence_level=confidence,
+                lower=m, upper=m,
+                margin_of_error=0.0, method='insufficient_data',
+            )
+
+        x_bar = self._mean(data)
+        s = self._std(data)
+        se = s / math.sqrt(n)
+        alpha = 1.0 - confidence
+
+        if n < 30:
+            df = n - 1
+            t_crit = self._t_ppf(1.0 - alpha / 2.0, df)
+            margin = t_crit * se
+            method = 't_distribution'
+        else:
+            z_crit = self._z_ppf(1.0 - alpha / 2.0)
+            margin = z_crit * se
+            method = 'z_normal'
+
+        return IntervalResult(
+            mean=x_bar, std=s, n=n,
+            confidence_level=confidence,
+            lower=x_bar - margin,
+            upper=x_bar + margin,
+            margin_of_error=margin,
+            method=method,
+        )
+
+    def proportion_interval(
+        self,
+        successes: int,
+        total: int,
+        confidence: float = 0.95,
+    ) -> IntervalResult:
+        """Wilson score confidence interval for a proportion.
+
+        The Wilson score interval behaves well even for proportions near
+        0 or 1 and for small sample sizes.
+
+        Args:
+            successes: Number of successes observed.
+            total: Total number of trials.
+            confidence: Confidence level in (0, 1).
+
+        Returns:
+            IntervalResult (mean field holds the point estimate p-hat).
+        """
+        if total <= 0:
+            return IntervalResult(
+                mean=0.0, std=0.0, n=0,
+                confidence_level=confidence,
+                lower=0.0, upper=0.0,
+                margin_of_error=0.0, method='wilson_score',
+            )
+
+        p_hat = successes / total
+        alpha = 1.0 - confidence
+        z = self._z_ppf(1.0 - alpha / 2.0)
+        z2 = z * z
+
+        denom = 1.0 + z2 / total
+        centre = (p_hat + z2 / (2.0 * total)) / denom
+        spread = z * math.sqrt(
+            (p_hat * (1.0 - p_hat) + z2 / (4.0 * total)) / total
+        ) / denom
+
+        lower = max(0.0, centre - spread)
+        upper = min(1.0, centre + spread)
+
+        return IntervalResult(
+            mean=p_hat,
+            std=math.sqrt(p_hat * (1.0 - p_hat) / total) if total > 0 else 0.0,
+            n=total,
+            confidence_level=confidence,
+            lower=lower,
+            upper=upper,
+            margin_of_error=spread,
+            method='wilson_score',
+        )
+
+    def variance_interval(
+        self,
+        data: List[float],
+        confidence: float = 0.95,
+    ) -> IntervalResult:
+        """Chi-squared confidence interval for the population variance.
+
+        Args:
+            data: Sample observations (n >= 2 required).
+            confidence: Confidence level in (0, 1).
+
+        Returns:
+            IntervalResult where *mean* holds the sample variance and
+            lower/upper are the bounds on the true variance.
+        """
+        n = len(data)
+        if n < 2:
+            return IntervalResult(
+                mean=0.0, std=0.0, n=n,
+                confidence_level=confidence,
+                lower=0.0, upper=0.0,
+                margin_of_error=0.0, method='chi_squared',
+            )
+
+        s2 = self._variance(data)
+        df = n - 1
+        alpha = 1.0 - confidence
+
+        chi2_lower = self._chi2_ppf(1.0 - alpha / 2.0, df)
+        chi2_upper = self._chi2_ppf(alpha / 2.0, df)
+
+        lower = df * s2 / chi2_lower if chi2_lower > 0 else 0.0
+        upper = df * s2 / chi2_upper if chi2_upper > 0 else float('inf')
+
+        margin = (upper - lower) / 2.0
+
+        return IntervalResult(
+            mean=s2, std=math.sqrt(s2), n=n,
+            confidence_level=confidence,
+            lower=lower, upper=upper,
+            margin_of_error=margin,
+            method='chi_squared',
+        )
+
+    def prediction_interval(
+        self,
+        predicted: float,
+        model_std_error: float,
+        n: int,
+        confidence: float = 0.95,
+    ) -> PredictionInterval:
+        """Prediction interval for a future observation.
+
+        Accounts for both model uncertainty and random variation.
+
+        Args:
+            predicted: Point prediction from the model.
+            model_std_error: Standard error of the model's residuals.
+            n: Number of observations used to fit the model.
+            confidence: Confidence level in (0, 1).
+
+        Returns:
+            PredictionInterval with lower/upper bounds.
+        """
+        alpha = 1.0 - confidence
+        if n >= 30:
+            z_crit = self._z_ppf(1.0 - alpha / 2.0)
+            margin = z_crit * model_std_error * math.sqrt(1.0 + 1.0 / n)
+        else:
+            df = max(n - 2, 1)
+            t_crit = self._t_ppf(1.0 - alpha / 2.0, df)
+            margin = t_crit * model_std_error * math.sqrt(1.0 + 1.0 / n)
+
+        return PredictionInterval(
+            predicted_value=predicted,
+            lower=predicted - margin,
+            upper=predicted + margin,
+            confidence_level=confidence,
+            model_std_error=model_std_error,
+        )
+
+    def tolerance_interval(
+        self,
+        data: List[float],
+        confidence: float = 0.95,
+        coverage: float = 0.99,
+    ) -> IntervalResult:
+        """Two-sided tolerance interval covering *coverage* of the population.
+
+        Uses the Howe approximation:  k = z_coverage * sqrt((n-1)(1+1/n) / chi2_lower)
+        where chi2_lower is the lower alpha/2 quantile of chi-squared(n-1).
+
+        Args:
+            data: Sample observations.
+            confidence: Confidence that the interval truly covers *coverage*.
+            coverage: Proportion of the population to cover.
+
+        Returns:
+            IntervalResult where lower/upper give the tolerance bounds.
+        """
+        n = len(data)
+        if n < 2:
+            m = data[0] if data else 0.0
+            return IntervalResult(
+                mean=m, std=0.0, n=n,
+                confidence_level=confidence,
+                lower=m, upper=m,
+                margin_of_error=0.0, method='tolerance_howe',
+            )
+
+        x_bar = self._mean(data)
+        s = self._std(data)
+        alpha = 1.0 - confidence
+
+        z_cov = self._z_ppf(0.5 + coverage / 2.0)
+        chi2_val = self._chi2_ppf(alpha, n - 1)
+
+        if chi2_val > 0:
+            k = z_cov * math.sqrt((n - 1) * (1.0 + 1.0 / n) / chi2_val)
+        else:
+            k = z_cov * math.sqrt(1.0 + 1.0 / n)
+
+        margin = k * s
+        return IntervalResult(
+            mean=x_bar, std=s, n=n,
+            confidence_level=confidence,
+            lower=x_bar - margin,
+            upper=x_bar + margin,
+            margin_of_error=margin,
+            method='tolerance_howe',
+        )
+
+    def sample_size_needed(
+        self,
+        margin_of_error: float,
+        confidence: float = 0.95,
+        estimated_std: float = 1.0,
+    ) -> int:
+        """Required sample size for a desired margin of error.
+
+        Uses the formula  n = ceil((z * sigma / E)^2)  for a CI on the mean.
+
+        Args:
+            margin_of_error: Maximum acceptable half-width of the CI.
+            confidence: Confidence level.
+            estimated_std: Estimated or pilot-study standard deviation.
+
+        Returns:
+            Minimum sample size (integer >= 2).
+        """
+        if margin_of_error <= 0:
+            return 2
+        alpha = 1.0 - confidence
+        z = self._z_ppf(1.0 - alpha / 2.0)
+        n = math.ceil((z * estimated_std / margin_of_error) ** 2)
+        return max(n, 2)
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

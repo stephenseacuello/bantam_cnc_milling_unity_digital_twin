@@ -4610,3 +4610,353 @@ class VibrationFFTAnalyzer:
             return True, chatter_freq
 
         return False, None
+
+
+# ---------------------------------------------------------------------------
+# Chip Evacuation Model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChipFormation:
+    """Describes the geometry and type of a formed chip."""
+    chip_type: str = 'continuous'  # 'continuous', 'segmented', 'discontinuous', 'built_up_edge'
+    chip_thickness_mm: float = 0.0
+    chip_ratio: float = 1.0
+    shear_angle_deg: float = 25.0
+    chip_curl_radius_mm: float = 5.0
+
+
+@dataclass
+class EvacuationStatus:
+    """Assessment of chip evacuation effectiveness."""
+    effectiveness_pct: float = 100.0  # 0-100
+    clogging_risk: str = 'low'  # 'low', 'medium', 'high'
+    chip_volume_rate_mm3_min: float = 0.0
+    coolant_sufficient: bool = True
+    recommendation: str = ''
+
+
+class ChipEvacuationModel:
+    """Models chip formation, breakability, and evacuation effectiveness.
+
+    Provides predictions for chip type based on cutting conditions, chip
+    thickness calculations, chip ratio analysis, evacuation effectiveness
+    evaluation, chip breaker recommendations, and shear-angle computation
+    via Merchant's equation.
+    """
+
+    # Material families that tend to produce specific chip types
+    _DUCTILE_MATERIALS = frozenset({
+        'aluminum', '6061-t6', '7075-t6', '2024-t3', 'copper', 'brass',
+        'low_carbon_steel', '1018', '1020', 'aisi_1018',
+    })
+    _HARD_MATERIALS = frozenset({
+        'cast_iron', 'gray_cast_iron', 'ductile_iron',
+        'titanium', 'ti-6al-4v', 'inconel', 'inconel_718',
+    })
+    _BRITTLE_MATERIALS = frozenset({
+        'cast_iron', 'gray_cast_iron', 'bronze', 'ceramic',
+    })
+
+    def predict_chip_type(
+        self,
+        material: str,
+        feed_mm: float,
+        speed_m_min: float,
+        rake_angle_deg: float,
+    ) -> ChipFormation:
+        """Predict the chip formation type based on cutting conditions.
+
+        Parameters
+        ----------
+        material : str
+            Workpiece material identifier (case-insensitive).
+        feed_mm : float
+            Feed per tooth / feed per revolution in mm.
+        speed_m_min : float
+            Cutting speed in m/min.
+        rake_angle_deg : float
+            Tool rake angle in degrees.
+
+        Returns
+        -------
+        ChipFormation
+            Predicted chip formation dataclass.
+        """
+        mat = material.lower().replace(' ', '_')
+
+        # Determine chip type from material family and cutting conditions
+        if mat in self._BRITTLE_MATERIALS:
+            chip_type = 'discontinuous'
+        elif mat in self._DUCTILE_MATERIALS:
+            # High speed + low feed + positive rake -> continuous
+            # Low speed + high feed -> built-up edge risk
+            if speed_m_min < 30.0 and feed_mm > 0.15:
+                chip_type = 'built_up_edge'
+            elif feed_mm > 0.25:
+                chip_type = 'segmented'
+            else:
+                chip_type = 'continuous'
+        elif mat in self._HARD_MATERIALS:
+            if feed_mm > 0.20:
+                chip_type = 'segmented'
+            else:
+                chip_type = 'discontinuous'
+        else:
+            # Default heuristic for unknown materials
+            if feed_mm > 0.25:
+                chip_type = 'segmented'
+            elif speed_m_min < 25.0 and feed_mm > 0.15:
+                chip_type = 'built_up_edge'
+            else:
+                chip_type = 'continuous'
+
+        # Estimate shear angle from an approximate chip ratio
+        estimated_ratio = max(0.2, min(1.0, 0.5 + rake_angle_deg / 60.0))
+        rake_rad = math.radians(rake_angle_deg)
+        shear_angle_deg = math.degrees(
+            math.atan2(
+                estimated_ratio * math.cos(rake_rad),
+                1.0 - estimated_ratio * math.sin(rake_rad),
+            )
+        )
+
+        # Curl radius heuristic: smaller feed -> tighter curl
+        curl_radius = max(1.0, feed_mm * 30.0)
+
+        return ChipFormation(
+            chip_type=chip_type,
+            chip_thickness_mm=feed_mm,  # undeformed approximation
+            chip_ratio=estimated_ratio,
+            shear_angle_deg=round(shear_angle_deg, 2),
+            chip_curl_radius_mm=round(curl_radius, 2),
+        )
+
+    def calculate_chip_thickness(
+        self,
+        feed_mm: float,
+        depth_mm: float,
+        width_mm: float,
+        lead_angle_deg: float = 90.0,
+    ) -> float:
+        """Calculate undeformed chip thickness.
+
+        For a turning/milling operation the undeformed chip thickness is:
+            h = f * sin(lead_angle)
+        where f is the feed per tooth/revolution.
+
+        Parameters
+        ----------
+        feed_mm : float
+            Feed per tooth/revolution in mm.
+        depth_mm : float
+            Axial depth of cut in mm (used for validation, not formula).
+        width_mm : float
+            Radial width of cut in mm (used for validation, not formula).
+        lead_angle_deg : float
+            Lead (entering) angle in degrees. Default 90 deg (square shoulder).
+
+        Returns
+        -------
+        float
+            Undeformed chip thickness in mm.
+        """
+        if feed_mm <= 0 or depth_mm <= 0 or width_mm <= 0:
+            return 0.0
+        lead_rad = math.radians(max(0.0, min(180.0, lead_angle_deg)))
+        return feed_mm * math.sin(lead_rad)
+
+    def calculate_chip_ratio(
+        self,
+        feed_mm: float,
+        chip_thickness_measured: float,
+    ) -> float:
+        """Calculate the chip compression / thickness ratio.
+
+        The chip ratio r = t_undeformed / t_deformed.  A value < 1 indicates
+        the chip is thicker than the undeformed thickness (typical).
+
+        Parameters
+        ----------
+        feed_mm : float
+            Feed per tooth (approximation of undeformed thickness).
+        chip_thickness_measured : float
+            Measured chip thickness after deformation in mm.
+
+        Returns
+        -------
+        float
+            Chip ratio (r).
+        """
+        if chip_thickness_measured <= 0 or feed_mm <= 0:
+            return 0.0
+        return feed_mm / chip_thickness_measured
+
+    def evaluate_evacuation(
+        self,
+        chip_volume_rate: float,
+        flute_count: int,
+        coolant_pressure_bar: float,
+        hole_depth_ratio: float = 0.0,
+    ) -> EvacuationStatus:
+        """Assess chip evacuation effectiveness.
+
+        Parameters
+        ----------
+        chip_volume_rate : float
+            Chip volumetric removal rate in mm^3/min.
+        flute_count : int
+            Number of flutes on the cutting tool.
+        coolant_pressure_bar : float
+            Coolant delivery pressure in bar.
+        hole_depth_ratio : float
+            Ratio of hole depth to diameter (L/D). 0 for non-hole operations.
+
+        Returns
+        -------
+        EvacuationStatus
+            Assessment of evacuation conditions.
+        """
+        # Base effectiveness from coolant pressure
+        if coolant_pressure_bar >= 70.0:
+            pressure_score = 100.0
+        elif coolant_pressure_bar >= 30.0:
+            pressure_score = 70.0 + (coolant_pressure_bar - 30.0) * 0.75
+        elif coolant_pressure_bar >= 5.0:
+            pressure_score = 40.0 + (coolant_pressure_bar - 5.0) * 1.2
+        else:
+            pressure_score = max(10.0, coolant_pressure_bar * 8.0)
+
+        # Flute penalty: fewer flutes = more chip space = better evacuation
+        flute_factor = 1.0 if flute_count <= 2 else max(0.6, 1.0 - (flute_count - 2) * 0.1)
+
+        # Depth ratio penalty for deep holes
+        depth_penalty = 1.0
+        if hole_depth_ratio > 3.0:
+            depth_penalty = max(0.3, 1.0 - (hole_depth_ratio - 3.0) * 0.1)
+
+        # Volume penalty: very high MRR challenges evacuation
+        volume_factor = 1.0
+        if chip_volume_rate > 50000:
+            volume_factor = max(0.5, 1.0 - (chip_volume_rate - 50000) / 200000)
+
+        effectiveness = pressure_score * flute_factor * depth_penalty * volume_factor
+        effectiveness = max(0.0, min(100.0, effectiveness))
+
+        # Clogging risk
+        if effectiveness >= 70.0:
+            clogging_risk = 'low'
+        elif effectiveness >= 40.0:
+            clogging_risk = 'medium'
+        else:
+            clogging_risk = 'high'
+
+        # Coolant sufficiency
+        coolant_sufficient = coolant_pressure_bar >= 5.0
+        if hole_depth_ratio > 5.0:
+            coolant_sufficient = coolant_pressure_bar >= 30.0
+
+        # Recommendations
+        recommendations: List[str] = []
+        if clogging_risk == 'high':
+            recommendations.append('Reduce depth of cut or increase peck cycle frequency.')
+        if not coolant_sufficient:
+            recommendations.append('Increase coolant pressure for reliable chip evacuation.')
+        if hole_depth_ratio > 5.0 and coolant_pressure_bar < 70.0:
+            recommendations.append('Consider through-tool high-pressure coolant for deep holes.')
+        if flute_count > 3 and effectiveness < 60.0:
+            recommendations.append('Use a tool with fewer flutes to improve chip clearance.')
+        if not recommendations:
+            recommendations.append('Chip evacuation conditions are adequate.')
+
+        return EvacuationStatus(
+            effectiveness_pct=round(effectiveness, 2),
+            clogging_risk=clogging_risk,
+            chip_volume_rate_mm3_min=chip_volume_rate,
+            coolant_sufficient=coolant_sufficient,
+            recommendation=' '.join(recommendations),
+        )
+
+    def recommend_chip_breaker(
+        self,
+        chip_type: str,
+        material: str,
+    ) -> str:
+        """Suggest chip breaker geometry based on chip type and material.
+
+        Parameters
+        ----------
+        chip_type : str
+            One of 'continuous', 'segmented', 'discontinuous', 'built_up_edge'.
+        material : str
+            Workpiece material identifier.
+
+        Returns
+        -------
+        str
+            Recommendation string describing the suggested chip breaker.
+        """
+        mat = material.lower().replace(' ', '_')
+
+        if chip_type == 'discontinuous':
+            return 'No chip breaker required; chips break naturally.'
+
+        if chip_type == 'built_up_edge':
+            return (
+                'Use a polished, positive-rake insert with a sharp edge and '
+                'increase cutting speed to eliminate built-up edge formation.'
+            )
+
+        if chip_type == 'segmented':
+            if mat in self._HARD_MATERIALS:
+                return (
+                    'Use a heavy-duty chip breaker with restricted contact length '
+                    'and negative land for hard/tough materials.'
+                )
+            return (
+                'Use a standard chip breaker groove with moderate contact length '
+                'to maintain segmented chip control.'
+            )
+
+        # continuous chips
+        if mat in self._DUCTILE_MATERIALS:
+            return (
+                'Use a tight chip breaker groove with positive rake and a '
+                'narrow land to curl and break continuous chips in ductile material.'
+            )
+        return (
+            'Use a general-purpose chip breaker with an obstruction-type groove '
+            'to promote chip curling and breakage.'
+        )
+
+    def get_shear_angle(
+        self,
+        chip_ratio: float,
+        rake_angle_deg: float,
+    ) -> float:
+        """Calculate the shear plane angle using Merchant's circle relationship.
+
+        Merchant's equation:
+            tan(phi) = r * cos(alpha) / (1 - r * sin(alpha))
+
+        Parameters
+        ----------
+        chip_ratio : float
+            Chip thickness ratio r = t_undeformed / t_deformed.
+        rake_angle_deg : float
+            Rake angle in degrees.
+
+        Returns
+        -------
+        float
+            Shear angle in degrees.
+        """
+        if chip_ratio <= 0:
+            return 0.0
+        alpha = math.radians(rake_angle_deg)
+        numerator = chip_ratio * math.cos(alpha)
+        denominator = 1.0 - chip_ratio * math.sin(alpha)
+        if denominator <= 0:
+            return 90.0  # degenerate case
+        phi = math.atan2(numerator, denominator)
+        return round(math.degrees(phi), 4)

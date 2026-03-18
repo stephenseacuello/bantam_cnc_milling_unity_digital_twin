@@ -12,6 +12,7 @@ automatically pauses or reassigns jobs on affected machines.
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import IntEnum
+import copy
 import math
 import threading
 import time
@@ -2684,6 +2685,215 @@ class QualityGateChecker:
                 passed_gates.add(gr.gate_id)
 
         return required_gate_ids.issubset(passed_gates)
+
+
+# ---------------------------------------------------------------------------
+# Manufacturing Recipe Version Control
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RecipeParameter:
+    """A single tuneable parameter within a manufacturing recipe."""
+
+    name: str
+    value: float
+    unit: str
+    min_value: float
+    max_value: float
+    is_critical: bool = False
+
+
+@dataclass
+class Recipe:
+    """A versioned manufacturing recipe – a complete parameter set for a part."""
+
+    recipe_id: str
+    part_number: str
+    version: int
+    parameters: List[RecipeParameter]
+    created_by: str
+    created_at: float
+    approved: bool = False
+    approved_by: str = ''
+    notes: str = ''
+
+
+@dataclass
+class RecipeDiff:
+    """Result of comparing two recipe versions."""
+
+    recipe_id: str
+    version_a: int
+    version_b: int
+    added: List[str]
+    removed: List[str]
+    changed: Dict[str, Tuple[float, float]]
+
+
+class RecipeVersionControl:
+    """Manages versioned manufacturing recipes.
+
+    Stores every version of each recipe, supports approval workflows,
+    parameter-bound validation, and version-to-version diffing.
+    """
+
+    def __init__(self) -> None:
+        # recipe_id -> {version -> Recipe}
+        self._recipes: Dict[str, Dict[int, Recipe]] = {}
+
+    # -- public API --------------------------------------------------------
+
+    def create_recipe(
+        self,
+        recipe_id: str,
+        part_number: str,
+        parameters: List[RecipeParameter],
+        created_by: str,
+        notes: str = '',
+    ) -> Recipe:
+        """Create a brand-new recipe at version 1."""
+        if recipe_id in self._recipes:
+            raise ValueError(
+                f"Recipe '{recipe_id}' already exists. "
+                "Use update_recipe to create a new version."
+            )
+        recipe = Recipe(
+            recipe_id=recipe_id,
+            part_number=part_number,
+            version=1,
+            parameters=copy.deepcopy(parameters),
+            created_by=created_by,
+            created_at=time.time(),
+            notes=notes,
+        )
+        self._recipes[recipe_id] = {1: recipe}
+        return recipe
+
+    def update_recipe(
+        self,
+        recipe_id: str,
+        parameters: List[RecipeParameter],
+        created_by: str,
+        notes: str = '',
+    ) -> Recipe:
+        """Create a new version of an existing recipe."""
+        if recipe_id not in self._recipes:
+            raise KeyError(f"Recipe '{recipe_id}' does not exist.")
+        versions = self._recipes[recipe_id]
+        latest_version = max(versions)
+        latest_recipe = versions[latest_version]
+        new_version = latest_version + 1
+        recipe = Recipe(
+            recipe_id=recipe_id,
+            part_number=latest_recipe.part_number,
+            version=new_version,
+            parameters=copy.deepcopy(parameters),
+            created_by=created_by,
+            created_at=time.time(),
+            notes=notes,
+        )
+        versions[new_version] = recipe
+        return recipe
+
+    def approve_recipe(
+        self,
+        recipe_id: str,
+        version: int,
+        approved_by: str,
+    ) -> Recipe:
+        """Mark a specific recipe version as approved."""
+        recipe = self._get_version(recipe_id, version)
+        recipe.approved = True
+        recipe.approved_by = approved_by
+        return recipe
+
+    def get_recipe(
+        self,
+        recipe_id: str,
+        version: Optional[int] = None,
+    ) -> Recipe:
+        """Return a specific version, or the latest if *version* is ``None``."""
+        if version is not None:
+            return self._get_version(recipe_id, version)
+        if recipe_id not in self._recipes:
+            raise KeyError(f"Recipe '{recipe_id}' does not exist.")
+        latest_version = max(self._recipes[recipe_id])
+        return self._recipes[recipe_id][latest_version]
+
+    def get_approved_recipe(self, recipe_id: str) -> Optional[Recipe]:
+        """Return the latest *approved* version, or ``None``."""
+        if recipe_id not in self._recipes:
+            raise KeyError(f"Recipe '{recipe_id}' does not exist.")
+        approved: List[Recipe] = [
+            r for r in self._recipes[recipe_id].values() if r.approved
+        ]
+        if not approved:
+            return None
+        return max(approved, key=lambda r: r.version)
+
+    def diff_versions(
+        self,
+        recipe_id: str,
+        v1: int,
+        v2: int,
+    ) -> RecipeDiff:
+        """Compare two versions of a recipe and return the diff."""
+        recipe_a = self._get_version(recipe_id, v1)
+        recipe_b = self._get_version(recipe_id, v2)
+
+        params_a = {p.name: p.value for p in recipe_a.parameters}
+        params_b = {p.name: p.value for p in recipe_b.parameters}
+
+        names_a = set(params_a)
+        names_b = set(params_b)
+
+        added = sorted(names_b - names_a)
+        removed = sorted(names_a - names_b)
+        changed: Dict[str, Tuple[float, float]] = {}
+        for name in sorted(names_a & names_b):
+            if params_a[name] != params_b[name]:
+                changed[name] = (params_a[name], params_b[name])
+
+        return RecipeDiff(
+            recipe_id=recipe_id,
+            version_a=v1,
+            version_b=v2,
+            added=added,
+            removed=removed,
+            changed=changed,
+        )
+
+    @staticmethod
+    def validate_parameters(parameters: List[RecipeParameter]) -> List[str]:
+        """Validate that every parameter value is within its min/max bounds.
+
+        Returns a list of human-readable error strings.  An empty list
+        means all parameters are valid.
+        """
+        errors: List[str] = []
+        for p in parameters:
+            if p.value < p.min_value:
+                errors.append(
+                    f"{p.name}: value {p.value} is below minimum {p.min_value}"
+                )
+            if p.value > p.max_value:
+                errors.append(
+                    f"{p.name}: value {p.value} is above maximum {p.max_value}"
+                )
+        return errors
+
+    # -- private helpers ---------------------------------------------------
+
+    def _get_version(self, recipe_id: str, version: int) -> Recipe:
+        if recipe_id not in self._recipes:
+            raise KeyError(f"Recipe '{recipe_id}' does not exist.")
+        versions = self._recipes[recipe_id]
+        if version not in versions:
+            raise KeyError(
+                f"Version {version} not found for recipe '{recipe_id}'."
+            )
+        return versions[version]
 
 
 def main(args=None):

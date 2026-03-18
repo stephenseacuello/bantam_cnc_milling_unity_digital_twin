@@ -2606,4 +2606,414 @@ namespace MiracleTwin.Cutting
             );
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Canned Cycle Library
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Enumerates the standard canned drilling/boring/tapping cycles.
+    /// </summary>
+    public enum CannedCycleType
+    {
+        /// <summary>G81 — Simple drilling cycle.</summary>
+        DRILL,
+        /// <summary>G82 — Drilling cycle with dwell at bottom.</summary>
+        DRILL_DWELL,
+        /// <summary>G83 — Peck drilling cycle (deep-hole drilling).</summary>
+        PECK_DRILL,
+        /// <summary>G84 — Tapping cycle.</summary>
+        TAP,
+        /// <summary>G85 — Boring cycle (feed retract).</summary>
+        BORE,
+        /// <summary>G86 — Boring cycle with dwell and spindle stop.</summary>
+        BORE_DWELL,
+        /// <summary>G87 — Back boring cycle.</summary>
+        BACK_BORE,
+        /// <summary>G89 — Boring cycle with dwell and feed retract.</summary>
+        BORE_STOP
+    }
+
+    /// <summary>
+    /// Parameters that fully define a canned cycle invocation.
+    /// </summary>
+    [Serializable]
+    public class CannedCycleParams
+    {
+        /// <summary>Type of canned cycle (G81–G89).</summary>
+        public CannedCycleType cycleType;
+        /// <summary>Hole X position (mm).</summary>
+        public float x;
+        /// <summary>Hole Y position (mm).</summary>
+        public float y;
+        /// <summary>Final Z depth (mm). Must be below the R plane.</summary>
+        public float z;
+        /// <summary>R-plane / retract height (mm). Must be above final Z.</summary>
+        public float r;
+        /// <summary>Peck depth increment for G83 (mm). Ignored by other cycles.</summary>
+        public float q;
+        /// <summary>Dwell time at bottom for G82/G86/G89 (milliseconds).</summary>
+        public float p;
+        /// <summary>Feedrate (mm/min).</summary>
+        public float f;
+        /// <summary>Total depth of cut measured from R plane (mm). Computed as r − z.</summary>
+        public float depth;
+    }
+
+    /// <summary>
+    /// Represents a single linear move segment produced by cycle expansion.
+    /// </summary>
+    [Serializable]
+    public class CycleMoveSegment
+    {
+        /// <summary>Start position of the move.</summary>
+        public Vector3 start;
+        /// <summary>End position of the move.</summary>
+        public Vector3 end;
+
+        public CycleMoveSegment(Vector3 start, Vector3 end)
+        {
+            this.start = start;
+            this.end = end;
+        }
+    }
+
+    /// <summary>
+    /// Result of expanding a canned cycle: the list of linear move segments,
+    /// move count, estimated execution time, and a human-readable cycle name.
+    /// </summary>
+    [Serializable]
+    public class CycleExpansion
+    {
+        /// <summary>Ordered list of linear move segments (start → end pairs).</summary>
+        public List<CycleMoveSegment> moves = new();
+        /// <summary>Total number of move segments.</summary>
+        public int totalMoves;
+        /// <summary>Estimated execution time in seconds.</summary>
+        public float estimatedTimeSec;
+        /// <summary>Human-readable name of the cycle.</summary>
+        public string cycleName = "";
+    }
+
+    /// <summary>
+    /// Manages and expands standard canned drilling / boring / tapping
+    /// cycles (G81–G89) into sequences of linear move segments suitable
+    /// for simulation playback.
+    /// </summary>
+    public class CannedCycleLibrary
+    {
+        /// <summary>Small clearance distance (mm) used during peck retract.</summary>
+        private const float PeckClearance = 0.5f;
+
+        /// <summary>Rapid traverse rate assumed for time estimation (mm/min).</summary>
+        private const float RapidRate = 10000f;
+
+        // ── Public API ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Expands a canned cycle into individual linear move segments.
+        /// </summary>
+        public CycleExpansion ExpandCycle(CannedCycleParams p)
+        {
+            if (p == null)
+                throw new ArgumentNullException(nameof(p));
+
+            var errors = ValidateParams(p);
+            if (errors.Count > 0)
+                throw new ArgumentException(string.Join("; ", errors));
+
+            var expansion = new CycleExpansion
+            {
+                cycleName = GetCycleDescription(p.cycleType)
+            };
+
+            switch (p.cycleType)
+            {
+                case CannedCycleType.DRILL:
+                    ExpandDrill(p, expansion);
+                    break;
+                case CannedCycleType.DRILL_DWELL:
+                    ExpandDrillDwell(p, expansion);
+                    break;
+                case CannedCycleType.PECK_DRILL:
+                    ExpandPeckDrill(p, expansion);
+                    break;
+                case CannedCycleType.TAP:
+                    ExpandTap(p, expansion);
+                    break;
+                case CannedCycleType.BORE:
+                    ExpandBore(p, expansion);
+                    break;
+                case CannedCycleType.BORE_DWELL:
+                    ExpandBoreDwell(p, expansion);
+                    break;
+                case CannedCycleType.BACK_BORE:
+                    ExpandBackBore(p, expansion);
+                    break;
+                case CannedCycleType.BORE_STOP:
+                    ExpandBoreStop(p, expansion);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(p.cycleType));
+            }
+
+            expansion.totalMoves = expansion.moves.Count;
+            expansion.estimatedTimeSec = EstimateCycleTime(p, p.f);
+            return expansion;
+        }
+
+        /// <summary>
+        /// Returns a human-readable description of the given cycle type.
+        /// </summary>
+        public string GetCycleDescription(CannedCycleType type)
+        {
+            return type switch
+            {
+                CannedCycleType.DRILL       => "G81 Drilling Cycle",
+                CannedCycleType.DRILL_DWELL => "G82 Drilling Cycle with Dwell",
+                CannedCycleType.PECK_DRILL  => "G83 Peck Drilling Cycle",
+                CannedCycleType.TAP         => "G84 Tapping Cycle",
+                CannedCycleType.BORE        => "G85 Boring Cycle",
+                CannedCycleType.BORE_DWELL  => "G86 Boring Cycle with Dwell",
+                CannedCycleType.BACK_BORE   => "G87 Back Boring Cycle",
+                CannedCycleType.BORE_STOP   => "G89 Boring Cycle with Dwell and Feed Retract",
+                _                           => "Unknown Cycle"
+            };
+        }
+
+        /// <summary>
+        /// Estimates the execution time (in seconds) for a cycle at the
+        /// given feed rate.  Rapid moves use <see cref="RapidRate"/>.
+        /// </summary>
+        public float EstimateCycleTime(CannedCycleParams p, float feedRate)
+        {
+            if (p == null)
+                throw new ArgumentNullException(nameof(p));
+            if (feedRate <= 0f)
+                throw new ArgumentException("feedRate must be positive", nameof(feedRate));
+
+            float totalDepth = p.r - p.z; // positive value
+            float dwellSec = p.p / 1000f;
+
+            switch (p.cycleType)
+            {
+                case CannedCycleType.DRILL:
+                    // Feed down, rapid retract
+                    return (totalDepth / feedRate + totalDepth / RapidRate) * 60f;
+
+                case CannedCycleType.DRILL_DWELL:
+                    return (totalDepth / feedRate + totalDepth / RapidRate) * 60f + dwellSec;
+
+                case CannedCycleType.PECK_DRILL:
+                {
+                    float remaining = totalDepth;
+                    float timeSec = 0f;
+                    float currentDepthFromR = 0f;
+                    while (remaining > 0f)
+                    {
+                        float peck = Mathf.Min(p.q, remaining);
+                        // Rapid from R to (previous depth - clearance) if not first peck
+                        if (currentDepthFromR > 0f)
+                        {
+                            float rapidDown = currentDepthFromR - PeckClearance;
+                            timeSec += (rapidDown / RapidRate) * 60f;
+                        }
+                        // Feed the peck increment (+ clearance recovery except first)
+                        float feedDist = currentDepthFromR > 0f ? peck + PeckClearance : peck;
+                        timeSec += (feedDist / feedRate) * 60f;
+                        currentDepthFromR += peck;
+                        remaining -= peck;
+                        // Rapid retract to R
+                        timeSec += (currentDepthFromR / RapidRate) * 60f;
+                    }
+                    return timeSec;
+                }
+
+                case CannedCycleType.TAP:
+                    // Feed down, feed retract (reversed)
+                    return (totalDepth / feedRate + totalDepth / feedRate) * 60f;
+
+                case CannedCycleType.BORE:
+                    // Feed down, feed retract
+                    return (totalDepth / feedRate + totalDepth / feedRate) * 60f;
+
+                case CannedCycleType.BORE_DWELL:
+                    return (totalDepth / feedRate + totalDepth / RapidRate) * 60f + dwellSec;
+
+                case CannedCycleType.BACK_BORE:
+                    // Rapid to bottom, feed up to depth, rapid retract
+                    return (totalDepth / RapidRate + totalDepth / feedRate + totalDepth / RapidRate) * 60f;
+
+                case CannedCycleType.BORE_STOP:
+                    return (totalDepth / feedRate + totalDepth / feedRate) * 60f + dwellSec;
+
+                default:
+                    return 0f;
+            }
+        }
+
+        /// <summary>
+        /// Validates cycle parameters.  Returns a list of error strings
+        /// (empty if parameters are valid).
+        /// </summary>
+        public List<string> ValidateParams(CannedCycleParams p)
+        {
+            if (p == null)
+                throw new ArgumentNullException(nameof(p));
+
+            var errors = new List<string>();
+            float totalDepth = p.r - p.z;
+
+            if (totalDepth <= 0f)
+                errors.Add("Depth must be positive (r must be greater than z)");
+
+            if (p.f <= 0f)
+                errors.Add("Feed rate (f) must be positive");
+
+            if (p.cycleType == CannedCycleType.PECK_DRILL && p.q <= 0f)
+                errors.Add("Peck depth (q) must be positive for G83 peck drilling");
+
+            if ((p.cycleType == CannedCycleType.DRILL_DWELL ||
+                 p.cycleType == CannedCycleType.BORE_DWELL ||
+                 p.cycleType == CannedCycleType.BORE_STOP) && p.p < 0f)
+                errors.Add("Dwell time (p) must not be negative for dwell cycles");
+
+            return errors;
+        }
+
+        // ── Private expansion helpers ─────────────────────────────────
+
+        private void AddMove(CycleExpansion exp, Vector3 from, Vector3 to)
+        {
+            exp.moves.Add(new CycleMoveSegment(from, to));
+        }
+
+        /// <summary>G81: Rapid to R, feed to Z, rapid retract to R.</summary>
+        private void ExpandDrill(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            // Rapid to R-plane
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+            // Feed to depth
+            AddMove(exp, xyR, xyZ);
+            // Rapid retract to R
+            AddMove(exp, xyZ, xyR);
+        }
+
+        /// <summary>G82: Rapid to R, feed to Z, dwell, rapid retract to R.</summary>
+        private void ExpandDrillDwell(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+            AddMove(exp, xyR, xyZ);
+            // Dwell is implicit (represented by dwell parameter, not a move)
+            AddMove(exp, xyZ, xyR);
+        }
+
+        /// <summary>
+        /// G83: Peck drilling — rapid to R, feed first peck, rapid retract
+        /// to R, rapid to (previous depth − clearance), feed next peck, repeat
+        /// until full depth is reached, rapid retract to R.
+        /// </summary>
+        private void ExpandPeckDrill(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            float remaining = p.r - p.z; // total depth (positive)
+            float currentZ = p.r;
+
+            // Initial positioning at R
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+
+            bool firstPeck = true;
+            while (remaining > 0f)
+            {
+                float peck = Mathf.Min(p.q, remaining);
+                float targetZ = currentZ - peck;
+
+                if (!firstPeck)
+                {
+                    // Rapid from R down to (previous depth + clearance)
+                    float rapidTargetZ = currentZ + PeckClearance;
+                    AddMove(exp, xyR, new Vector3(p.x, p.y, rapidTargetZ));
+                    // Feed through clearance + peck
+                    AddMove(exp, new Vector3(p.x, p.y, rapidTargetZ), new Vector3(p.x, p.y, targetZ));
+                }
+                else
+                {
+                    // Feed from R to first peck depth
+                    AddMove(exp, xyR, new Vector3(p.x, p.y, targetZ));
+                    firstPeck = false;
+                }
+
+                currentZ = targetZ;
+                remaining -= peck;
+
+                // Rapid retract to R
+                AddMove(exp, new Vector3(p.x, p.y, currentZ), xyR);
+            }
+        }
+
+        /// <summary>G84: Rapid to R, feed to Z, reverse-feed retract to R.</summary>
+        private void ExpandTap(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+            AddMove(exp, xyR, xyZ);
+            // Retract at feed rate (spindle reverses)
+            AddMove(exp, xyZ, xyR);
+        }
+
+        /// <summary>G85: Rapid to R, feed to Z, feed retract to R.</summary>
+        private void ExpandBore(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+            AddMove(exp, xyR, xyZ);
+            AddMove(exp, xyZ, xyR);
+        }
+
+        /// <summary>G86: Rapid to R, feed to Z, dwell, spindle stop, rapid retract.</summary>
+        private void ExpandBoreDwell(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+            AddMove(exp, xyR, xyZ);
+            AddMove(exp, xyZ, xyR);
+        }
+
+        /// <summary>G87: Back boring — rapid to bottom, feed up, rapid retract.</summary>
+        private void ExpandBackBore(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            // Rapid to bottom
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyZ);
+            // Feed up to R
+            AddMove(exp, xyZ, xyR);
+            // Rapid retract to R (already there — modeled as position hold)
+            AddMove(exp, xyR, xyR);
+        }
+
+        /// <summary>G89: Rapid to R, feed to Z, dwell, feed retract to R.</summary>
+        private void ExpandBoreStop(CannedCycleParams p, CycleExpansion exp)
+        {
+            var xyR = new Vector3(p.x, p.y, p.r);
+            var xyZ = new Vector3(p.x, p.y, p.z);
+
+            AddMove(exp, new Vector3(p.x, p.y, p.r), xyR);
+            AddMove(exp, xyR, xyZ);
+            AddMove(exp, xyZ, xyR);
+        }
+    }
 }

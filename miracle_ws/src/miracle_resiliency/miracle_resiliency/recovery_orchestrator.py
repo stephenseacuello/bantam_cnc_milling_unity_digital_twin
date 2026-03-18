@@ -8,6 +8,7 @@ coordinating with lifecycle management and dependency ordering.
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+import copy
 import threading
 import asyncio
 import time
@@ -1826,6 +1827,231 @@ class CircuitBreakerRegistry:
                 name: cb.get_metrics()
                 for name, cb in self._breakers.items()
             }
+
+
+@dataclass
+class ConfigVersion:
+    """A versioned snapshot of configuration data for a system node."""
+    version_id: str
+    node_id: str
+    config_data: dict
+    timestamp: float
+    author: str
+    description: str
+    is_active: bool = False
+
+
+@dataclass
+class ConfigDiff:
+    """The difference between two configuration versions."""
+    version_a: str
+    version_b: str
+    added_keys: List[str]
+    removed_keys: List[str]
+    changed_keys: List[str]
+    changes: Dict[str, Tuple[Any, Any]]
+
+
+class ConfigVersionManager:
+    """Tracks and manages versioned configurations for system nodes.
+
+    Each node can have many saved configuration versions, but only one
+    may be *active* at any time.  The manager supports saving, activating,
+    rolling back, diffing, and import/export of versioned configs.
+    """
+
+    def __init__(self) -> None:
+        # node_id -> list of ConfigVersion (append-order)
+        self._versions: Dict[str, List[ConfigVersion]] = {}
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+
+    def save_version(
+        self,
+        node_id: str,
+        config_data: dict,
+        author: str,
+        description: str,
+    ) -> ConfigVersion:
+        """Save a new configuration version for *node_id*.
+
+        A unique ``version_id`` is generated automatically.  The new
+        version is **not** activated by default.
+        """
+        version = ConfigVersion(
+            version_id=str(uuid.uuid4()),
+            node_id=node_id,
+            config_data=copy.deepcopy(config_data),
+            timestamp=time.time(),
+            author=author,
+            description=description,
+            is_active=False,
+        )
+        with self._lock:
+            self._versions.setdefault(node_id, []).append(version)
+        return version
+
+    def activate_version(self, node_id: str, version_id: str) -> ConfigVersion:
+        """Set the version identified by *version_id* as the active config
+        for *node_id*, deactivating any previously active version.
+
+        Raises ``KeyError`` if the node or version is not found.
+        """
+        with self._lock:
+            versions = self._versions.get(node_id)
+            if versions is None:
+                raise KeyError(f"No configurations found for node '{node_id}'")
+            target: Optional[ConfigVersion] = None
+            for v in versions:
+                if v.version_id == version_id:
+                    target = v
+                    break
+            if target is None:
+                raise KeyError(
+                    f"Version '{version_id}' not found for node '{node_id}'"
+                )
+            # Deactivate current active version (if any)
+            for v in versions:
+                if v.is_active:
+                    v.is_active = False
+            target.is_active = True
+            return target
+
+    def get_active_config(self, node_id: str) -> Optional[ConfigVersion]:
+        """Return the currently active ``ConfigVersion`` for *node_id*,
+        or ``None`` if no version is active.
+        """
+        with self._lock:
+            for v in self._versions.get(node_id, []):
+                if v.is_active:
+                    return v
+        return None
+
+    def get_version_history(self, node_id: str) -> List[ConfigVersion]:
+        """Return all versions for *node_id* sorted by timestamp."""
+        with self._lock:
+            versions = list(self._versions.get(node_id, []))
+        versions.sort(key=lambda v: v.timestamp)
+        return versions
+
+    def diff_versions(
+        self, version_id_a: str, version_id_b: str,
+    ) -> ConfigDiff:
+        """Compute a ``ConfigDiff`` between two versions (by id).
+
+        Raises ``KeyError`` if either version cannot be found.
+        """
+        va = self._find_version(version_id_a)
+        vb = self._find_version(version_id_b)
+
+        keys_a = set(va.config_data.keys())
+        keys_b = set(vb.config_data.keys())
+
+        added = sorted(keys_b - keys_a)
+        removed = sorted(keys_a - keys_b)
+        common = keys_a & keys_b
+        changed: List[str] = []
+        changes: Dict[str, Tuple[Any, Any]] = {}
+        for k in sorted(common):
+            old_val = va.config_data[k]
+            new_val = vb.config_data[k]
+            if old_val != new_val:
+                changed.append(k)
+                changes[k] = (old_val, new_val)
+
+        return ConfigDiff(
+            version_a=version_id_a,
+            version_b=version_id_b,
+            added_keys=added,
+            removed_keys=removed,
+            changed_keys=changed,
+            changes=changes,
+        )
+
+    def rollback(self, node_id: str, version_id: str) -> ConfigVersion:
+        """Activate a previous version for *node_id*.
+
+        This is semantically equivalent to ``activate_version`` but
+        signals intent to revert to an earlier configuration.
+
+        Raises ``KeyError`` if the node or version is not found.
+        """
+        return self.activate_version(node_id, version_id)
+
+    def get_all_nodes(self) -> List[str]:
+        """Return a sorted list of all node ids with managed configs."""
+        with self._lock:
+            return sorted(self._versions.keys())
+
+    # ------------------------------------------------------------------
+    # Export / Import
+    # ------------------------------------------------------------------
+
+    def export_config(self, node_id: str) -> dict:
+        """Export all versions for *node_id* as a JSON-compatible dict.
+
+        Raises ``KeyError`` if no versions exist for the node.
+        """
+        with self._lock:
+            versions = self._versions.get(node_id)
+            if versions is None:
+                raise KeyError(f"No configurations found for node '{node_id}'")
+            return {
+                'node_id': node_id,
+                'versions': [
+                    {
+                        'version_id': v.version_id,
+                        'node_id': v.node_id,
+                        'config_data': copy.deepcopy(v.config_data),
+                        'timestamp': v.timestamp,
+                        'author': v.author,
+                        'description': v.description,
+                        'is_active': v.is_active,
+                    }
+                    for v in versions
+                ],
+            }
+
+    def import_config(self, node_id: str, data: dict) -> List[ConfigVersion]:
+        """Import versions from a previously exported dict.
+
+        Existing versions for *node_id* are **replaced** by the imported
+        data.  Returns the list of imported ``ConfigVersion`` objects.
+        """
+        imported: List[ConfigVersion] = []
+        for entry in data.get('versions', []):
+            cv = ConfigVersion(
+                version_id=entry['version_id'],
+                node_id=node_id,
+                config_data=copy.deepcopy(entry['config_data']),
+                timestamp=entry['timestamp'],
+                author=entry['author'],
+                description=entry['description'],
+                is_active=entry.get('is_active', False),
+            )
+            imported.append(cv)
+        with self._lock:
+            self._versions[node_id] = imported
+        return imported
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _find_version(self, version_id: str) -> ConfigVersion:
+        """Look up a version by id across all nodes.
+
+        Raises ``KeyError`` if not found.
+        """
+        with self._lock:
+            for versions in self._versions.values():
+                for v in versions:
+                    if v.version_id == version_id:
+                        return v
+        raise KeyError(f"Version '{version_id}' not found")
 
 
 def main(args=None):

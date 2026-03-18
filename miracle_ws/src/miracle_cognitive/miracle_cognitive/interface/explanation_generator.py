@@ -2197,6 +2197,323 @@ class NaturalLanguageExplainer:
         return list(template.get(key, template.get('details_operator', [])))
 
 
+# ---------------------------------------------------------------------------
+# Anomaly Scoring Model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AnomalyScore:
+    """Score for a single feature indicating how anomalous its value is."""
+    feature_name: str
+    value: float
+    z_score: float
+    percentile: float
+    is_anomaly: bool
+    severity: str  # 'normal' | 'mild' | 'moderate' | 'severe'
+    contribution_pct: float
+
+
+@dataclass
+class AnomalyReport:
+    """Aggregate anomaly report for an entire observation."""
+    timestamp: float
+    overall_score: float  # 0-100
+    anomaly_scores: List[AnomalyScore]
+    top_anomalies: List[AnomalyScore]
+    is_anomalous: bool
+    explanation: str
+
+
+class AnomalyScoringModel:
+    """Scores manufacturing data points for anomaly likelihood using
+    statistical (z-score based) methods.
+
+    Workflow:
+      1. ``train(data)`` — learn per-feature normal distributions.
+      2. ``score(observation)`` — score a single observation.
+      3. ``score_batch(observations)`` — score many observations.
+
+    Severity thresholds (absolute z-score):
+      * |z| > 3.0  -> severe
+      * |z| > 2.0  -> moderate
+      * |z| > 1.5  -> mild
+      * otherwise   -> normal
+
+    The overall score is a weighted average of individual feature anomaly
+    scores, mapped to a 0-100 scale.  A feature whose absolute z-score is
+    zero contributes 0; one with |z| >= 4 contributes the maximum.
+    """
+
+    _SEVERITY_THRESHOLDS: List[Tuple[float, str]] = [
+        (3.0, 'severe'),
+        (2.0, 'moderate'),
+        (1.5, 'mild'),
+        (0.0, 'normal'),
+    ]
+
+    def __init__(self) -> None:
+        self._means: Dict[str, float] = {}
+        self._stds: Dict[str, float] = {}
+        self._mins: Dict[str, float] = {}
+        self._maxs: Dict[str, float] = {}
+        self._counts: Dict[str, int] = {}
+        self._bounds: Dict[str, Tuple[float, float]] = {}
+        self._trained: bool = False
+
+    # -- Training ----------------------------------------------------------
+
+    def train(self, data: Dict[str, List[float]]) -> None:
+        """Learn normal distributions (mean, std) per feature.
+
+        Args:
+            data: Mapping of feature name to a list of observed values.
+
+        Raises:
+            ValueError: If *data* is empty or any feature has fewer than
+                2 observations.
+        """
+        if not data:
+            raise ValueError('Training data must not be empty.')
+
+        for name, values in data.items():
+            if len(values) < 2:
+                raise ValueError(
+                    f"Feature '{name}' needs at least 2 observations "
+                    f"(got {len(values)})."
+                )
+
+            n = len(values)
+            mean = sum(values) / n
+            variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+            std = math.sqrt(variance)
+
+            self._means[name] = mean
+            self._stds[name] = std
+            self._mins[name] = min(values)
+            self._maxs[name] = max(values)
+            self._counts[name] = n
+
+        self._trained = True
+
+    # -- Scoring -----------------------------------------------------------
+
+    def score(self, observation: Dict[str, float]) -> AnomalyReport:
+        """Score a single observation and return an :class:`AnomalyReport`.
+
+        Only features that were seen during training are scored; unknown
+        features in *observation* are silently ignored.
+
+        Args:
+            observation: Mapping of feature name to observed value.
+
+        Returns:
+            An AnomalyReport summarising the anomaly assessment.
+
+        Raises:
+            RuntimeError: If the model has not been trained yet.
+        """
+        if not self._trained:
+            raise RuntimeError('Model must be trained before scoring.')
+
+        anomaly_scores: List[AnomalyScore] = []
+
+        for feat, value in observation.items():
+            if feat not in self._means:
+                continue
+
+            mean = self._means[feat]
+            std = self._stds[feat]
+
+            # Compute z-score; guard against zero std
+            if std > 0:
+                z = (value - mean) / std
+            else:
+                z = 0.0 if value == mean else (
+                    4.0 if value > mean else -4.0
+                )
+
+            abs_z = abs(z)
+
+            # Check hard bounds
+            bounds_violated = False
+            if feat in self._bounds:
+                lo, hi = self._bounds[feat]
+                if value < lo or value > hi:
+                    bounds_violated = True
+                    abs_z = max(abs_z, 3.0)
+
+            # Determine severity
+            severity = self._classify_severity(abs_z)
+
+            # Percentile approximation using the error-function CDF
+            percentile = self._normal_cdf(z) * 100.0
+
+            is_anomaly = abs_z >= 1.5 or bounds_violated
+
+            anomaly_scores.append(AnomalyScore(
+                feature_name=feat,
+                value=value,
+                z_score=round(z, 4),
+                percentile=round(percentile, 2),
+                is_anomaly=is_anomaly,
+                severity=severity,
+                contribution_pct=0.0,  # filled in below
+            ))
+
+        # Compute per-feature anomaly contribution and overall score
+        overall_score = self._compute_overall_score(anomaly_scores)
+
+        # Top anomalies: those flagged, sorted by |z| descending
+        top_anomalies = sorted(
+            [s for s in anomaly_scores if s.is_anomaly],
+            key=lambda s: abs(s.z_score),
+            reverse=True,
+        )
+
+        is_anomalous = overall_score >= 25.0 or len(top_anomalies) > 0
+        explanation = self._build_explanation(overall_score, top_anomalies)
+
+        return AnomalyReport(
+            timestamp=time.time(),
+            overall_score=round(overall_score, 2),
+            anomaly_scores=anomaly_scores,
+            top_anomalies=top_anomalies,
+            is_anomalous=is_anomalous,
+            explanation=explanation,
+        )
+
+    def score_batch(
+        self, observations: List[Dict[str, float]],
+    ) -> List[AnomalyReport]:
+        """Score multiple observations.
+
+        Args:
+            observations: List of observation dicts.
+
+        Returns:
+            A list of :class:`AnomalyReport`, one per observation.
+        """
+        return [self.score(obs) for obs in observations]
+
+    # -- Feature bounds ----------------------------------------------------
+
+    def add_feature_bounds(
+        self, feature_name: str, lower: float, upper: float,
+    ) -> None:
+        """Set hard limits for a feature.
+
+        Any value outside ``[lower, upper]`` is automatically flagged as
+        anomalous (severity at least 'severe').
+
+        Args:
+            feature_name: Feature identifier.
+            lower: Lower acceptable bound.
+            upper: Upper acceptable bound.
+
+        Raises:
+            ValueError: If *lower* >= *upper*.
+        """
+        if lower >= upper:
+            raise ValueError(
+                f"Lower bound ({lower}) must be less than upper bound ({upper})."
+            )
+        self._bounds[feature_name] = (lower, upper)
+
+    # -- Statistics --------------------------------------------------------
+
+    def get_feature_stats(self) -> Dict[str, Dict[str, float]]:
+        """Return descriptive statistics for every trained feature.
+
+        Returns:
+            Dict mapping feature name to
+            ``{mean, std, min, max, count}``.
+        """
+        stats: Dict[str, Dict[str, float]] = {}
+        for feat in self._means:
+            stats[feat] = {
+                'mean': self._means[feat],
+                'std': self._stds[feat],
+                'min': self._mins[feat],
+                'max': self._maxs[feat],
+                'count': self._counts[feat],
+            }
+        return stats
+
+    # -- Private helpers ---------------------------------------------------
+
+    @classmethod
+    def _classify_severity(cls, abs_z: float) -> str:
+        """Map an absolute z-score to a severity label."""
+        for threshold, label in cls._SEVERITY_THRESHOLDS:
+            if abs_z >= threshold:
+                return label
+        return 'normal'
+
+    @staticmethod
+    def _normal_cdf(z: float) -> float:
+        """Approximate the standard-normal CDF using the error function."""
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    @staticmethod
+    def _compute_overall_score(
+        scores: List[AnomalyScore],
+    ) -> float:
+        """Weighted average of feature anomaly scores on a 0-100 scale.
+
+        Each feature contributes ``min(abs_z / 4, 1) * 100``.  The overall
+        score is the mean of these contributions, and each score's
+        ``contribution_pct`` is updated in place.
+        """
+        if not scores:
+            return 0.0
+
+        raw: List[float] = []
+        for s in scores:
+            # Map |z| to 0-100, clamping at |z|=4
+            feature_score = min(abs(s.z_score) / 4.0, 1.0) * 100.0
+            raw.append(feature_score)
+
+        total = sum(raw)
+        overall = total / len(raw)
+
+        # Update contribution percentages
+        for s, r in zip(scores, raw):
+            pct = (r / total * 100.0) if total > 0 else 0.0
+            # dataclass fields are mutable; update in place
+            object.__setattr__(s, 'contribution_pct', round(pct, 2))
+
+        return overall
+
+    @staticmethod
+    def _build_explanation(
+        overall_score: float,
+        top_anomalies: List[AnomalyScore],
+    ) -> str:
+        """Build a human-readable explanation string."""
+        if not top_anomalies:
+            return (
+                f'Overall anomaly score is {overall_score:.1f}/100. '
+                f'All features are within normal operating ranges.'
+            )
+
+        parts = [
+            f'Overall anomaly score is {overall_score:.1f}/100.',
+        ]
+        for a in top_anomalies[:3]:
+            parts.append(
+                f'{a.feature_name} is {a.severity} '
+                f'(z={a.z_score:+.2f}, value={a.value:.4g}).'
+            )
+
+        if len(top_anomalies) > 3:
+            parts.append(
+                f'{len(top_anomalies) - 3} additional anomalous feature(s) detected.'
+            )
+
+        return ' '.join(parts)
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

@@ -2209,6 +2209,285 @@ class DowntimeClassifier:
         return max(0.0, min(1.0, availability))
 
 
+# ---------------------------------------------------------------------------
+# OEE Dashboard Data Provider
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DashboardOEESnapshot:
+    """An OEE data point enriched with part counts and time details for
+    dashboard display."""
+
+    machine_id: str
+    timestamp: float
+    availability: float   # 0-1
+    performance: float     # 0-1
+    quality: float         # 0-1
+    oee: float             # 0-1
+    good_parts: int
+    total_parts: int
+    planned_time_min: float
+    actual_run_time_min: float
+
+
+@dataclass
+class OEETrend:
+    """Time-series OEE trend data for a single machine."""
+
+    timestamps: List[float]
+    oee_values: List[float]
+    availability_values: List[float]
+    performance_values: List[float]
+    quality_values: List[float]
+    trend_direction: str  # 'improving' | 'stable' | 'declining'
+
+
+@dataclass
+class DashboardSummary:
+    """Aggregated dashboard view across all machines."""
+
+    overall_oee: float
+    best_machine: str
+    worst_machine: str
+    machines: Dict[str, DashboardOEESnapshot]
+    alerts: List[str]
+
+
+class OEEDashboardProvider:
+    """Aggregates OEE snapshots for multi-machine dashboard display.
+
+    Stores a rolling history of ``DashboardOEESnapshot`` records per machine
+    and exposes convenience methods for dashboard widgets: summaries, trends,
+    alerts, machine comparison, and shift-level analysis.
+    """
+
+    _MAX_HISTORY = 2880  # ~24 h at 30 s interval
+
+    def __init__(self) -> None:
+        self._history: Dict[str, List[DashboardOEESnapshot]] = {}
+        self._lock = threading.Lock()
+
+    # -- Recording ----------------------------------------------------------
+
+    def record_snapshot(self, snapshot: DashboardOEESnapshot) -> None:
+        """Append a snapshot for the given machine, trimming old data."""
+        with self._lock:
+            machine_snapshots = self._history.setdefault(
+                snapshot.machine_id, [],
+            )
+            machine_snapshots.append(snapshot)
+            # Trim to keep bounded memory usage
+            if len(machine_snapshots) > self._MAX_HISTORY:
+                del machine_snapshots[: len(machine_snapshots) - self._MAX_HISTORY]
+
+    # -- Dashboard summary --------------------------------------------------
+
+    def get_dashboard_summary(self) -> DashboardSummary:
+        """Build a ``DashboardSummary`` from the latest snapshot of each machine.
+
+        Overall OEE is a *weighted* average where each machine's weight is its
+        ``planned_time_min`` so that larger contributors dominate the metric.
+        """
+        with self._lock:
+            latest_map: Dict[str, DashboardOEESnapshot] = {}
+            for mid, snaps in self._history.items():
+                if snaps:
+                    latest_map[mid] = snaps[-1]
+
+        if not latest_map:
+            return DashboardSummary(
+                overall_oee=0.0,
+                best_machine='',
+                worst_machine='',
+                machines={},
+                alerts=[],
+            )
+
+        # Weighted average OEE
+        total_weight = sum(s.planned_time_min for s in latest_map.values())
+        if total_weight > 0.0:
+            overall_oee = sum(
+                s.oee * s.planned_time_min for s in latest_map.values()
+            ) / total_weight
+        else:
+            overall_oee = sum(s.oee for s in latest_map.values()) / len(latest_map)
+
+        best = max(latest_map, key=lambda m: latest_map[m].oee)
+        worst = min(latest_map, key=lambda m: latest_map[m].oee)
+        alerts = self.get_alerts()
+
+        return DashboardSummary(
+            overall_oee=overall_oee,
+            best_machine=best,
+            worst_machine=worst,
+            machines=latest_map,
+            alerts=alerts,
+        )
+
+    # -- Trend analysis -----------------------------------------------------
+
+    def get_trend(
+        self,
+        machine_id: str,
+        num_points: int = 60,
+    ) -> OEETrend:
+        """Return an ``OEETrend`` for the given machine.
+
+        If the machine has fewer recorded snapshots than *num_points*, all
+        available data is returned.  Trend direction is computed from a simple
+        linear slope over the returned window.
+        """
+        with self._lock:
+            snaps = list(self._history.get(machine_id, []))
+
+        snaps = snaps[-num_points:]
+
+        if not snaps:
+            return OEETrend(
+                timestamps=[],
+                oee_values=[],
+                availability_values=[],
+                performance_values=[],
+                quality_values=[],
+                trend_direction='stable',
+            )
+
+        timestamps = [s.timestamp for s in snaps]
+        oee_values = [s.oee for s in snaps]
+        availability_values = [s.availability for s in snaps]
+        performance_values = [s.performance for s in snaps]
+        quality_values = [s.quality for s in snaps]
+
+        trend_direction = self._compute_trend_direction(oee_values)
+
+        return OEETrend(
+            timestamps=timestamps,
+            oee_values=oee_values,
+            availability_values=availability_values,
+            performance_values=performance_values,
+            quality_values=quality_values,
+            trend_direction=trend_direction,
+        )
+
+    @staticmethod
+    def _compute_trend_direction(values: List[float]) -> str:
+        """Simple linear regression slope to classify trend."""
+        n = len(values)
+        if n < 2:
+            return 'stable'
+
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(values) / n
+        num = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        if den == 0.0:
+            return 'stable'
+        slope = num / den
+
+        # Threshold: require at least 0.5 % per sample to call it a trend
+        if slope > 0.005:
+            return 'improving'
+        elif slope < -0.005:
+            return 'declining'
+        return 'stable'
+
+    # -- Alerts -------------------------------------------------------------
+
+    def get_alerts(self) -> List[str]:
+        """Generate alerts based on latest snapshot per machine.
+
+        Thresholds:
+        - OEE < 65 %
+        - Availability < 80 %
+        - Quality < 95 %
+        """
+        alerts: List[str] = []
+        with self._lock:
+            for mid, snaps in self._history.items():
+                if not snaps:
+                    continue
+                s = snaps[-1]
+                if s.oee < 0.65:
+                    alerts.append(
+                        f"{mid}: OEE is {s.oee:.1%}, below 65% threshold"
+                    )
+                if s.availability < 0.80:
+                    alerts.append(
+                        f"{mid}: Availability is {s.availability:.1%}, "
+                        f"below 80% threshold"
+                    )
+                if s.quality < 0.95:
+                    alerts.append(
+                        f"{mid}: Quality is {s.quality:.1%}, "
+                        f"below 95% threshold"
+                    )
+        return alerts
+
+    # -- Machine comparison -------------------------------------------------
+
+    def compare_machines(self) -> List[Tuple[str, float]]:
+        """Rank machines by their latest OEE value (descending).
+
+        Returns a list of ``(machine_id, oee)`` tuples sorted from best to
+        worst.
+        """
+        with self._lock:
+            latest: List[Tuple[str, float]] = []
+            for mid, snaps in self._history.items():
+                if snaps:
+                    latest.append((mid, snaps[-1].oee))
+        latest.sort(key=lambda t: t[1], reverse=True)
+        return latest
+
+    # -- Shift comparison ---------------------------------------------------
+
+    def get_shift_comparison(
+        self,
+        machine_id: str,
+        shift_timestamps: List[Tuple[float, float]],
+    ) -> List[Dict[str, Any]]:
+        """Compare OEE metrics across shift windows for a single machine.
+
+        *shift_timestamps* is a list of ``(start, end)`` pairs.  For each
+        shift, the method computes the average OEE, availability, performance,
+        and quality from the snapshots falling inside that window.
+
+        Returns a list of dicts (one per shift) with keys ``start``, ``end``,
+        ``avg_oee``, ``avg_availability``, ``avg_performance``,
+        ``avg_quality``, and ``sample_count``.
+        """
+        with self._lock:
+            snaps = list(self._history.get(machine_id, []))
+
+        results: List[Dict[str, Any]] = []
+        for start, end in shift_timestamps:
+            in_shift = [
+                s for s in snaps if start <= s.timestamp < end
+            ]
+            if not in_shift:
+                results.append({
+                    'start': start,
+                    'end': end,
+                    'avg_oee': 0.0,
+                    'avg_availability': 0.0,
+                    'avg_performance': 0.0,
+                    'avg_quality': 0.0,
+                    'sample_count': 0,
+                })
+                continue
+            count = len(in_shift)
+            results.append({
+                'start': start,
+                'end': end,
+                'avg_oee': sum(s.oee for s in in_shift) / count,
+                'avg_availability': sum(s.availability for s in in_shift) / count,
+                'avg_performance': sum(s.performance for s in in_shift) / count,
+                'avg_quality': sum(s.quality for s in in_shift) / count,
+                'sample_count': count,
+            })
+        return results
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

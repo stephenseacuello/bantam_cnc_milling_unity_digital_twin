@@ -2193,6 +2193,223 @@ class WorkOrderTracker:
         )
 
 
+# ---------------------------------------------------------------------------
+# Operator Skill Matrix
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OperatorProfile:
+    """Profile for a manufacturing operator."""
+    operator_id: str
+    name: str
+    skills: Dict[str, int] = field(default_factory=dict)       # skill_name -> proficiency 1-5
+    certifications: List[str] = field(default_factory=list)
+    qualified_machines: List[str] = field(default_factory=list)
+    shift: str = ''
+    hire_date: float = 0.0    # unix timestamp
+    total_hours: float = 0.0
+
+
+@dataclass
+class SkillAssessment:
+    """Record of a single skill assessment for an operator."""
+    operator_id: str
+    skill_name: str
+    score: int          # 1-5
+    assessed_by: str
+    timestamp: float
+    notes: str = ''
+
+
+class OperatorSkillMatrix:
+    """Tracks operator skills, certifications, and machine qualifications.
+
+    Supports workforce planning by identifying skill gaps, recommending
+    training, and ensuring shift coverage across machines.
+    """
+
+    def __init__(self) -> None:
+        self._operators: Dict[str, OperatorProfile] = {}
+        self._assessments: List[SkillAssessment] = []
+
+    # ------------------------------------------------------------------
+    # Registration helpers
+    # ------------------------------------------------------------------
+
+    def register_operator(self, profile: OperatorProfile) -> None:
+        """Register or update an operator profile."""
+        self._operators[profile.operator_id] = profile
+
+    def get_operator(self, operator_id: str) -> Optional[OperatorProfile]:
+        """Return the profile for *operator_id*, or ``None``."""
+        return self._operators.get(operator_id)
+
+    def get_all_operators(self) -> List[OperatorProfile]:
+        """Return all registered operator profiles."""
+        return list(self._operators.values())
+
+    # ------------------------------------------------------------------
+    # Skill assessment
+    # ------------------------------------------------------------------
+
+    def record_assessment(self, assessment: SkillAssessment) -> None:
+        """Record an assessment and update the operator's skill level."""
+        self._assessments.append(assessment)
+        profile = self._operators.get(assessment.operator_id)
+        if profile is not None:
+            profile.skills[assessment.skill_name] = max(
+                1, min(5, assessment.score),
+            )
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
+
+    def find_qualified_operators(
+        self,
+        machine_id: str,
+        required_skills: Optional[Dict[str, int]] = None,
+    ) -> List[OperatorProfile]:
+        """Find operators qualified for *machine_id* with *required_skills*.
+
+        Args:
+            machine_id: The machine the operator must be qualified on.
+            required_skills: Mapping of skill_name -> minimum proficiency.
+                             If ``None`` or empty, only machine qualification
+                             is checked.
+
+        Returns:
+            List of matching :class:`OperatorProfile` instances.
+        """
+        required_skills = required_skills or {}
+        result: List[OperatorProfile] = []
+        for op in self._operators.values():
+            if machine_id not in op.qualified_machines:
+                continue
+            qualified = True
+            for skill, min_level in required_skills.items():
+                if op.skills.get(skill, 0) < min_level:
+                    qualified = False
+                    break
+            if qualified:
+                result.append(op)
+        return result
+
+    def get_skill_gaps(
+        self,
+        operator_id: str,
+        required_skills: Dict[str, int],
+    ) -> Dict[str, Tuple[int, int]]:
+        """Identify skills below the required level for an operator.
+
+        Args:
+            operator_id: The operator to evaluate.
+            required_skills: Mapping of skill_name -> minimum proficiency.
+
+        Returns:
+            Dict of skill_name -> (current_level, required_level) for every
+            skill that is below the requirement.  A missing skill is treated
+            as level 0.
+        """
+        profile = self._operators.get(operator_id)
+        if profile is None:
+            return {skill: (0, level) for skill, level in required_skills.items()}
+        gaps: Dict[str, Tuple[int, int]] = {}
+        for skill, required_level in required_skills.items():
+            current = profile.skills.get(skill, 0)
+            if current < required_level:
+                gaps[skill] = (current, required_level)
+        return gaps
+
+    def get_team_coverage(
+        self,
+        machine_ids: List[str],
+        shift: str,
+    ) -> Dict[str, List[str]]:
+        """Check whether a shift has operators for every machine.
+
+        Args:
+            machine_ids: Machines that need coverage.
+            shift: The shift identifier to filter by.
+
+        Returns:
+            Mapping of machine_id -> list of qualified operator_ids on that
+            shift.  An empty list means the machine is uncovered.
+        """
+        coverage: Dict[str, List[str]] = {m: [] for m in machine_ids}
+        for op in self._operators.values():
+            if op.shift != shift:
+                continue
+            for mid in machine_ids:
+                if mid in op.qualified_machines:
+                    coverage[mid].append(op.operator_id)
+        return coverage
+
+    def recommend_training(
+        self,
+        operator_id: str,
+    ) -> List[Tuple[str, int, int]]:
+        """Suggest skills to improve based on gaps across all machines.
+
+        Compares the operator's current skills to the skills required by all
+        machines they are *not* yet qualified on (or where their proficiency
+        is below 3).  Returns a list of (skill_name, current_level,
+        recommended_level) tuples sorted by the size of the gap (largest
+        first).
+        """
+        profile = self._operators.get(operator_id)
+        if profile is None:
+            return []
+
+        # Collect the maximum proficiency seen for every skill across all
+        # operators (a proxy for "what the team values").
+        team_skills: Dict[str, int] = {}
+        for op in self._operators.values():
+            for skill, level in op.skills.items():
+                if level > team_skills.get(skill, 0):
+                    team_skills[skill] = level
+
+        recommendations: List[Tuple[str, int, int]] = []
+        for skill, team_max in team_skills.items():
+            current = profile.skills.get(skill, 0)
+            if current < team_max and current < 3:
+                recommendations.append((skill, current, team_max))
+
+        # Sort by gap size descending, then skill name for stability
+        recommendations.sort(key=lambda r: (-r[2] + r[1], r[0]))
+        return recommendations
+
+    def get_skill_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Return team-wide skill distribution.
+
+        Returns:
+            Mapping of skill_name -> {
+                'avg': float,       # average proficiency
+                'min': int,         # minimum proficiency
+                'max': int,         # maximum proficiency
+                'count': int,       # number of operators with this skill
+                'operators': list,  # operator_ids who hold this skill
+            }
+        """
+        skill_data: Dict[str, List[Tuple[str, int]]] = {}
+        for op in self._operators.values():
+            for skill, level in op.skills.items():
+                skill_data.setdefault(skill, []).append((op.operator_id, level))
+
+        summary: Dict[str, Dict[str, Any]] = {}
+        for skill, entries in skill_data.items():
+            levels = [lvl for _, lvl in entries]
+            summary[skill] = {
+                'avg': sum(levels) / len(levels),
+                'min': min(levels),
+                'max': max(levels),
+                'count': len(levels),
+                'operators': [oid for oid, _ in entries],
+            }
+        return summary
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

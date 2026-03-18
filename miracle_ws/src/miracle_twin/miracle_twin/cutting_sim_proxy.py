@@ -3541,3 +3541,306 @@ class WearPredictionModel:
             return float('inf')
         # T = (C / V) ^ (1/n)
         return (C / cutting_speed) ** (1.0 / n)
+
+
+# ---------------------------------------------------------------------------
+# Cutting Fluid Lifecycle Manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FluidSample:
+    """A single cutting-fluid quality sample taken from the sump."""
+    timestamp: float
+    concentration_pct: float
+    ph: float
+    bacteria_count: int  # CFU/mL
+    tramp_oil_pct: float
+    temperature_c: float
+
+
+@dataclass
+class FluidStatus:
+    """Aggregated health assessment of the cutting fluid."""
+    health_score: float          # 0-100
+    concentration_ok: bool
+    ph_ok: bool
+    bacteria_ok: bool
+    tramp_oil_ok: bool
+    days_since_change: int
+    recommended_action: str
+
+
+@dataclass
+class FluidMaintenanceRecord:
+    """Record of a maintenance action performed on the cutting fluid."""
+    timestamp: float
+    action: str   # 'top_up' | 'full_change' | 'skim' | 'add_biocide' | 'adjust_concentration'
+    amount_liters: float
+    notes: str
+
+
+class CuttingFluidManager:
+    """Tracks cutting-fluid condition, concentration, and maintenance schedule.
+
+    Thresholds
+    ----------
+    * concentration: 5 – 10 %
+    * pH: 8.5 – 9.5
+    * bacteria: < 10 000 CFU/mL
+    * tramp oil: < 3 %
+    """
+
+    CONCENTRATION_MIN: float = 5.0
+    CONCENTRATION_MAX: float = 10.0
+    PH_MIN: float = 8.5
+    PH_MAX: float = 9.5
+    BACTERIA_MAX: int = 10_000
+    TRAMP_OIL_MAX: float = 3.0
+
+    _VALID_ACTIONS = frozenset({
+        'top_up', 'full_change', 'skim', 'add_biocide', 'adjust_concentration',
+    })
+
+    def __init__(self) -> None:
+        self._samples: List[FluidSample] = []
+        self._maintenance: List[FluidMaintenanceRecord] = []
+        self._last_change_timestamp: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Sample management
+    # ------------------------------------------------------------------
+
+    def record_sample(self, sample: FluidSample) -> None:
+        """Record a fluid quality sample."""
+        self._samples.append(sample)
+
+    # ------------------------------------------------------------------
+    # Status / health
+    # ------------------------------------------------------------------
+
+    def get_status(self) -> FluidStatus:
+        """Analyse the most recent sample and return a :class:`FluidStatus`.
+
+        Raises ``ValueError`` when no samples have been recorded.
+        """
+        if not self._samples:
+            raise ValueError("No fluid samples recorded")
+
+        latest = self._samples[-1]
+
+        conc_ok = self.CONCENTRATION_MIN <= latest.concentration_pct <= self.CONCENTRATION_MAX
+        ph_ok = self.PH_MIN <= latest.ph <= self.PH_MAX
+        bact_ok = latest.bacteria_count < self.BACTERIA_MAX
+        oil_ok = latest.tramp_oil_pct < self.TRAMP_OIL_MAX
+
+        # Health score: each factor contributes up to 25 points
+        score = 0.0
+
+        # Concentration sub-score (25 pts)
+        if conc_ok:
+            score += 25.0
+        else:
+            mid = (self.CONCENTRATION_MIN + self.CONCENTRATION_MAX) / 2.0
+            half_range = (self.CONCENTRATION_MAX - self.CONCENTRATION_MIN) / 2.0
+            deviation = abs(latest.concentration_pct - mid)
+            score += max(0.0, 25.0 * (1.0 - deviation / (half_range * 3)))
+
+        # pH sub-score (25 pts)
+        if ph_ok:
+            score += 25.0
+        else:
+            mid_ph = (self.PH_MIN + self.PH_MAX) / 2.0
+            half_ph = (self.PH_MAX - self.PH_MIN) / 2.0
+            dev_ph = abs(latest.ph - mid_ph)
+            score += max(0.0, 25.0 * (1.0 - dev_ph / (half_ph * 3)))
+
+        # Bacteria sub-score (25 pts)
+        if bact_ok:
+            score += 25.0
+        else:
+            ratio = latest.bacteria_count / self.BACTERIA_MAX
+            score += max(0.0, 25.0 * (1.0 - (ratio - 1.0)))
+
+        # Tramp-oil sub-score (25 pts)
+        if oil_ok:
+            score += 25.0
+        else:
+            oil_ratio = latest.tramp_oil_pct / self.TRAMP_OIL_MAX
+            score += max(0.0, 25.0 * (1.0 - (oil_ratio - 1.0)))
+
+        score = max(0.0, min(100.0, score))
+
+        # Days since last full change
+        if self._last_change_timestamp is not None:
+            days_since = int((latest.timestamp - self._last_change_timestamp) / 86400)
+        else:
+            days_since = -1  # unknown
+
+        # Recommended action
+        action = self._recommend_action(latest, conc_ok, ph_ok, bact_ok, oil_ok)
+
+        return FluidStatus(
+            health_score=round(score, 1),
+            concentration_ok=conc_ok,
+            ph_ok=ph_ok,
+            bacteria_ok=bact_ok,
+            tramp_oil_ok=oil_ok,
+            days_since_change=days_since,
+            recommended_action=action,
+        )
+
+    @staticmethod
+    def _recommend_action(
+        sample: FluidSample,
+        conc_ok: bool,
+        ph_ok: bool,
+        bact_ok: bool,
+        oil_ok: bool,
+    ) -> str:
+        """Determine the single most important recommended action."""
+        if not bact_ok and sample.bacteria_count >= 50_000:
+            return 'full_change'
+        if not oil_ok and sample.tramp_oil_pct >= 5.0:
+            return 'full_change'
+        if not bact_ok:
+            return 'add_biocide'
+        if not oil_ok:
+            return 'skim'
+        if not conc_ok:
+            return 'adjust_concentration'
+        if not ph_ok:
+            return 'adjust_concentration'
+        return 'none'
+
+    # ------------------------------------------------------------------
+    # Maintenance records
+    # ------------------------------------------------------------------
+
+    def record_maintenance(self, record: FluidMaintenanceRecord) -> None:
+        """Log a maintenance action.
+
+        Raises ``ValueError`` for unknown action types.
+        """
+        if record.action not in self._VALID_ACTIONS:
+            raise ValueError(
+                f"Unknown action '{record.action}'. "
+                f"Valid actions: {sorted(self._VALID_ACTIONS)}"
+            )
+        self._maintenance.append(record)
+        if record.action == 'full_change':
+            self._last_change_timestamp = record.timestamp
+
+    def get_maintenance_history(self) -> List[FluidMaintenanceRecord]:
+        """Return all maintenance records in chronological order."""
+        return list(self._maintenance)
+
+    # ------------------------------------------------------------------
+    # Predictive analytics
+    # ------------------------------------------------------------------
+
+    def predict_next_change(
+        self,
+        max_bacteria: int = 50_000,
+        max_tramp_oil: float = 5.0,
+    ) -> Optional[float]:
+        """Predict the number of days until the fluid needs a full change.
+
+        Uses linear regression on bacteria count and tramp-oil percentage
+        trends.  Returns ``None`` when there are fewer than 2 samples or
+        the degradation trend is non-positive (fluid is improving).
+        """
+        if len(self._samples) < 2:
+            return None
+
+        ts = [s.timestamp for s in self._samples]
+        bacteria = [float(s.bacteria_count) for s in self._samples]
+        tramp = [s.tramp_oil_pct for s in self._samples]
+
+        # Convert timestamps to days relative to first sample
+        t0 = ts[0]
+        days = [(t - t0) / 86400.0 for t in ts]
+
+        days_to_limit: List[float] = []
+
+        # Bacteria trend
+        b_slope, b_intercept = self._simple_lr(days, bacteria)
+        if b_slope > 0:
+            days_to_bact = (max_bacteria - b_intercept) / b_slope
+            remaining_bact = days_to_bact - days[-1]
+            if remaining_bact > 0:
+                days_to_limit.append(remaining_bact)
+
+        # Tramp-oil trend
+        o_slope, o_intercept = self._simple_lr(days, tramp)
+        if o_slope > 0:
+            days_to_oil = (max_tramp_oil - o_intercept) / o_slope
+            remaining_oil = days_to_oil - days[-1]
+            if remaining_oil > 0:
+                days_to_limit.append(remaining_oil)
+
+        if not days_to_limit:
+            return None
+
+        return round(min(days_to_limit), 1)
+
+    @staticmethod
+    def _simple_lr(xs: List[float], ys: List[float]) -> Tuple[float, float]:
+        """Ordinary least-squares for slope and intercept."""
+        n = len(xs)
+        if n < 2:
+            return 0.0, 0.0
+        sum_x = sum(xs)
+        sum_y = sum(ys)
+        sum_xy = sum(x * y for x, y in zip(xs, ys))
+        sum_xx = sum(x * x for x in xs)
+        denom = n * sum_xx - sum_x * sum_x
+        if abs(denom) < 1e-12:
+            return 0.0, sum_y / n
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - slope * sum_x) / n
+        return slope, intercept
+
+    # ------------------------------------------------------------------
+    # Cost analysis
+    # ------------------------------------------------------------------
+
+    def get_cost_analysis(
+        self,
+        fluid_cost_per_liter: float,
+        disposal_cost: float,
+    ) -> Dict[str, float]:
+        """Compute total fluid costs from the maintenance history.
+
+        Parameters
+        ----------
+        fluid_cost_per_liter:
+            Price of cutting fluid concentrate per litre.
+        disposal_cost:
+            Fixed cost per full-change disposal event.
+
+        Returns
+        -------
+        dict with keys:
+            ``total_fluid_cost`` – sum of (amount_liters * cost) across all
+            records.
+            ``total_disposal_cost`` – disposal_cost * number of full changes.
+            ``total_cost`` – sum of the above.
+            ``num_full_changes`` – count of ``full_change`` actions.
+            ``total_liters_used`` – total volume of fluid consumed.
+        """
+        total_liters = 0.0
+        num_full_changes = 0
+        for rec in self._maintenance:
+            total_liters += rec.amount_liters
+            if rec.action == 'full_change':
+                num_full_changes += 1
+
+        total_fluid = total_liters * fluid_cost_per_liter
+        total_disposal = num_full_changes * disposal_cost
+        return {
+            'total_fluid_cost': round(total_fluid, 2),
+            'total_disposal_cost': round(total_disposal, 2),
+            'total_cost': round(total_fluid + total_disposal, 2),
+            'num_full_changes': num_full_changes,
+            'total_liters_used': round(total_liters, 2),
+        }

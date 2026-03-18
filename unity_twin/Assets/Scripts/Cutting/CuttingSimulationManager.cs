@@ -1320,4 +1320,350 @@ namespace MiracleTwin.Cutting
             return sum / points.Count;
         }
     }
+
+    // ── Spindle Bearing Health Monitor ───────────────────────────────
+
+    /// <summary>
+    /// A single bearing sensor reading capturing temperature, vibration, and load data.
+    /// </summary>
+    [Serializable]
+    public class BearingReading
+    {
+        public string timestamp;          // ISO-8601
+        public float temperature;         // °C
+        public float vibrationRms;        // mm/s  (root-mean-square)
+        public float vibrationPeak;       // mm/s  (peak value)
+        public float axialLoad;           // N
+        public float radialLoad;          // N
+    }
+
+    /// <summary>
+    /// Health report produced by <see cref="SpindleBearingMonitor"/>.
+    /// </summary>
+    [Serializable]
+    public class BearingHealthReport
+    {
+        public float overallHealth;                  // 0-100
+        public string temperatureStatus;             // "normal", "elevated", "critical"
+        public string vibrationStatus;               // "normal", "elevated", "critical"
+        public string lubricationStatus;             // "good", "marginal", "poor"
+        public float estimatedRemainingHours;
+        public List<string> recommendations = new List<string>();
+    }
+
+    /// <summary>
+    /// Temperature trend result returned by <see cref="SpindleBearingMonitor.GetTemperatureTrend"/>.
+    /// </summary>
+    [Serializable]
+    public class TemperatureTrend
+    {
+        public float average;
+        public float slope;
+        public bool isRising;
+    }
+
+    /// <summary>
+    /// Vibration spectrum summary returned by <see cref="SpindleBearingMonitor.GetVibrationSpectrum"/>.
+    /// </summary>
+    [Serializable]
+    public class VibrationSpectrum
+    {
+        public float rmsAvg;
+        public float peakAvg;
+        public float crestFactor;
+    }
+
+    /// <summary>
+    /// Monitors spindle bearing health through vibration and temperature analysis.
+    ///
+    /// Health scoring weights:
+    ///   Temperature  30 %
+    ///   Vibration    40 %
+    ///   Load         20 %
+    ///   Trend        10 %
+    ///
+    /// Thresholds:
+    ///   Temperature – normal &lt; 50 °C, elevated &lt; 70 °C, critical &ge; 70 °C
+    ///   Vibration   – normal &lt; 2.5 mm/s, elevated &lt; 5.0 mm/s, critical &ge; 5.0 mm/s
+    /// </summary>
+    public class SpindleBearingMonitor
+    {
+        // ── Constants ────────────────────────────────────────────────
+
+        private const int MaxReadings = 1000;
+        private const int TrendWindow = 50;
+
+        // Temperature thresholds (°C)
+        private const float TempNormalMax = 50f;
+        private const float TempElevatedMax = 70f;
+
+        // Vibration RMS thresholds (mm/s)
+        private const float VibNormalMax = 2.5f;
+        private const float VibElevatedMax = 5.0f;
+
+        // Scoring weights
+        private const float WeightTemperature = 0.30f;
+        private const float WeightVibration   = 0.40f;
+        private const float WeightLoad        = 0.20f;
+        private const float WeightTrend       = 0.10f;
+
+        // Load reference (rated load for scoring – readings above this reduce score)
+        private const float RatedAxialLoad  = 5000f;  // N
+        private const float RatedRadialLoad = 3000f;  // N
+
+        // ── State ────────────────────────────────────────────────────
+
+        private List<BearingReading> readings = new List<BearingReading>();
+
+        // ── Recording ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Store a bearing reading.  The buffer is capped at 1 000 entries;
+        /// the oldest readings are discarded when the limit is reached.
+        /// </summary>
+        public void RecordReading(BearingReading reading)
+        {
+            if (reading == null) return;
+
+            readings.Add(reading);
+            if (readings.Count > MaxReadings)
+                readings.RemoveAt(0);
+        }
+
+        /// <summary>Current number of stored readings.</summary>
+        public int ReadingCount => readings.Count;
+
+        // ── Health Report ────────────────────────────────────────────
+
+        /// <summary>
+        /// Analyse recent readings and produce a comprehensive health report.
+        /// </summary>
+        public BearingHealthReport GetHealthReport()
+        {
+            var report = new BearingHealthReport();
+
+            if (readings.Count == 0)
+            {
+                report.overallHealth = 100f;
+                report.temperatureStatus = "normal";
+                report.vibrationStatus = "normal";
+                report.lubricationStatus = "good";
+                report.estimatedRemainingHours = 0f;
+                report.recommendations.Add("No readings recorded yet.");
+                return report;
+            }
+
+            // --- Temperature scoring (30 %) ---
+            float avgTemp = readings.Average(r => r.temperature);
+            float tempScore = ScoreTemperature(avgTemp);
+            report.temperatureStatus = ClassifyTemperature(avgTemp);
+
+            // --- Vibration scoring (40 %) ---
+            var spectrum = GetVibrationSpectrum();
+            float vibScore = ScoreVibration(spectrum.rmsAvg);
+            report.vibrationStatus = ClassifyVibration(spectrum.rmsAvg);
+
+            // --- Load scoring (20 %) ---
+            float avgAxial  = readings.Average(r => r.axialLoad);
+            float avgRadial = readings.Average(r => r.radialLoad);
+            float loadScore = ScoreLoad(avgAxial, avgRadial);
+
+            // --- Trend scoring (10 %) ---
+            var trend = GetTemperatureTrend();
+            float trendScore = ScoreTrend(trend);
+
+            // --- Overall health ---
+            report.overallHealth = Mathf.Clamp(
+                tempScore  * WeightTemperature +
+                vibScore   * WeightVibration   +
+                loadScore  * WeightLoad        +
+                trendScore * WeightTrend,
+                0f, 100f);
+
+            // --- Lubrication status (derived from vibration crest factor) ---
+            report.lubricationStatus = ClassifyLubrication(spectrum.crestFactor);
+
+            // --- Remaining life estimate (simple linear projection) ---
+            report.estimatedRemainingHours = PredictRemainingLife(0f, 20000f);
+
+            // --- Recommendations ---
+            if (report.temperatureStatus == "critical")
+                report.recommendations.Add("Immediate inspection required: bearing temperature critical.");
+            else if (report.temperatureStatus == "elevated")
+                report.recommendations.Add("Monitor bearing temperature closely; consider coolant check.");
+
+            if (report.vibrationStatus == "critical")
+                report.recommendations.Add("Immediate inspection required: vibration levels critical.");
+            else if (report.vibrationStatus == "elevated")
+                report.recommendations.Add("Schedule vibration analysis; check bearing pre-load.");
+
+            if (report.lubricationStatus == "poor")
+                report.recommendations.Add("Re-lubricate bearings immediately.");
+            else if (report.lubricationStatus == "marginal")
+                report.recommendations.Add("Plan bearing lubrication at next maintenance window.");
+
+            if (trend.isRising && trend.slope > 0.5f)
+                report.recommendations.Add("Temperature trend is rising; investigate root cause.");
+
+            if (report.recommendations.Count == 0)
+                report.recommendations.Add("Bearing health is within normal parameters.");
+
+            return report;
+        }
+
+        // ── Temperature Trend ────────────────────────────────────────
+
+        /// <summary>
+        /// Compute average temperature, linear slope, and rising flag from
+        /// the last <see cref="TrendWindow"/> readings (or all if fewer).
+        /// </summary>
+        public TemperatureTrend GetTemperatureTrend()
+        {
+            var result = new TemperatureTrend();
+
+            if (readings.Count == 0)
+                return result;
+
+            var window = readings.Count <= TrendWindow
+                ? readings
+                : readings.GetRange(readings.Count - TrendWindow, TrendWindow);
+
+            result.average = window.Average(r => r.temperature);
+
+            // Simple least-squares slope (y = temperature, x = index)
+            if (window.Count >= 2)
+            {
+                float n = window.Count;
+                float sumX = 0f, sumY = 0f, sumXY = 0f, sumX2 = 0f;
+                for (int i = 0; i < window.Count; i++)
+                {
+                    float x = i;
+                    float y = window[i].temperature;
+                    sumX  += x;
+                    sumY  += y;
+                    sumXY += x * y;
+                    sumX2 += x * x;
+                }
+                float denom = n * sumX2 - sumX * sumX;
+                result.slope = denom != 0f ? (n * sumXY - sumX * sumY) / denom : 0f;
+            }
+
+            result.isRising = result.slope > 0f;
+            return result;
+        }
+
+        // ── Vibration Spectrum ───────────────────────────────────────
+
+        /// <summary>
+        /// Compute RMS average, peak average and crest factor from recent readings.
+        /// </summary>
+        public VibrationSpectrum GetVibrationSpectrum()
+        {
+            var result = new VibrationSpectrum();
+
+            if (readings.Count == 0)
+                return result;
+
+            result.rmsAvg  = readings.Average(r => r.vibrationRms);
+            result.peakAvg = readings.Average(r => r.vibrationPeak);
+            result.crestFactor = result.rmsAvg > 0f
+                ? result.peakAvg / result.rmsAvg
+                : 0f;
+
+            return result;
+        }
+
+        // ── Remaining Life Prediction ────────────────────────────────
+
+        /// <summary>
+        /// Estimate remaining bearing life hours based on current health
+        /// degradation rate.  <paramref name="currentHours"/> is the number
+        /// of operating hours already accumulated and <paramref name="maxHours"/>
+        /// is the manufacturer-rated L10 life.
+        /// </summary>
+        public float PredictRemainingLife(float currentHours, float maxHours)
+        {
+            if (readings.Count == 0)
+                return maxHours - currentHours;
+
+            // Health-based degradation factor (lower health = faster degradation)
+            float avgTemp = readings.Average(r => r.temperature);
+            float avgVib  = readings.Average(r => r.vibrationRms);
+
+            float tempFactor = avgTemp < TempNormalMax ? 1.0f
+                             : avgTemp < TempElevatedMax ? 0.7f
+                             : 0.3f;
+
+            float vibFactor = avgVib < VibNormalMax ? 1.0f
+                            : avgVib < VibElevatedMax ? 0.6f
+                            : 0.2f;
+
+            float degradationFactor = (tempFactor + vibFactor) / 2f;
+
+            float remaining = (maxHours - currentHours) * degradationFactor;
+            return Mathf.Max(remaining, 0f);
+        }
+
+        // ── Scoring Helpers ──────────────────────────────────────────
+
+        private float ScoreTemperature(float avgTemp)
+        {
+            if (avgTemp < TempNormalMax)
+                return 100f;
+            if (avgTemp < TempElevatedMax)
+                return Mathf.Lerp(100f, 50f, (avgTemp - TempNormalMax) / (TempElevatedMax - TempNormalMax));
+            // critical
+            return Mathf.Lerp(50f, 0f, Mathf.Clamp01((avgTemp - TempElevatedMax) / 30f));
+        }
+
+        private float ScoreVibration(float rmsAvg)
+        {
+            if (rmsAvg < VibNormalMax)
+                return 100f;
+            if (rmsAvg < VibElevatedMax)
+                return Mathf.Lerp(100f, 50f, (rmsAvg - VibNormalMax) / (VibElevatedMax - VibNormalMax));
+            return Mathf.Lerp(50f, 0f, Mathf.Clamp01((rmsAvg - VibElevatedMax) / 5f));
+        }
+
+        private float ScoreLoad(float axial, float radial)
+        {
+            float axialRatio  = Mathf.Clamp01(axial  / RatedAxialLoad);
+            float radialRatio = Mathf.Clamp01(radial / RatedRadialLoad);
+            float loadRatio   = Mathf.Max(axialRatio, radialRatio);
+            return Mathf.Lerp(100f, 0f, loadRatio);
+        }
+
+        private float ScoreTrend(TemperatureTrend trend)
+        {
+            if (!trend.isRising)
+                return 100f;
+            // Penalise rising temperature; slope > 1 °C/reading ≈ worst case
+            return Mathf.Lerp(100f, 0f, Mathf.Clamp01(trend.slope));
+        }
+
+        // ── Classification Helpers ───────────────────────────────────
+
+        private string ClassifyTemperature(float temp)
+        {
+            if (temp < TempNormalMax)  return "normal";
+            if (temp < TempElevatedMax) return "elevated";
+            return "critical";
+        }
+
+        private string ClassifyVibration(float rms)
+        {
+            if (rms < VibNormalMax)  return "normal";
+            if (rms < VibElevatedMax) return "elevated";
+            return "critical";
+        }
+
+        private string ClassifyLubrication(float crestFactor)
+        {
+            // A crest factor near 1.0-1.5 indicates smooth operation (good lube).
+            // Higher crest factors suggest impulsive vibration (poor lube / damage).
+            if (crestFactor < 3.0f)  return "good";
+            if (crestFactor < 5.0f)  return "marginal";
+            return "poor";
+        }
+    }
 }

@@ -1976,6 +1976,239 @@ class ControlChartGenerator:
         return {'A2': _A2[n], 'D3': _D3[n], 'D4': _D4[n], 'd2': _d2[n]}
 
 
+# ---------------------------------------------------------------------------
+# Downtime Event Classifier
+# ---------------------------------------------------------------------------
+
+_DOWNTIME_CATEGORIES = frozenset({
+    'planned', 'unplanned', 'changeover', 'maintenance',
+    'quality', 'material', 'operator',
+})
+
+
+@dataclass
+class DowntimeEvent:
+    """A single machine downtime event."""
+    event_id: str
+    machine_id: str
+    start_time: float
+    end_time: Optional[float]
+    category: str          # one of _DOWNTIME_CATEGORIES
+    reason: str
+    resolved: bool = False
+
+    def duration_min(self) -> float:
+        """Return event duration in minutes.  Returns 0 if still open."""
+        if self.end_time is None:
+            return 0.0
+        return max(0.0, (self.end_time - self.start_time) / 60.0)
+
+
+@dataclass
+class DowntimeSummary:
+    """Aggregated downtime statistics over a time range."""
+    total_downtime_min: float = 0.0
+    planned_min: float = 0.0
+    unplanned_min: float = 0.0
+    by_category: Dict[str, float] = field(default_factory=dict)
+    by_machine: Dict[str, float] = field(default_factory=dict)
+    event_count: int = 0
+    mttr_min: float = 0.0      # mean time to repair (resolved events)
+    top_reasons: List[Tuple[str, int, float]] = field(default_factory=list)
+
+
+class DowntimeClassifier:
+    """Classifies and tracks machine downtime events by category.
+
+    Provides summary statistics, Pareto analysis, and OEE availability
+    calculations for recorded downtime events.
+    """
+
+    def __init__(self) -> None:
+        self._events: Dict[str, DowntimeEvent] = {}   # event_id -> event
+        self._lock = threading.Lock()
+
+    # -- Recording ----------------------------------------------------------
+
+    def record_event(self, event: DowntimeEvent) -> None:
+        """Record a downtime event.
+
+        Raises ``ValueError`` if the category is not one of the valid
+        downtime categories or the event_id is already registered.
+        """
+        if event.category not in _DOWNTIME_CATEGORIES:
+            raise ValueError(
+                f"Invalid category '{event.category}'. "
+                f"Must be one of {sorted(_DOWNTIME_CATEGORIES)}."
+            )
+        with self._lock:
+            if event.event_id in self._events:
+                raise ValueError(
+                    f"Event '{event.event_id}' already exists."
+                )
+            self._events[event.event_id] = event
+
+    def close_event(self, event_id: str, end_time: float) -> None:
+        """Mark an event as resolved with the given *end_time*.
+
+        Raises ``KeyError`` if the event_id is not found.
+        """
+        with self._lock:
+            if event_id not in self._events:
+                raise KeyError(f"Event '{event_id}' not found.")
+            ev = self._events[event_id]
+            ev.end_time = end_time
+            ev.resolved = True
+
+    # -- Queries ------------------------------------------------------------
+
+    def get_events_by_machine(self, machine_id: str) -> List[DowntimeEvent]:
+        """Return all events for a given machine."""
+        with self._lock:
+            return [e for e in self._events.values()
+                    if e.machine_id == machine_id]
+
+    def get_open_events(self) -> List[DowntimeEvent]:
+        """Return events that have not been closed/resolved."""
+        with self._lock:
+            return [e for e in self._events.values() if not e.resolved]
+
+    # -- Analysis -----------------------------------------------------------
+
+    def _events_in_range(
+        self, start_time: float, end_time: float,
+    ) -> List[DowntimeEvent]:
+        """Return resolved events overlapping the given time window."""
+        results: List[DowntimeEvent] = []
+        for ev in self._events.values():
+            if ev.end_time is None:
+                continue
+            # Event overlaps window if it starts before window-end and
+            # ends after window-start.
+            if ev.start_time < end_time and ev.end_time > start_time:
+                results.append(ev)
+        return results
+
+    @staticmethod
+    def _clipped_duration_min(
+        ev: DowntimeEvent, start_time: float, end_time: float,
+    ) -> float:
+        """Duration of *ev* clipped to the [start_time, end_time] window, in minutes."""
+        if ev.end_time is None:
+            return 0.0
+        clipped_start = max(ev.start_time, start_time)
+        clipped_end = min(ev.end_time, end_time)
+        return max(0.0, (clipped_end - clipped_start) / 60.0)
+
+    def get_summary(
+        self, start_time: float, end_time: float,
+    ) -> DowntimeSummary:
+        """Generate a ``DowntimeSummary`` for the given time range.
+
+        Only resolved (closed) events that overlap the window are included.
+        Durations are clipped to the window boundaries.
+        """
+        with self._lock:
+            events = self._events_in_range(start_time, end_time)
+
+        total = 0.0
+        planned = 0.0
+        unplanned = 0.0
+        by_cat: Dict[str, float] = {}
+        by_machine: Dict[str, float] = {}
+        reason_map: Dict[str, List[float]] = {}  # reason -> list of durations
+
+        resolved_durations: List[float] = []
+
+        for ev in events:
+            dur = self._clipped_duration_min(ev, start_time, end_time)
+            total += dur
+
+            if ev.category == 'planned':
+                planned += dur
+            else:
+                unplanned += dur
+
+            by_cat[ev.category] = by_cat.get(ev.category, 0.0) + dur
+            by_machine[ev.machine_id] = by_machine.get(ev.machine_id, 0.0) + dur
+
+            reason_map.setdefault(ev.reason, []).append(dur)
+
+            if ev.resolved:
+                resolved_durations.append(ev.duration_min())
+
+        mttr = (sum(resolved_durations) / len(resolved_durations)
+                if resolved_durations else 0.0)
+
+        # Top reasons sorted by total duration descending
+        top_reasons: List[Tuple[str, int, float]] = sorted(
+            [(reason, len(durs), sum(durs))
+             for reason, durs in reason_map.items()],
+            key=lambda t: t[2],
+            reverse=True,
+        )
+
+        return DowntimeSummary(
+            total_downtime_min=total,
+            planned_min=planned,
+            unplanned_min=unplanned,
+            by_category=by_cat,
+            by_machine=by_machine,
+            event_count=len(events),
+            mttr_min=mttr,
+            top_reasons=top_reasons,
+        )
+
+    def get_pareto_reasons(
+        self, top_n: int = 5,
+    ) -> List[Tuple[str, int, float]]:
+        """Return the top *top_n* downtime reasons by total duration.
+
+        Each entry is ``(reason, occurrence_count, total_duration_min)``.
+        """
+        with self._lock:
+            reason_map: Dict[str, List[float]] = {}
+            for ev in self._events.values():
+                dur = ev.duration_min()
+                reason_map.setdefault(ev.reason, []).append(dur)
+
+        ranked = sorted(
+            [(reason, len(durs), sum(durs))
+             for reason, durs in reason_map.items()],
+            key=lambda t: t[2],
+            reverse=True,
+        )
+        return ranked[:top_n]
+
+    def calculate_availability(
+        self,
+        machine_id: str,
+        planned_production_min: float,
+        start_time: float,
+        end_time: float,
+    ) -> float:
+        """Compute the OEE availability component for *machine_id*.
+
+        availability = (planned_production_min - downtime) / planned_production_min
+
+        Returns a value clamped to [0.0, 1.0].  If *planned_production_min*
+        is zero the result is 1.0 (no planned time => full availability).
+        """
+        if planned_production_min <= 0.0:
+            return 1.0
+
+        with self._lock:
+            events = self._events_in_range(start_time, end_time)
+
+        downtime = sum(
+            self._clipped_duration_min(ev, start_time, end_time)
+            for ev in events if ev.machine_id == machine_id
+        )
+
+        availability = (planned_production_min - downtime) / planned_production_min
+        return max(0.0, min(1.0, availability))
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

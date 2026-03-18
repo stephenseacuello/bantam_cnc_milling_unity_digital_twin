@@ -1606,6 +1606,228 @@ class ServiceMeshMonitor:
         return sorted(at_risk)
 
 
+# ---------------------------------------------------------------------------
+# Circuit Breaker Pattern
+# ---------------------------------------------------------------------------
+
+
+class CircuitBreakerState(Enum):
+    """States for the circuit breaker pattern."""
+    CLOSED = 'CLOSED'
+    OPEN = 'OPEN'
+    HALF_OPEN = 'HALF_OPEN'
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for a circuit breaker instance."""
+    failure_threshold: int = 5
+    reset_timeout_sec: float = 30.0
+    half_open_max_calls: int = 3
+    success_threshold: int = 2
+
+
+@dataclass
+class CircuitBreakerMetrics:
+    """Runtime metrics for a circuit breaker."""
+    state: str
+    failure_count: int
+    success_count: int
+    total_calls: int
+    last_failure_time: Optional[float]
+    last_success_time: Optional[float]
+    trips: int
+    state_changes: List[Tuple[float, str, str]]
+
+
+class CircuitOpenError(Exception):
+    """Raised when a call is attempted while the circuit breaker is OPEN."""
+    pass
+
+
+class CircuitBreaker:
+    """Implements the circuit breaker pattern for service calls.
+
+    Protects downstream services by tracking failures and opening the
+    circuit when the failure threshold is exceeded.  After a configurable
+    timeout the breaker transitions to HALF_OPEN, allowing a limited
+    number of probe calls.  If enough succeed the circuit closes again;
+    any failure in the half-open state immediately re-opens it.
+    """
+
+    def __init__(self, config: Optional[CircuitBreakerConfig] = None) -> None:
+        self._config = config or CircuitBreakerConfig()
+        self._state = CircuitBreakerState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._half_open_calls = 0
+        self._half_open_successes = 0
+        self._total_calls = 0
+        self._last_failure_time: Optional[float] = None
+        self._last_success_time: Optional[float] = None
+        self._trips = 0
+        self._state_changes: List[Tuple[float, str, str]] = []
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------ #
+    #  State transitions
+    # ------------------------------------------------------------------ #
+
+    def _transition(self, new_state: CircuitBreakerState) -> None:
+        """Record a state transition."""
+        old_state = self._state
+        self._state = new_state
+        self._state_changes.append(
+            (time.time(), old_state.value, new_state.value),
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Public API
+    # ------------------------------------------------------------------ #
+
+    def call(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        """Execute *func* through the circuit breaker.
+
+        - **CLOSED**: calls pass through; failures are tracked and if
+          they reach ``failure_threshold`` the breaker trips to OPEN.
+        - **OPEN**: calls are rejected immediately with
+          :class:`CircuitOpenError`.  After ``reset_timeout_sec`` the
+          breaker transitions to HALF_OPEN.
+        - **HALF_OPEN**: up to ``half_open_max_calls`` probe calls are
+          allowed.  If ``success_threshold`` consecutive successes are
+          recorded the breaker closes.  Any failure re-opens it.
+        """
+        with self._lock:
+            self._total_calls += 1
+
+            if self._state == CircuitBreakerState.OPEN:
+                # Check if the reset timeout has elapsed
+                if (
+                    self._last_failure_time is not None
+                    and (time.time() - self._last_failure_time) >= self._config.reset_timeout_sec
+                ):
+                    self._transition(CircuitBreakerState.HALF_OPEN)
+                    self._half_open_calls = 0
+                    self._half_open_successes = 0
+                else:
+                    raise CircuitOpenError(
+                        'Circuit breaker is OPEN; call rejected.'
+                    )
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                if self._half_open_calls >= self._config.half_open_max_calls:
+                    # Exceeded probe limit without meeting success threshold
+                    self._transition(CircuitBreakerState.OPEN)
+                    self._trips += 1
+                    self._last_failure_time = time.time()
+                    raise CircuitOpenError(
+                        'Circuit breaker exceeded half-open call limit; re-opened.'
+                    )
+
+        # Execute the call outside the lock to avoid holding it during I/O
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            with self._lock:
+                self._last_failure_time = time.time()
+                if self._state == CircuitBreakerState.HALF_OPEN:
+                    # Any failure in HALF_OPEN immediately re-opens
+                    self._transition(CircuitBreakerState.OPEN)
+                    self._trips += 1
+                    self._half_open_calls += 1
+                else:
+                    # CLOSED state
+                    self._failure_count += 1
+                    if self._failure_count >= self._config.failure_threshold:
+                        self._transition(CircuitBreakerState.OPEN)
+                        self._trips += 1
+            raise
+
+        with self._lock:
+            self._last_success_time = time.time()
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._half_open_calls += 1
+                self._half_open_successes += 1
+                if self._half_open_successes >= self._config.success_threshold:
+                    self._transition(CircuitBreakerState.CLOSED)
+                    self._failure_count = 0
+                    self._success_count += 1
+                else:
+                    self._success_count += 1
+            else:
+                self._success_count += 1
+
+        return result
+
+    def get_state(self) -> CircuitBreakerState:
+        """Return the current circuit breaker state."""
+        with self._lock:
+            # Auto-transition from OPEN -> HALF_OPEN if timeout elapsed
+            if self._state == CircuitBreakerState.OPEN:
+                if (
+                    self._last_failure_time is not None
+                    and (time.time() - self._last_failure_time) >= self._config.reset_timeout_sec
+                ):
+                    self._transition(CircuitBreakerState.HALF_OPEN)
+                    self._half_open_calls = 0
+                    self._half_open_successes = 0
+            return self._state
+
+    def get_metrics(self) -> CircuitBreakerMetrics:
+        """Return a snapshot of circuit breaker metrics."""
+        with self._lock:
+            return CircuitBreakerMetrics(
+                state=self._state.value,
+                failure_count=self._failure_count,
+                success_count=self._success_count,
+                total_calls=self._total_calls,
+                last_failure_time=self._last_failure_time,
+                last_success_time=self._last_success_time,
+                trips=self._trips,
+                state_changes=list(self._state_changes),
+            )
+
+    def reset(self) -> None:
+        """Force the circuit breaker back to CLOSED state."""
+        with self._lock:
+            old_state = self._state
+            if old_state != CircuitBreakerState.CLOSED:
+                self._transition(CircuitBreakerState.CLOSED)
+            self._failure_count = 0
+            self._half_open_calls = 0
+            self._half_open_successes = 0
+
+
+class CircuitBreakerRegistry:
+    """Manages a collection of named circuit breakers.
+
+    Provides centralised access to :class:`CircuitBreaker` instances so
+    that different parts of the system can share breaker state for the
+    same downstream service.
+    """
+
+    def __init__(self) -> None:
+        self._breakers: Dict[str, CircuitBreaker] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create(
+        self, name: str, config: Optional[CircuitBreakerConfig] = None,
+    ) -> CircuitBreaker:
+        """Return the breaker for *name*, creating one if necessary."""
+        with self._lock:
+            if name not in self._breakers:
+                self._breakers[name] = CircuitBreaker(config)
+            return self._breakers[name]
+
+    def get_all_metrics(self) -> Dict[str, CircuitBreakerMetrics]:
+        """Return metrics for every registered circuit breaker."""
+        with self._lock:
+            return {
+                name: cb.get_metrics()
+                for name, cb in self._breakers.items()
+            }
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

@@ -1972,6 +1972,227 @@ class CycleTimeEstimator:
         return suggestions
 
 
+# ---------------------------------------------------------------------------
+# Work Order Tracker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkOrderStage:
+    """A single manufacturing stage within a work order."""
+
+    stage_name: str
+    status: str = 'pending'  # 'pending' | 'in_progress' | 'completed' | 'skipped'
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    operator: str = ''
+    notes: str = ''
+
+
+@dataclass
+class WorkOrder:
+    """A manufacturing work order consisting of multiple stages."""
+
+    wo_id: str
+    part_number: str
+    quantity: int
+    stages: List[WorkOrderStage] = field(default_factory=list)
+    created_at: float = 0.0
+    priority: int = 0
+    customer: str = ''
+    due_date: float = 0.0
+
+
+@dataclass
+class WorkOrderMetrics:
+    """Aggregate metrics across all tracked work orders."""
+
+    total_orders: int = 0
+    completed: int = 0
+    in_progress: int = 0
+    avg_cycle_time_min: float = 0.0
+    on_time_delivery_pct: float = 0.0
+    stage_bottleneck: str = ''
+
+
+class WorkOrderTracker:
+    """Tracks work orders through manufacturing stages.
+
+    Provides lifecycle management for work orders, including stage
+    transitions (start, complete, skip) and aggregate metrics with
+    bottleneck analysis.
+    """
+
+    def __init__(self) -> None:
+        self._orders: Dict[str, WorkOrder] = {}
+
+    # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _overall_status(wo: WorkOrder) -> str:
+        """Derive the overall status of a work order from its stages."""
+        statuses = {s.status for s in wo.stages}
+        if all(s in ('completed', 'skipped') for s in statuses):
+            return 'completed'
+        if 'in_progress' in statuses:
+            return 'in_progress'
+        # Mix of pending / completed / skipped but nothing in_progress
+        if 'completed' in statuses or 'skipped' in statuses:
+            # Some work done but not all finished
+            if 'pending' in statuses:
+                return 'in_progress'
+            return 'completed'
+        return 'pending'
+
+    # -- public API ----------------------------------------------------------
+
+    def create_work_order(
+        self,
+        wo_id: str,
+        part_number: str,
+        quantity: int,
+        stage_names: List[str],
+        priority: int = 0,
+        customer: str = '',
+        due_date: float = 0.0,
+    ) -> WorkOrder:
+        """Create a new work order with all stages initialised to *pending*."""
+        stages = [WorkOrderStage(stage_name=name) for name in stage_names]
+        wo = WorkOrder(
+            wo_id=wo_id,
+            part_number=part_number,
+            quantity=quantity,
+            stages=stages,
+            created_at=time.time(),
+            priority=priority,
+            customer=customer,
+            due_date=due_date,
+        )
+        self._orders[wo_id] = wo
+        return wo
+
+    def start_stage(self, wo_id: str, stage_name: str, operator: str) -> None:
+        """Mark a stage as *in_progress* and record the operator."""
+        wo = self._orders[wo_id]
+        for stage in wo.stages:
+            if stage.stage_name == stage_name:
+                stage.status = 'in_progress'
+                stage.start_time = time.time()
+                stage.operator = operator
+                return
+        raise ValueError(f"Stage '{stage_name}' not found in work order '{wo_id}'")
+
+    def complete_stage(self, wo_id: str, stage_name: str, notes: str = '') -> None:
+        """Mark a stage as *completed* and auto-start the next pending stage."""
+        wo = self._orders[wo_id]
+        completed_stage: Optional[WorkOrderStage] = None
+        for stage in wo.stages:
+            if stage.stage_name == stage_name:
+                stage.status = 'completed'
+                stage.end_time = time.time()
+                stage.notes = notes
+                completed_stage = stage
+                break
+        if completed_stage is None:
+            raise ValueError(f"Stage '{stage_name}' not found in work order '{wo_id}'")
+
+        # Auto-start the next pending stage if one exists
+        for stage in wo.stages:
+            if stage.status == 'pending':
+                stage.status = 'in_progress'
+                stage.start_time = time.time()
+                if completed_stage.operator:
+                    stage.operator = completed_stage.operator
+                break
+
+    def skip_stage(self, wo_id: str, stage_name: str, reason: str = '') -> None:
+        """Skip a stage with an optional reason stored in notes."""
+        wo = self._orders[wo_id]
+        for stage in wo.stages:
+            if stage.stage_name == stage_name:
+                stage.status = 'skipped'
+                stage.end_time = time.time()
+                stage.notes = reason
+                return
+        raise ValueError(f"Stage '{stage_name}' not found in work order '{wo_id}'")
+
+    def get_work_order(self, wo_id: str) -> WorkOrder:
+        """Return a single work order by ID."""
+        return self._orders[wo_id]
+
+    def get_all_orders(self) -> List[WorkOrder]:
+        """Return all tracked work orders."""
+        return list(self._orders.values())
+
+    def get_orders_by_status(self, status: str) -> List[WorkOrder]:
+        """Filter work orders by overall status (pending/in_progress/completed)."""
+        return [wo for wo in self._orders.values() if self._overall_status(wo) == status]
+
+    def get_metrics(self) -> WorkOrderMetrics:
+        """Compute aggregate metrics including bottleneck analysis."""
+        all_orders = list(self._orders.values())
+        total = len(all_orders)
+        if total == 0:
+            return WorkOrderMetrics()
+
+        completed_orders = [wo for wo in all_orders if self._overall_status(wo) == 'completed']
+        in_progress_orders = [wo for wo in all_orders if self._overall_status(wo) == 'in_progress']
+
+        # Average cycle time (for completed orders, in minutes)
+        cycle_times: List[float] = []
+        for wo in completed_orders:
+            stage_times = [
+                s.end_time - s.start_time
+                for s in wo.stages
+                if s.status == 'completed' and s.start_time is not None and s.end_time is not None
+            ]
+            if stage_times:
+                cycle_times.append(sum(stage_times))
+
+        avg_cycle_min = (sum(cycle_times) / len(cycle_times) / 60.0) if cycle_times else 0.0
+
+        # On-time delivery percentage (completed orders finished by due_date)
+        if completed_orders:
+            on_time = 0
+            for wo in completed_orders:
+                if wo.due_date <= 0:
+                    on_time += 1  # no due date counts as on-time
+                else:
+                    last_end = max(
+                        (s.end_time for s in wo.stages if s.end_time is not None),
+                        default=0.0,
+                    )
+                    if last_end <= wo.due_date:
+                        on_time += 1
+            on_time_pct = (on_time / len(completed_orders)) * 100.0
+        else:
+            on_time_pct = 0.0
+
+        # Bottleneck analysis: stage with the longest average duration
+        stage_durations: Dict[str, List[float]] = {}
+        for wo in all_orders:
+            for s in wo.stages:
+                if s.status == 'completed' and s.start_time is not None and s.end_time is not None:
+                    dur = s.end_time - s.start_time
+                    stage_durations.setdefault(s.stage_name, []).append(dur)
+
+        bottleneck = ''
+        if stage_durations:
+            bottleneck = max(
+                stage_durations,
+                key=lambda name: sum(stage_durations[name]) / len(stage_durations[name]),
+            )
+
+        return WorkOrderMetrics(
+            total_orders=total,
+            completed=len(completed_orders),
+            in_progress=len(in_progress_orders),
+            avg_cycle_time_min=avg_cycle_min,
+            on_time_delivery_pct=on_time_pct,
+            stage_bottleneck=bottleneck,
+        )
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

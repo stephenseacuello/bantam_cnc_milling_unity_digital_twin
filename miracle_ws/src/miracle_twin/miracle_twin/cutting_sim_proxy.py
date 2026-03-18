@@ -3334,3 +3334,210 @@ class ToolPathSimulator:
             is_rapid=is_rapid,
             timestamp_sec=self._elapsed_sec,
         ))
+
+
+# ---------------------------------------------------------------------------
+# Tool Wear Prediction Model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WearDataPoint:
+    """Single wear measurement recorded during cutting."""
+    timestamp: float
+    cutting_time_min: float
+    flank_wear_mm: float
+    crater_wear_mm: float
+    cutting_speed_m_min: float
+    feed_mm_tooth: float
+
+
+@dataclass
+class WearPrediction:
+    """Result of a wear prediction query."""
+    predicted_wear_mm: float
+    confidence: float
+    time_to_limit_min: float
+    wear_rate_mm_per_min: float
+    model_used: str
+
+
+@dataclass
+class WearTrend:
+    """Linear regression statistics for wear progression."""
+    slope: float
+    intercept: float
+    r_squared: float
+    data_points: int
+
+
+class WearPredictionModel:
+    """Predicts tool wear progression using multiple models.
+
+    Maintains a history of :class:`WearDataPoint` measurements and provides
+    predictions via linear regression and the Taylor tool-life equation.
+    """
+
+    def __init__(self) -> None:
+        self._data: List[WearDataPoint] = []
+
+    # -- data management ----------------------------------------------------
+
+    def add_data_point(self, point: WearDataPoint) -> None:
+        """Record a wear measurement."""
+        self._data.append(point)
+
+    def reset(self) -> None:
+        """Clear all recorded data."""
+        self._data.clear()
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _linear_regression(
+        self, xs: List[float], ys: List[float]
+    ) -> Tuple[float, float, float]:
+        """Return (slope, intercept, r_squared) for simple OLS regression."""
+        n = len(xs)
+        if n < 2:
+            if n == 1:
+                return 0.0, ys[0], 0.0
+            return 0.0, 0.0, 0.0
+
+        sum_x = sum(xs)
+        sum_y = sum(ys)
+        sum_xx = sum(x * x for x in xs)
+        sum_xy = sum(x * y for x, y in zip(xs, ys))
+
+        denom = n * sum_xx - sum_x * sum_x
+        if abs(denom) < 1e-15:
+            return 0.0, sum_y / n, 0.0
+
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - slope * sum_x) / n
+
+        # R-squared
+        mean_y = sum_y / n
+        ss_tot = sum((y - mean_y) ** 2 for y in ys)
+        ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-15 else 0.0
+
+        return slope, intercept, r_squared
+
+    # -- public API ---------------------------------------------------------
+
+    def predict_wear(self, future_cutting_time_min: float) -> WearPrediction:
+        """Predict flank wear at *future_cutting_time_min* using linear regression.
+
+        Raises ``ValueError`` when no data points have been recorded.
+        """
+        if not self._data:
+            raise ValueError("No data points recorded")
+
+        xs = [dp.cutting_time_min for dp in self._data]
+        ys = [dp.flank_wear_mm for dp in self._data]
+
+        slope, intercept, r_sq = self._linear_regression(xs, ys)
+        predicted = slope * future_cutting_time_min + intercept
+        predicted = max(0.0, predicted)
+
+        # confidence degrades with extrapolation distance and low r_squared
+        min_time = min(xs)
+        max_time = max(xs)
+        data_range = max_time - min_time if max_time > min_time else 1.0
+        if future_cutting_time_min > max_time:
+            extrap = (future_cutting_time_min - max_time) / data_range
+        elif future_cutting_time_min < min_time:
+            extrap = (min_time - future_cutting_time_min) / data_range
+        else:
+            extrap = 0.0  # within observed range — interpolation
+        confidence = max(0.0, min(1.0, r_sq * (1.0 / (1.0 + extrap))))
+
+        wear_rate = slope if slope > 0 else 0.0
+        if wear_rate > 0:
+            limit = 0.3  # VBmax default
+            time_to_limit = max(0.0, (limit - predicted) / wear_rate)
+        else:
+            time_to_limit = float('inf')
+
+        return WearPrediction(
+            predicted_wear_mm=predicted,
+            confidence=confidence,
+            time_to_limit_min=time_to_limit,
+            wear_rate_mm_per_min=wear_rate,
+            model_used='linear_regression',
+        )
+
+    def predict_remaining_life(self, wear_limit_mm: float = 0.3) -> float:
+        """Estimate remaining cutting time (min) before *wear_limit_mm*.
+
+        Returns ``float('inf')`` when wear is not progressing or no data is
+        available.
+        """
+        if len(self._data) < 2:
+            return float('inf')
+
+        xs = [dp.cutting_time_min for dp in self._data]
+        ys = [dp.flank_wear_mm for dp in self._data]
+
+        slope, intercept, _ = self._linear_regression(xs, ys)
+
+        if slope <= 0:
+            return float('inf')
+
+        current_time = max(xs)
+        current_wear = slope * current_time + intercept
+
+        if current_wear >= wear_limit_mm:
+            return 0.0
+
+        time_at_limit = (wear_limit_mm - intercept) / slope
+        remaining = time_at_limit - current_time
+        return max(0.0, remaining)
+
+    def get_wear_trend(self) -> WearTrend:
+        """Return :class:`WearTrend` with linear regression statistics.
+
+        Raises ``ValueError`` when no data points have been recorded.
+        """
+        if not self._data:
+            raise ValueError("No data points recorded")
+
+        xs = [dp.cutting_time_min for dp in self._data]
+        ys = [dp.flank_wear_mm for dp in self._data]
+        slope, intercept, r_sq = self._linear_regression(xs, ys)
+
+        return WearTrend(
+            slope=slope,
+            intercept=intercept,
+            r_squared=r_sq,
+            data_points=len(self._data),
+        )
+
+    def get_wear_rate(self) -> float:
+        """Current wear rate (mm/min) estimated from the most recent data.
+
+        Uses up to the last 5 data points for a localised estimate.  Returns
+        ``0.0`` when fewer than 2 points are available.
+        """
+        if len(self._data) < 2:
+            return 0.0
+
+        recent = self._data[-5:]
+        xs = [dp.cutting_time_min for dp in recent]
+        ys = [dp.flank_wear_mm for dp in recent]
+        slope, _, _ = self._linear_regression(xs, ys)
+        return max(0.0, slope)
+
+    @staticmethod
+    def taylor_tool_life(
+        cutting_speed: float, n: float = 0.125, C: float = 300.0
+    ) -> float:
+        """Taylor tool-life equation  V * T^n = C.
+
+        Returns the predicted tool life in minutes for the given
+        *cutting_speed* (m/min).  Returns ``float('inf')`` when
+        *cutting_speed* is zero or negative.
+        """
+        if cutting_speed <= 0:
+            return float('inf')
+        # T = (C / V) ^ (1/n)
+        return (C / cutting_speed) ** (1.0 / n)

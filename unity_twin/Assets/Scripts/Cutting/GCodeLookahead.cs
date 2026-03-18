@@ -1639,4 +1639,338 @@ namespace MiracleTwin.Cutting
             return result;
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Fixture Library Manager
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Defines a workholding fixture with its physical characteristics,
+    /// clamping capacity, and machine compatibility.
+    /// </summary>
+    [Serializable]
+    public class FixtureDefinition
+    {
+        /// <summary>Unique identifier for this fixture.</summary>
+        public string fixtureId = "";
+        /// <summary>Human-readable name of the fixture.</summary>
+        public string name = "";
+        /// <summary>Type of fixture: vise, chuck, vacuum, fixture_plate, tombstone.</summary>
+        public string fixtureType = "";
+        /// <summary>Maximum clamping force in newtons.</summary>
+        public float maxClampingForceN;
+        /// <summary>Jaw width in millimetres (vise-specific, 0 for others).</summary>
+        public float jawWidthMm;
+        /// <summary>Maximum workpiece diameter (mm) the fixture can hold.</summary>
+        public float maxWorkpieceDiaMm;
+        /// <summary>Minimum workpiece diameter (mm) the fixture can hold.</summary>
+        public float minWorkpieceDiaMm;
+        /// <summary>Repeatability of the fixture in millimetres.</summary>
+        public float repeatabilityMm;
+        /// <summary>Typical setup time in minutes.</summary>
+        public float setupTimeMin;
+        /// <summary>List of machine IDs this fixture is compatible with.</summary>
+        public List<string> compatibleMachines = new();
+    }
+
+    /// <summary>
+    /// A scored fixture recommendation with reasons explaining the suitability rating.
+    /// </summary>
+    [Serializable]
+    public class FixtureRecommendation
+    {
+        /// <summary>The recommended fixture definition.</summary>
+        public FixtureDefinition fixture;
+        /// <summary>Suitability score from 0 (unsuitable) to 100 (ideal).</summary>
+        public float suitabilityScore;
+        /// <summary>Human-readable reasons supporting this recommendation.</summary>
+        public List<string> reasons = new();
+    }
+
+    /// <summary>
+    /// Manages a library of workholding fixture definitions, provides CRUD
+    /// operations, fixture recommendations based on workpiece requirements,
+    /// and side-by-side fixture comparison.
+    /// </summary>
+    public class FixtureLibraryManager
+    {
+        private readonly Dictionary<string, FixtureDefinition> _fixtures = new();
+
+        /// <summary>
+        /// Creates a new FixtureLibraryManager pre-loaded with five standard fixtures.
+        /// </summary>
+        public FixtureLibraryManager()
+        {
+            LoadDefaults();
+        }
+
+        // ── CRUD ────────────────────────────────────────────────────────
+
+        /// <summary>Add a fixture definition to the library.</summary>
+        public void AddFixture(FixtureDefinition def)
+        {
+            if (def == null) throw new ArgumentNullException(nameof(def));
+            if (string.IsNullOrEmpty(def.fixtureId))
+                throw new ArgumentException("fixtureId must not be empty");
+            _fixtures[def.fixtureId] = def;
+        }
+
+        /// <summary>Remove a fixture by its ID. Returns true if found and removed.</summary>
+        public bool RemoveFixture(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return false;
+            return _fixtures.Remove(id);
+        }
+
+        /// <summary>Retrieve a fixture by its ID. Returns null if not found.</summary>
+        public FixtureDefinition GetFixture(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return null;
+            return _fixtures.TryGetValue(id, out var def) ? def : null;
+        }
+
+        /// <summary>Returns all fixture definitions in the library.</summary>
+        public List<FixtureDefinition> GetAllFixtures()
+        {
+            return new List<FixtureDefinition>(_fixtures.Values);
+        }
+
+        // ── Query / Recommendation ─────────────────────────────────────
+
+        /// <summary>Filter fixtures by type (e.g. "vise", "chuck").</summary>
+        public List<FixtureDefinition> GetFixturesByType(string fixtureType)
+        {
+            var results = new List<FixtureDefinition>();
+            foreach (var f in _fixtures.Values)
+            {
+                if (string.Equals(f.fixtureType, fixtureType, StringComparison.OrdinalIgnoreCase))
+                    results.Add(f);
+            }
+            return results;
+        }
+
+        /// <summary>
+        /// Recommend fixtures for a given workpiece diameter, required clamping force,
+        /// and machine identifier.  Returns a list of <see cref="FixtureRecommendation"/>
+        /// sorted by descending suitability score.
+        /// </summary>
+        public List<FixtureRecommendation> RecommendFixture(
+            float workpieceDiaMm, float requiredForceN, string machineId)
+        {
+            var recommendations = new List<FixtureRecommendation>();
+
+            foreach (var fixture in _fixtures.Values)
+            {
+                float score = 0f;
+                var reasons = new List<string>();
+
+                // ── Machine compatibility (hard filter — 0 if incompatible) ───
+                bool machineOk = fixture.compatibleMachines.Count == 0 ||
+                    fixture.compatibleMachines.Contains(machineId);
+                if (machineOk)
+                {
+                    score += 30f;
+                    reasons.Add("Compatible with machine " + machineId);
+                }
+                else
+                {
+                    reasons.Add("Not compatible with machine " + machineId);
+                }
+
+                // ── Clamping force capacity ────────────────────────────────
+                if (fixture.maxClampingForceN >= requiredForceN)
+                {
+                    float forceRatio = requiredForceN / Mathf.Max(fixture.maxClampingForceN, 1f);
+                    // Best score when force requirement is 50-80% of capacity
+                    float forceScore;
+                    if (forceRatio <= 0.8f && forceRatio >= 0.3f)
+                        forceScore = 30f;
+                    else if (forceRatio < 0.3f)
+                        forceScore = 30f * (forceRatio / 0.3f);
+                    else
+                        forceScore = 30f * ((1f - forceRatio) / 0.2f);
+                    score += forceScore;
+                    reasons.Add($"Force capacity {fixture.maxClampingForceN}N meets requirement of {requiredForceN}N");
+                }
+                else
+                {
+                    reasons.Add($"Insufficient clamping force ({fixture.maxClampingForceN}N < {requiredForceN}N)");
+                }
+
+                // ── Workpiece size range ───────────────────────────────────
+                if (workpieceDiaMm >= fixture.minWorkpieceDiaMm &&
+                    workpieceDiaMm <= fixture.maxWorkpieceDiaMm)
+                {
+                    float range = fixture.maxWorkpieceDiaMm - fixture.minWorkpieceDiaMm;
+                    float mid = (fixture.maxWorkpieceDiaMm + fixture.minWorkpieceDiaMm) * 0.5f;
+                    float distFromMid = Mathf.Abs(workpieceDiaMm - mid);
+                    float sizeScore = range > 0f
+                        ? 25f * (1f - distFromMid / (range * 0.5f))
+                        : 25f;
+                    score += Mathf.Max(sizeScore, 5f);
+                    reasons.Add("Workpiece diameter within fixture range");
+                }
+                else
+                {
+                    reasons.Add($"Workpiece diameter {workpieceDiaMm}mm outside range " +
+                        $"[{fixture.minWorkpieceDiaMm}–{fixture.maxWorkpieceDiaMm}mm]");
+                }
+
+                // ── Repeatability bonus ────────────────────────────────────
+                if (fixture.repeatabilityMm <= 0.01f)
+                {
+                    score += 10f;
+                    reasons.Add("Excellent repeatability");
+                }
+                else if (fixture.repeatabilityMm <= 0.025f)
+                {
+                    score += 7f;
+                    reasons.Add("Good repeatability");
+                }
+                else
+                {
+                    score += 3f;
+                    reasons.Add("Moderate repeatability");
+                }
+
+                // ── Setup time bonus ───────────────────────────────────────
+                if (fixture.setupTimeMin <= 5f)
+                {
+                    score += 5f;
+                    reasons.Add("Quick setup time");
+                }
+                else if (fixture.setupTimeMin <= 15f)
+                {
+                    score += 3f;
+                    reasons.Add("Moderate setup time");
+                }
+                else
+                {
+                    score += 1f;
+                    reasons.Add("Lengthy setup time");
+                }
+
+                score = Mathf.Clamp(score, 0f, 100f);
+
+                recommendations.Add(new FixtureRecommendation
+                {
+                    fixture = fixture,
+                    suitabilityScore = score,
+                    reasons = reasons,
+                });
+            }
+
+            // Sort descending by suitability score
+            recommendations.Sort((a, b) => b.suitabilityScore.CompareTo(a.suitabilityScore));
+            return recommendations;
+        }
+
+        /// <summary>
+        /// Compare two fixtures side-by-side.  Returns a dictionary mapping
+        /// attribute names to a tuple of (fixture1Value, fixture2Value) strings.
+        /// Returns null if either fixture ID is not found.
+        /// </summary>
+        public Dictionary<string, (string, string)> CompareFixtures(string id1, string id2)
+        {
+            var f1 = GetFixture(id1);
+            var f2 = GetFixture(id2);
+            if (f1 == null || f2 == null)
+                return null;
+
+            var diff = new Dictionary<string, (string, string)>();
+            diff["name"] = (f1.name, f2.name);
+            diff["fixtureType"] = (f1.fixtureType, f2.fixtureType);
+            diff["maxClampingForceN"] = (f1.maxClampingForceN.ToString("F1"), f2.maxClampingForceN.ToString("F1"));
+            diff["jawWidthMm"] = (f1.jawWidthMm.ToString("F1"), f2.jawWidthMm.ToString("F1"));
+            diff["maxWorkpieceDiaMm"] = (f1.maxWorkpieceDiaMm.ToString("F1"), f2.maxWorkpieceDiaMm.ToString("F1"));
+            diff["minWorkpieceDiaMm"] = (f1.minWorkpieceDiaMm.ToString("F1"), f2.minWorkpieceDiaMm.ToString("F1"));
+            diff["repeatabilityMm"] = (f1.repeatabilityMm.ToString("F4"), f2.repeatabilityMm.ToString("F4"));
+            diff["setupTimeMin"] = (f1.setupTimeMin.ToString("F1"), f2.setupTimeMin.ToString("F1"));
+            diff["compatibleMachines"] = (
+                string.Join(",", f1.compatibleMachines),
+                string.Join(",", f2.compatibleMachines));
+
+            return diff;
+        }
+
+        // ── Default fixtures ───────────────────────────────────────────
+
+        private void LoadDefaults()
+        {
+            AddFixture(new FixtureDefinition
+            {
+                fixtureId = "KURT-DL640",
+                name = "Kurt DL640 6\" Double Lock Vise",
+                fixtureType = "vise",
+                maxClampingForceN = 44480f,   // ~10,000 lbf
+                jawWidthMm = 152.4f,          // 6"
+                maxWorkpieceDiaMm = 152.4f,
+                minWorkpieceDiaMm = 5.0f,
+                repeatabilityMm = 0.0127f,    // 0.0005"
+                setupTimeMin = 5f,
+                compatibleMachines = new List<string>
+                    { "VMC-500", "VMC-750", "VMC-1000", "HMC-500" },
+            });
+
+            AddFixture(new FixtureDefinition
+            {
+                fixtureId = "3JAW-200",
+                name = "200mm 3-Jaw Universal Chuck",
+                fixtureType = "chuck",
+                maxClampingForceN = 55000f,
+                jawWidthMm = 0f,
+                maxWorkpieceDiaMm = 200f,
+                minWorkpieceDiaMm = 10f,
+                repeatabilityMm = 0.025f,
+                setupTimeMin = 10f,
+                compatibleMachines = new List<string>
+                    { "LATHE-200", "LATHE-300", "MILL-TURN-500" },
+            });
+
+            AddFixture(new FixtureDefinition
+            {
+                fixtureId = "VAC-TABLE-600",
+                name = "600x400mm Vacuum Table",
+                fixtureType = "vacuum",
+                maxClampingForceN = 8000f,
+                jawWidthMm = 0f,
+                maxWorkpieceDiaMm = 600f,
+                minWorkpieceDiaMm = 50f,
+                repeatabilityMm = 0.05f,
+                setupTimeMin = 3f,
+                compatibleMachines = new List<string>
+                    { "VMC-500", "VMC-750", "VMC-1000", "ROUTER-1200" },
+            });
+
+            AddFixture(new FixtureDefinition
+            {
+                fixtureId = "MOD-PLATE-400",
+                name = "400x400mm Modular Fixture Plate",
+                fixtureType = "fixture_plate",
+                maxClampingForceN = 35000f,
+                jawWidthMm = 0f,
+                maxWorkpieceDiaMm = 380f,
+                minWorkpieceDiaMm = 20f,
+                repeatabilityMm = 0.005f,
+                setupTimeMin = 15f,
+                compatibleMachines = new List<string>
+                    { "VMC-500", "VMC-750", "VMC-1000", "HMC-500", "5AX-400" },
+            });
+
+            AddFixture(new FixtureDefinition
+            {
+                fixtureId = "TOMB-4SIDE-300",
+                name = "300mm 4-Sided Tombstone",
+                fixtureType = "tombstone",
+                maxClampingForceN = 60000f,
+                jawWidthMm = 0f,
+                maxWorkpieceDiaMm = 280f,
+                minWorkpieceDiaMm = 15f,
+                repeatabilityMm = 0.01f,
+                setupTimeMin = 25f,
+                compatibleMachines = new List<string>
+                    { "HMC-500", "HMC-630", "5AX-400" },
+            });
+        }
+    }
 }

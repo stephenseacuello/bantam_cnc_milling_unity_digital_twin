@@ -1030,6 +1030,338 @@ class FaultTreeAnalyzer:
         return path
 
 
+# ---------------------------------------------------------------------------
+# Decision Tree Classifier for Fault Diagnosis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DiagnosisNode:
+    """A node in a fault diagnosis decision tree."""
+    node_id: str
+    question: str
+    feature: str
+    threshold: float
+    yes_child: Optional[str] = None
+    no_child: Optional[str] = None
+    diagnosis: Optional[str] = None
+    confidence: float = 0.0
+    recommended_action: str = ''
+
+
+@dataclass
+class DiagnosisResult:
+    """Result returned by traversing the fault diagnosis tree."""
+    diagnosis: str
+    confidence: float
+    path: List[str]
+    recommended_action: str
+    features_checked: Dict[str, Any]
+
+
+class FaultDiagnosisTree:
+    """Decision tree classifier for diagnosing manufacturing faults.
+
+    Supports building a tree of yes/no questions based on sensor feature
+    thresholds, traversing it with live feature values, and returning a
+    structured diagnosis with confidence and recommended corrective action.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: Dict[str, DiagnosisNode] = {}
+        self._root_id: Optional[str] = None
+
+    # -- tree construction --
+
+    def add_node(self, node: DiagnosisNode) -> None:
+        """Add a diagnosis node to the tree."""
+        self._nodes[node.node_id] = node
+
+    def set_root(self, node_id: str) -> None:
+        """Set the root node of the decision tree.
+
+        Raises KeyError if the node_id has not been added yet.
+        """
+        if node_id not in self._nodes:
+            raise KeyError(f"Node '{node_id}' not found in tree")
+        self._root_id = node_id
+
+    # -- diagnosis --
+
+    def diagnose(self, features: Dict[str, float]) -> DiagnosisResult:
+        """Traverse the tree using *features* and return a DiagnosisResult.
+
+        At each internal node the feature value is compared against the
+        threshold.  If the feature value exceeds the threshold the yes-child
+        is followed, otherwise the no-child.  Traversal stops at a leaf
+        (a node with a non-None ``diagnosis``).
+
+        Raises RuntimeError if the tree has no root or a traversal reaches a
+        dead-end (missing child reference).
+        """
+        if self._root_id is None:
+            raise RuntimeError("No root node set for the diagnosis tree")
+
+        path: List[str] = []
+        features_checked: Dict[str, Any] = {}
+        current_id = self._root_id
+
+        while current_id is not None:
+            node = self._nodes.get(current_id)
+            if node is None:
+                raise RuntimeError(f"Node '{current_id}' referenced but not found in tree")
+
+            path.append(node.node_id)
+
+            # Leaf node – return diagnosis
+            if node.diagnosis is not None:
+                return DiagnosisResult(
+                    diagnosis=node.diagnosis,
+                    confidence=node.confidence,
+                    path=path,
+                    recommended_action=node.recommended_action,
+                    features_checked=features_checked,
+                )
+
+            # Internal node – evaluate feature threshold
+            feature_value = features.get(node.feature)
+            if feature_value is None:
+                # Feature missing: treat as not exceeding threshold (no branch)
+                features_checked[node.feature] = None
+                current_id = node.no_child
+            else:
+                features_checked[node.feature] = feature_value
+                if feature_value > node.threshold:
+                    current_id = node.yes_child
+                else:
+                    current_id = node.no_child
+
+        raise RuntimeError("Traversal ended without reaching a diagnosis leaf")
+
+    # -- queries --
+
+    def get_all_diagnoses(self) -> List[str]:
+        """Return a sorted list of all possible leaf diagnoses in the tree."""
+        diagnoses: List[str] = []
+        for node in self._nodes.values():
+            if node.diagnosis is not None:
+                diagnoses.append(node.diagnosis)
+        diagnoses.sort()
+        return diagnoses
+
+    # -- default tree --
+
+    def build_default_tree(self) -> None:
+        """Populate the tree with a pre-built CNC fault diagnosis decision tree.
+
+        Structure::
+
+            [vibration > 5.0 mm/s?]
+              YES -> [cutting_force > 800 N?]
+                       YES -> Chatter (conf 0.90)
+                       NO  -> Bearing Wear (conf 0.80)
+              NO  -> [temperature > 60 degC?]
+                       YES -> [coolant_flow > 5 L/min?]
+                                YES -> Thermal Drift (conf 0.75)
+                                NO  -> Coolant System Failure (conf 0.85)
+                       NO  -> [surface_roughness > Ra 3.2?]
+                                YES -> [feed_rate > 500 mm/min?]
+                                         YES -> Feed Rate Issue (conf 0.80)
+                                         NO  -> Tool Wear (conf 0.85)
+                                NO  -> Normal Operation (conf 0.95)
+        """
+        self._nodes.clear()
+        self._root_id = None
+
+        nodes = [
+            DiagnosisNode(
+                node_id='root',
+                question='Is vibration > 5 mm/s?',
+                feature='vibration',
+                threshold=5.0,
+                yes_child='check_force',
+                no_child='check_temp',
+            ),
+            DiagnosisNode(
+                node_id='check_force',
+                question='Is cutting force > 800 N?',
+                feature='cutting_force',
+                threshold=800.0,
+                yes_child='diag_chatter',
+                no_child='diag_bearing',
+            ),
+            DiagnosisNode(
+                node_id='diag_chatter',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Chatter',
+                confidence=0.90,
+                recommended_action='Reduce spindle speed and depth of cut',
+            ),
+            DiagnosisNode(
+                node_id='diag_bearing',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Bearing Wear',
+                confidence=0.80,
+                recommended_action='Schedule bearing replacement',
+            ),
+            DiagnosisNode(
+                node_id='check_temp',
+                question='Is temperature > 60 °C?',
+                feature='temperature',
+                threshold=60.0,
+                yes_child='check_coolant',
+                no_child='check_roughness',
+            ),
+            DiagnosisNode(
+                node_id='check_coolant',
+                question='Is coolant flow > 5 L/min?',
+                feature='coolant_flow',
+                threshold=5.0,
+                yes_child='diag_thermal_drift',
+                no_child='diag_coolant',
+            ),
+            DiagnosisNode(
+                node_id='diag_coolant',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Coolant System Failure',
+                confidence=0.85,
+                recommended_action='Inspect coolant pump and lines',
+            ),
+            DiagnosisNode(
+                node_id='diag_thermal_drift',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Thermal Drift',
+                confidence=0.75,
+                recommended_action='Allow machine warm-up and recalibrate',
+            ),
+            DiagnosisNode(
+                node_id='check_roughness',
+                question='Is surface roughness > Ra 3.2?',
+                feature='surface_roughness',
+                threshold=3.2,
+                yes_child='check_feed',
+                no_child='diag_normal',
+            ),
+            DiagnosisNode(
+                node_id='check_feed',
+                question='Is feed rate > 500 mm/min?',
+                feature='feed_rate',
+                threshold=500.0,
+                yes_child='diag_feed',
+                no_child='diag_tool_wear',
+            ),
+            DiagnosisNode(
+                node_id='diag_feed',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Feed Rate Issue',
+                confidence=0.80,
+                recommended_action='Reduce feed rate',
+            ),
+            DiagnosisNode(
+                node_id='diag_tool_wear',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Tool Wear',
+                confidence=0.85,
+                recommended_action='Replace worn tool insert',
+            ),
+            DiagnosisNode(
+                node_id='diag_normal',
+                question='',
+                feature='',
+                threshold=0.0,
+                diagnosis='Normal Operation',
+                confidence=0.95,
+                recommended_action='No action required',
+            ),
+        ]
+
+        for n in nodes:
+            self.add_node(n)
+        self.set_root('root')
+
+    # -- validation --
+
+    def validate_tree(self) -> List[str]:
+        """Validate the tree structure and return a list of error messages.
+
+        Checks performed:
+        - Root is set
+        - All child references point to existing nodes
+        - The tree is acyclic (no node is reachable from itself)
+        - Every internal (non-leaf) node has at least one child
+        - Every leaf node has a diagnosis
+
+        Returns an empty list when the tree is valid.
+        """
+        errors: List[str] = []
+
+        if self._root_id is None:
+            errors.append("No root node set")
+            return errors
+
+        if self._root_id not in self._nodes:
+            errors.append(f"Root node '{self._root_id}' not found in tree")
+            return errors
+
+        # Check child references
+        for node in self._nodes.values():
+            if node.diagnosis is not None:
+                # Leaf node
+                continue
+            for child_attr in ('yes_child', 'no_child'):
+                child_id = getattr(node, child_attr)
+                if child_id is not None and child_id not in self._nodes:
+                    errors.append(
+                        f"Node '{node.node_id}': {child_attr} '{child_id}' not found"
+                    )
+            if node.yes_child is None and node.no_child is None:
+                errors.append(
+                    f"Internal node '{node.node_id}' has no children"
+                )
+
+        # Leaf nodes must have a diagnosis (already guaranteed by the
+        # condition above but let's be explicit)
+        for node in self._nodes.values():
+            if node.yes_child is None and node.no_child is None and node.diagnosis is None:
+                errors.append(
+                    f"Leaf node '{node.node_id}' has no diagnosis"
+                )
+
+        # Acyclicity check via DFS
+        visited: Set[str] = set()
+        in_stack: Set[str] = set()
+
+        def _dfs(nid: str) -> None:
+            if nid not in self._nodes:
+                return
+            visited.add(nid)
+            in_stack.add(nid)
+            node = self._nodes[nid]
+            for child_id in (node.yes_child, node.no_child):
+                if child_id is None:
+                    continue
+                if child_id in in_stack:
+                    errors.append(f"Cycle detected involving node '{child_id}'")
+                elif child_id not in visited:
+                    _dfs(child_id)
+            in_stack.discard(nid)
+
+        _dfs(self._root_id)
+
+        return errors
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

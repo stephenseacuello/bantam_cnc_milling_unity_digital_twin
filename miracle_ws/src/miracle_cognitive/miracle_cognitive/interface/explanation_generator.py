@@ -3472,3 +3472,401 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+# ---------------------------------------------------------------------------
+# Outlier Detection Engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OutlierResult:
+    """Result for a single data point evaluated for outlier status."""
+    index: int
+    value: float
+    score: float
+    method: str
+    is_outlier: bool
+    direction: str  # 'high' | 'low'
+
+
+@dataclass
+class OutlierReport:
+    """Aggregated report produced by an outlier detection run."""
+    total_points: int
+    outlier_count: int
+    outlier_pct: float
+    results: List['OutlierResult']
+    method: str
+    threshold: float
+
+
+class OutlierDetectionEngine:
+    """Detect outliers in manufacturing sensor / process data.
+
+    Supports four statistical methods:
+      * z-score
+      * IQR (interquartile range)
+      * modified z-score (MAD-based)
+      * Grubbs' test (single-outlier)
+
+    All public ``detect_*`` methods return an ``OutlierReport``.
+    """
+
+    # -- Z-Score ---------------------------------------------------------- #
+
+    @staticmethod
+    def detect_zscore(
+        data: List[float],
+        threshold: float = 3.0,
+    ) -> 'OutlierReport':
+        """Classical z-score method.
+
+        Points whose absolute z-score exceeds *threshold* are flagged.
+        """
+        n = len(data)
+        if n < 2:
+            results = [
+                OutlierResult(
+                    index=i, value=v, score=0.0,
+                    method='zscore', is_outlier=False, direction='low',
+                )
+                for i, v in enumerate(data)
+            ]
+            return OutlierReport(
+                total_points=n, outlier_count=0, outlier_pct=0.0,
+                results=results, method='zscore', threshold=threshold,
+            )
+
+        mean = sum(data) / n
+        std = math.sqrt(sum((x - mean) ** 2 for x in data) / n)
+
+        results: List[OutlierResult] = []
+        for i, v in enumerate(data):
+            z = (v - mean) / std if std > 0 else 0.0
+            is_outlier = abs(z) > threshold
+            direction = 'high' if v >= mean else 'low'
+            results.append(OutlierResult(
+                index=i, value=v, score=abs(z),
+                method='zscore', is_outlier=is_outlier, direction=direction,
+            ))
+
+        outlier_count = sum(1 for r in results if r.is_outlier)
+        return OutlierReport(
+            total_points=n,
+            outlier_count=outlier_count,
+            outlier_pct=(outlier_count / n * 100.0) if n else 0.0,
+            results=results,
+            method='zscore',
+            threshold=threshold,
+        )
+
+    # -- IQR -------------------------------------------------------------- #
+
+    @staticmethod
+    def _quartiles(sorted_data: List[float]) -> Tuple[float, float, float]:
+        """Return (Q1, median, Q3) from an already-sorted list."""
+        n = len(sorted_data)
+
+        def _median(seq: List[float]) -> float:
+            m = len(seq)
+            mid = m // 2
+            if m % 2 == 1:
+                return seq[mid]
+            return (seq[mid - 1] + seq[mid]) / 2.0
+
+        median = _median(sorted_data)
+        mid = n // 2
+        lower = sorted_data[:mid]
+        upper = sorted_data[mid + 1:] if n % 2 == 1 else sorted_data[mid:]
+        q1 = _median(lower) if lower else median
+        q3 = _median(upper) if upper else median
+        return q1, median, q3
+
+    @staticmethod
+    def detect_iqr(
+        data: List[float],
+        multiplier: float = 1.5,
+    ) -> 'OutlierReport':
+        """Interquartile-range method.
+
+        Outliers lie below ``Q1 - multiplier*IQR`` or above
+        ``Q3 + multiplier*IQR``.
+        """
+        n = len(data)
+        if n < 4:
+            results = [
+                OutlierResult(
+                    index=i, value=v, score=0.0,
+                    method='iqr', is_outlier=False, direction='low',
+                )
+                for i, v in enumerate(data)
+            ]
+            return OutlierReport(
+                total_points=n, outlier_count=0, outlier_pct=0.0,
+                results=results, method='iqr', threshold=multiplier,
+            )
+
+        sorted_data = sorted(data)
+        q1, median, q3 = OutlierDetectionEngine._quartiles(sorted_data)
+        iqr = q3 - q1
+        lower_bound = q1 - multiplier * iqr
+        upper_bound = q3 + multiplier * iqr
+
+        results: List[OutlierResult] = []
+        for i, v in enumerate(data):
+            if v < lower_bound:
+                is_outlier = True
+                direction = 'low'
+                score = (lower_bound - v) / iqr if iqr > 0 else 0.0
+            elif v > upper_bound:
+                is_outlier = True
+                direction = 'high'
+                score = (v - upper_bound) / iqr if iqr > 0 else 0.0
+            else:
+                is_outlier = False
+                direction = 'high' if v >= median else 'low'
+                score = 0.0
+            results.append(OutlierResult(
+                index=i, value=v, score=score,
+                method='iqr', is_outlier=is_outlier, direction=direction,
+            ))
+
+        outlier_count = sum(1 for r in results if r.is_outlier)
+        return OutlierReport(
+            total_points=n,
+            outlier_count=outlier_count,
+            outlier_pct=(outlier_count / n * 100.0) if n else 0.0,
+            results=results,
+            method='iqr',
+            threshold=multiplier,
+        )
+
+    # -- Modified Z-Score (MAD) ------------------------------------------- #
+
+    @staticmethod
+    def detect_modified_zscore(
+        data: List[float],
+        threshold: float = 3.5,
+    ) -> 'OutlierReport':
+        """Modified z-score using the Median Absolute Deviation (MAD).
+
+        The consistency constant 0.6745 converts MAD to a standard-deviation
+        equivalent for normally distributed data.
+        """
+        n = len(data)
+        if n < 2:
+            results = [
+                OutlierResult(
+                    index=i, value=v, score=0.0,
+                    method='modified_zscore', is_outlier=False, direction='low',
+                )
+                for i, v in enumerate(data)
+            ]
+            return OutlierReport(
+                total_points=n, outlier_count=0, outlier_pct=0.0,
+                results=results, method='modified_zscore', threshold=threshold,
+            )
+
+        sorted_data = sorted(data)
+        mid = n // 2
+        median = (
+            sorted_data[mid]
+            if n % 2 == 1
+            else (sorted_data[mid - 1] + sorted_data[mid]) / 2.0
+        )
+        abs_devs = sorted(abs(v - median) for v in data)
+        mad_mid = len(abs_devs) // 2
+        mad = (
+            abs_devs[mad_mid]
+            if len(abs_devs) % 2 == 1
+            else (abs_devs[mad_mid - 1] + abs_devs[mad_mid]) / 2.0
+        )
+
+        results: List[OutlierResult] = []
+        for i, v in enumerate(data):
+            if mad > 0:
+                score = 0.6745 * (v - median) / mad
+            else:
+                # MAD is zero (majority of points equal the median).
+                # Any point that differs from the median is an outlier.
+                if v != median:
+                    score = float('inf') if v > median else float('-inf')
+                else:
+                    score = 0.0
+            is_outlier = abs(score) > threshold
+            direction = 'high' if v > median else 'low'
+            results.append(OutlierResult(
+                index=i, value=v, score=abs(score),
+                method='modified_zscore', is_outlier=is_outlier,
+                direction=direction,
+            ))
+
+        outlier_count = sum(1 for r in results if r.is_outlier)
+        return OutlierReport(
+            total_points=n,
+            outlier_count=outlier_count,
+            outlier_pct=(outlier_count / n * 100.0) if n else 0.0,
+            results=results,
+            method='modified_zscore',
+            threshold=threshold,
+        )
+
+    # -- Grubbs' Test ----------------------------------------------------- #
+
+    @staticmethod
+    def _t_critical(alpha: float, n: int) -> float:
+        """Approximate the two-sided t critical value.
+
+        Uses the Abramowitz & Stegun rational approximation for the inverse
+        normal CDF followed by the Cornish-Fisher expansion to convert from
+        z to t.  Sufficient for the moderate sample sizes typical in
+        manufacturing.
+        """
+        p = 1.0 - alpha / (2.0 * n)
+        # Rational approximation for inverse normal CDF (Abramowitz & Stegun 26.2.23)
+        if p <= 0.0 or p >= 1.0:
+            return 4.0  # fallback
+        t_val = p
+        if p > 0.5:
+            t_val = 1.0 - p
+        r = math.sqrt(-2.0 * math.log(t_val))
+        # Coefficients
+        c0, c1, c2 = 2.515517, 0.802853, 0.010328
+        d1, d2, d3 = 1.432788, 0.189269, 0.001308
+        z = r - (c0 + c1 * r + c2 * r * r) / (
+            1.0 + d1 * r + d2 * r * r + d3 * r * r * r
+        )
+        if p <= 0.5:
+            z = -z
+        # Cornish-Fisher: convert z to t with (n-2) degrees of freedom
+        df = n - 2
+        if df < 1:
+            return z
+        t_approx = z + (z ** 3 + z) / (4.0 * df) + (
+            5 * z ** 5 + 16 * z ** 3 + 3 * z
+        ) / (96.0 * df * df)
+        return t_approx
+
+    @classmethod
+    def detect_grubbs(
+        cls,
+        data: List[float],
+        alpha: float = 0.05,
+    ) -> 'OutlierReport':
+        """Grubbs' test for a single outlier.
+
+        The point with the largest absolute deviation from the mean is tested
+        against the critical value derived from the t-distribution.
+        """
+        n = len(data)
+        if n < 3:
+            results = [
+                OutlierResult(
+                    index=i, value=v, score=0.0,
+                    method='grubbs', is_outlier=False, direction='low',
+                )
+                for i, v in enumerate(data)
+            ]
+            return OutlierReport(
+                total_points=n, outlier_count=0, outlier_pct=0.0,
+                results=results, method='grubbs', threshold=alpha,
+            )
+
+        mean = sum(data) / n
+        std = math.sqrt(sum((x - mean) ** 2 for x in data) / n)
+
+        # Grubbs statistic for each point
+        g_scores: List[float] = []
+        for v in data:
+            g_scores.append(abs(v - mean) / std if std > 0 else 0.0)
+
+        # Critical value
+        t_crit = cls._t_critical(alpha, n)
+        g_critical = ((n - 1) / math.sqrt(n)) * math.sqrt(
+            t_crit ** 2 / (n - 2 + t_crit ** 2)
+        )
+
+        # Only the *most extreme* point can be flagged per Grubbs' test
+        max_g_idx = max(range(n), key=lambda i: g_scores[i])
+
+        results: List[OutlierResult] = []
+        for i, v in enumerate(data):
+            is_outlier = (i == max_g_idx and g_scores[i] > g_critical)
+            direction = 'high' if v >= mean else 'low'
+            results.append(OutlierResult(
+                index=i, value=v, score=g_scores[i],
+                method='grubbs', is_outlier=is_outlier, direction=direction,
+            ))
+
+        outlier_count = sum(1 for r in results if r.is_outlier)
+        return OutlierReport(
+            total_points=n,
+            outlier_count=outlier_count,
+            outlier_pct=(outlier_count / n * 100.0) if n else 0.0,
+            results=results,
+            method='grubbs',
+            threshold=alpha,
+        )
+
+    # -- Dispatcher ------------------------------------------------------- #
+
+    def detect(
+        self,
+        data: List[float],
+        method: str = 'zscore',
+        **kwargs: Any,
+    ) -> 'OutlierReport':
+        """Dispatch to the requested detection method.
+
+        Parameters
+        ----------
+        data : list of float
+            Raw sensor / process measurements.
+        method : str
+            One of ``'zscore'``, ``'iqr'``, ``'modified_zscore'``,
+            ``'grubbs'``.
+        **kwargs
+            Forwarded to the underlying detection function.
+        """
+        dispatchers = {
+            'zscore': self.detect_zscore,
+            'iqr': self.detect_iqr,
+            'modified_zscore': self.detect_modified_zscore,
+            'grubbs': self.detect_grubbs,
+        }
+        fn = dispatchers.get(method)
+        if fn is None:
+            raise ValueError(
+                f"Unknown method '{method}'. "
+                f"Choose from {sorted(dispatchers.keys())}."
+            )
+        return fn(data, **kwargs)
+
+    # -- Utilities -------------------------------------------------------- #
+
+    def remove_outliers(
+        self,
+        data: List[float],
+        method: str = 'zscore',
+        **kwargs: Any,
+    ) -> List[float]:
+        """Return *data* with detected outliers removed."""
+        report = self.detect(data, method, **kwargs)
+        outlier_indices = {r.index for r in report.results if r.is_outlier}
+        return [v for i, v in enumerate(data) if i not in outlier_indices]
+
+    def get_clean_statistics(
+        self,
+        data: List[float],
+        method: str = 'zscore',
+        **kwargs: Any,
+    ) -> Dict[str, float]:
+        """Return mean and std of data after outlier removal."""
+        clean = self.remove_outliers(data, method, **kwargs)
+        n = len(clean)
+        if n == 0:
+            return {'mean': 0.0, 'std': 0.0}
+        mean = sum(clean) / n
+        var = sum((x - mean) ** 2 for x in clean) / n
+        std = math.sqrt(var)
+        return {'mean': mean, 'std': std}

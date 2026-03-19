@@ -5288,3 +5288,199 @@ class ThermalCompensationCalculator:
             if abs(offset.offset_um) > threshold_um:
                 return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# Tool Runout Compensator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunoutMeasurement:
+    """A single tool runout measurement record."""
+    tir_mm: float  # total indicator reading in mm
+    eccentricity_mm: float  # radial eccentricity in mm
+    angle_deg: float  # angular position of maximum runout in degrees
+    timestamp: float  # epoch seconds when measurement was taken
+    measurement_method: str  # e.g. 'dial_indicator', 'laser', 'capacitive'
+
+
+@dataclass
+class RunoutEffect:
+    """Computed effects of tool runout on the machining process."""
+    force_variation_pct: float  # percentage variation in cutting forces
+    surface_roughness_increase_um: float  # additional Ra roughness in micrometres
+    effective_chip_load_variation_pct: float  # chip load variation across flutes
+    tool_life_reduction_pct: float  # estimated reduction in tool life
+
+
+@dataclass
+class RunoutCompensation:
+    """Recommended parameter adjustments to mitigate runout effects."""
+    feed_adjustment_pct: float  # suggested feed rate adjustment (negative = reduce)
+    speed_adjustment_pct: float  # suggested spindle speed adjustment
+    depth_adjustment_pct: float  # suggested depth-of-cut adjustment (negative = reduce)
+    estimated_improvement_pct: float  # expected improvement from applying adjustments
+
+
+class ToolRunoutCompensator:
+    """Models and compensates for tool runout effects on cutting forces and
+    surface quality.
+
+    Tool runout — the deviation of the tool's axis of rotation from the
+    spindle axis — causes uneven chip loads across flutes, increased force
+    variation, degraded surface finish, and shortened tool life.  This class
+    provides measurement storage, effect quantification, compensation
+    recommendations, and per-flute chip-load calculations.
+    """
+
+    def __init__(self) -> None:
+        self._measurements: List[RunoutMeasurement] = []
+
+    # -- Measurement management -----------------------------------------------
+
+    def record_measurement(self, measurement: RunoutMeasurement) -> None:
+        """Store a :class:`RunoutMeasurement`."""
+        self._measurements.append(measurement)
+
+    def get_runout_history(self) -> List[RunoutMeasurement]:
+        """Return all recorded measurements in insertion order."""
+        return list(self._measurements)
+
+    # -- Effect calculation ---------------------------------------------------
+
+    def calculate_effects(
+        self,
+        tir_mm: float,
+        num_flutes: int,
+        feed_per_tooth: float,
+    ) -> RunoutEffect:
+        """Compute the :class:`RunoutEffect` caused by the given runout.
+
+        Parameters
+        ----------
+        tir_mm:
+            Total indicator reading (peak-to-peak) in mm.
+        num_flutes:
+            Number of cutting flutes on the tool.
+        feed_per_tooth:
+            Nominal feed per tooth in mm/tooth.
+        """
+        if feed_per_tooth <= 0:
+            raise ValueError("feed_per_tooth must be positive")
+        if num_flutes < 1:
+            raise ValueError("num_flutes must be >= 1")
+
+        # Force variation is roughly proportional to the ratio of runout to
+        # feed per tooth, scaled across flutes.
+        chip_load_var_pct = (tir_mm / feed_per_tooth) * 100.0
+        # Clamp to a sensible maximum
+        chip_load_var_pct = min(chip_load_var_pct, 100.0)
+
+        # Force variation mirrors chip-load variation, amplified slightly by
+        # the dynamic stiffness interaction.
+        force_var_pct = chip_load_var_pct * 1.2
+
+        # Surface roughness increase (empirical model): roughly 2 um per
+        # 0.01 mm of TIR, scaled by flute count (fewer flutes => worse).
+        roughness_increase_um = (tir_mm / 0.01) * 2.0 * (2.0 / max(num_flutes, 1))
+
+        # Tool-life reduction: high runout loads one flute disproportionately.
+        # Approximate as 5 % life reduction per 0.01 mm of TIR.
+        life_reduction_pct = min((tir_mm / 0.01) * 5.0, 80.0)
+
+        return RunoutEffect(
+            force_variation_pct=round(force_var_pct, 2),
+            surface_roughness_increase_um=round(roughness_increase_um, 2),
+            effective_chip_load_variation_pct=round(chip_load_var_pct, 2),
+            tool_life_reduction_pct=round(life_reduction_pct, 2),
+        )
+
+    # -- Compensation recommendations -----------------------------------------
+
+    def recommend_compensation(
+        self,
+        tir_mm: float,
+        num_flutes: int,
+        feed_per_tooth: float,
+    ) -> RunoutCompensation:
+        """Suggest feed/speed/depth adjustments to mitigate runout effects.
+
+        The strategy is to reduce parameters proportionally to the severity
+        of the runout so that the most-loaded flute stays within safe limits.
+        """
+        effects = self.calculate_effects(tir_mm, num_flutes, feed_per_tooth)
+
+        # Reduce feed by half the chip-load variation so the heaviest-loaded
+        # flute stays closer to nominal.
+        feed_adj = -(effects.effective_chip_load_variation_pct / 2.0)
+
+        # A small speed increase can improve stability in light-runout cases;
+        # for heavy runout (>0.03 mm) we reduce speed instead.
+        if tir_mm <= 0.03:
+            speed_adj = 5.0
+        else:
+            speed_adj = -min((tir_mm / 0.01) * 2.0, 20.0)
+
+        # Depth reduction to keep force peaks manageable.
+        depth_adj = -(effects.force_variation_pct / 4.0)
+
+        # Estimated improvement: applying all adjustments recovers roughly
+        # 60 % of the degradation.
+        estimated_improvement = min(
+            effects.tool_life_reduction_pct * 0.6,
+            60.0,
+        )
+
+        return RunoutCompensation(
+            feed_adjustment_pct=round(feed_adj, 2),
+            speed_adjustment_pct=round(speed_adj, 2),
+            depth_adjustment_pct=round(depth_adj, 2),
+            estimated_improvement_pct=round(estimated_improvement, 2),
+        )
+
+    # -- Per-flute chip loads -------------------------------------------------
+
+    def get_effective_chip_loads(
+        self,
+        nominal_fpt: float,
+        tir_mm: float,
+        num_flutes: int,
+    ) -> List[float]:
+        """Return per-flute chip loads accounting for runout.
+
+        The flute at the angle of maximum eccentricity sees increased chip
+        load, while the opposite flute sees a decrease.  Intermediate flutes
+        are distributed sinusoidally.
+
+        Parameters
+        ----------
+        nominal_fpt:
+            Nominal feed per tooth in mm/tooth.
+        tir_mm:
+            Total indicator reading in mm.
+        num_flutes:
+            Number of cutting flutes.
+
+        Returns
+        -------
+        List[float]:
+            Chip loads for each flute (length == *num_flutes*).
+        """
+        if num_flutes < 1:
+            raise ValueError("num_flutes must be >= 1")
+
+        # Half TIR is the eccentricity amplitude
+        amplitude = tir_mm / 2.0
+        loads: List[float] = []
+        for i in range(num_flutes):
+            angle = 2.0 * math.pi * i / num_flutes
+            deviation = amplitude * math.cos(angle)
+            chip_load = max(nominal_fpt + deviation, 0.0)
+            loads.append(round(chip_load, 6))
+        return loads
+
+    # -- Acceptability check --------------------------------------------------
+
+    def is_acceptable(self, tir_mm: float, tolerance_mm: float = 0.01) -> bool:
+        """Return ``True`` if the measured TIR is within *tolerance_mm*."""
+        return tir_mm <= tolerance_mm

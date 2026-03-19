@@ -1599,3 +1599,242 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+# ---------------------------------------------------------------------------
+# Machine Log Analyzer
+# ---------------------------------------------------------------------------
+
+import math
+import re
+from collections import Counter, defaultdict
+
+
+@dataclass
+class LogEntry:
+    """A single CNC machine log entry."""
+    timestamp: float
+    level: str  # 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
+    source: str
+    message: str
+    machine_id: str
+    code: str
+
+
+@dataclass
+class LogPattern:
+    """A recurring pattern detected across log entries."""
+    pattern_id: str
+    description: str
+    entries: List[LogEntry] = field(default_factory=list)
+    frequency: int = 0
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+
+
+@dataclass
+class LogAnalysisReport:
+    """Summary report produced by MachineLogAnalyzer.analyze()."""
+    total_entries: int
+    by_level: Dict[str, int] = field(default_factory=dict)
+    by_source: Dict[str, int] = field(default_factory=dict)
+    patterns: List[LogPattern] = field(default_factory=list)
+    error_rate_per_hour: float = 0.0
+    top_errors: List[Tuple[str, int]] = field(default_factory=list)
+    time_range_sec: float = 0.0
+
+
+class MachineLogAnalyzer:
+    """Parses and analyzes CNC machine log entries for patterns and anomalies.
+
+    Stores ingested ``LogEntry`` objects and provides analytics helpers such as
+    time-range analysis, pattern detection, error timelines, and keyword search.
+    """
+
+    _NORMALIZE_RE = re.compile(r'\d+(?:\.\d+)?')
+
+    def __init__(self) -> None:
+        self._entries: List[LogEntry] = []
+        self._lock = threading.Lock()
+
+    # -- ingestion -----------------------------------------------------------
+
+    def ingest(self, entry: LogEntry) -> None:
+        """Store a log entry for later analysis."""
+        with self._lock:
+            self._entries.append(entry)
+
+    # -- analysis ------------------------------------------------------------
+
+    def analyze(self, start_time: float, end_time: float) -> LogAnalysisReport:
+        """Generate a :class:`LogAnalysisReport` for the given time range."""
+        with self._lock:
+            window = [
+                e for e in self._entries
+                if start_time <= e.timestamp <= end_time
+            ]
+
+        total = len(window)
+        by_level: Dict[str, int] = Counter(e.level for e in window)
+        by_source: Dict[str, int] = Counter(e.source for e in window)
+
+        time_range_sec = max(end_time - start_time, 0.0)
+        error_count = sum(
+            1 for e in window if e.level in ('ERROR', 'CRITICAL')
+        )
+        error_rate_per_hour = (
+            (error_count / time_range_sec) * 3600.0
+            if time_range_sec > 0 else 0.0
+        )
+
+        # Top errors by message
+        error_messages = [e.message for e in window if e.level in ('ERROR', 'CRITICAL')]
+        top_errors = Counter(error_messages).most_common(10)
+
+        patterns = self.find_patterns(min_frequency=2, _entries=window)
+
+        return LogAnalysisReport(
+            total_entries=total,
+            by_level=dict(by_level),
+            by_source=dict(by_source),
+            patterns=patterns,
+            error_rate_per_hour=error_rate_per_hour,
+            top_errors=top_errors,
+            time_range_sec=time_range_sec,
+        )
+
+    # -- pattern detection ---------------------------------------------------
+
+    def _normalize_message(self, msg: str) -> str:
+        """Replace numeric literals to produce a canonical message pattern."""
+        return self._NORMALIZE_RE.sub('<N>', msg)
+
+    def find_patterns(
+        self,
+        min_frequency: int = 2,
+        *,
+        _entries: Optional[List[LogEntry]] = None,
+    ) -> List[LogPattern]:
+        """Find recurring log message patterns.
+
+        Messages are compared after normalising numeric values so that
+        ``"Temp 45.2C"`` and ``"Temp 67.1C"`` are considered the same pattern.
+
+        Parameters
+        ----------
+        min_frequency:
+            Minimum number of occurrences for a group to count as a pattern.
+        _entries:
+            Internal override — when *None* the full stored entry set is used.
+        """
+        if _entries is None:
+            with self._lock:
+                _entries = list(self._entries)
+
+        groups: Dict[str, List[LogEntry]] = defaultdict(list)
+        for entry in _entries:
+            key = self._normalize_message(entry.message)
+            groups[key].append(entry)
+
+        patterns: List[LogPattern] = []
+        for key, entries in groups.items():
+            if len(entries) >= min_frequency:
+                timestamps = [e.timestamp for e in entries]
+                patterns.append(LogPattern(
+                    pattern_id=str(uuid.uuid4()),
+                    description=key,
+                    entries=entries,
+                    frequency=len(entries),
+                    first_seen=min(timestamps),
+                    last_seen=max(timestamps),
+                ))
+
+        # Sort by frequency descending
+        patterns.sort(key=lambda p: p.frequency, reverse=True)
+        return patterns
+
+    # -- error timeline ------------------------------------------------------
+
+    def get_error_timeline(
+        self,
+        machine_id: str,
+        granularity_sec: float = 60.0,
+    ) -> List[Tuple[float, int]]:
+        """Return error counts bucketed by time for a specific machine.
+
+        Each element is ``(bucket_start_timestamp, error_count)``.
+        """
+        with self._lock:
+            errors = [
+                e for e in self._entries
+                if e.machine_id == machine_id and e.level in ('ERROR', 'CRITICAL')
+            ]
+
+        if not errors:
+            return []
+
+        errors.sort(key=lambda e: e.timestamp)
+        t_min = errors[0].timestamp
+        t_max = errors[-1].timestamp
+
+        num_buckets = max(1, math.ceil((t_max - t_min) / granularity_sec) + 1)
+        buckets: List[int] = [0] * num_buckets
+
+        for e in errors:
+            idx = int((e.timestamp - t_min) / granularity_sec)
+            idx = min(idx, num_buckets - 1)
+            buckets[idx] += 1
+
+        return [
+            (t_min + i * granularity_sec, count)
+            for i, count in enumerate(buckets)
+        ]
+
+    # -- search --------------------------------------------------------------
+
+    def search(
+        self,
+        keyword: Optional[str] = None,
+        level: Optional[str] = None,
+        machine_id: Optional[str] = None,
+    ) -> List[LogEntry]:
+        """Search log entries with optional filters.
+
+        Parameters
+        ----------
+        keyword:
+            Case-insensitive substring to match in the message.
+        level:
+            Exact log level to match (e.g. ``'ERROR'``).
+        machine_id:
+            Exact machine id to match.
+        """
+        with self._lock:
+            results = list(self._entries)
+
+        if keyword is not None:
+            kw_lower = keyword.lower()
+            results = [e for e in results if kw_lower in e.message.lower()]
+
+        if level is not None:
+            results = [e for e in results if e.level == level]
+
+        if machine_id is not None:
+            results = [e for e in results if e.machine_id == machine_id]
+
+        return results
+
+    # -- context window ------------------------------------------------------
+
+    def get_entries_around(
+        self,
+        timestamp: float,
+        window_sec: float = 10.0,
+    ) -> List[LogEntry]:
+        """Return all entries within *window_sec* seconds of *timestamp*."""
+        half = window_sec / 2.0
+        with self._lock:
+            return [
+                e for e in self._entries
+                if (timestamp - half) <= e.timestamp <= (timestamp + half)
+            ]

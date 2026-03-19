@@ -3371,4 +3371,249 @@ namespace MiracleTwin.Cutting
             return moves;
         }
     }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Adaptive Stepover Calculator
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Result container for stepover/stepdown calculations.
+    /// </summary>
+    [Serializable]
+    public class StepoverResult
+    {
+        /// <summary>Radial stepover (ae) in mm.</summary>
+        public float stepoverMm;
+        /// <summary>Scallop height resulting from this stepover in mm.</summary>
+        public float scallopHeightMm;
+        /// <summary>Effective cutting width in mm.</summary>
+        public float effectiveWidth;
+        /// <summary>Cusp height between passes in mm.</summary>
+        public float cuspHeightMm;
+        /// <summary>Material removal rate in mm³/min.</summary>
+        public float materialRemovalRate;
+
+        public StepoverResult() { }
+
+        public StepoverResult(float stepover, float scallop, float width,
+                              float cusp, float mrr)
+        {
+            stepoverMm = stepover;
+            scallopHeightMm = scallop;
+            effectiveWidth = width;
+            cuspHeightMm = cusp;
+            materialRemovalRate = mrr;
+        }
+    }
+
+    /// <summary>
+    /// Calculates optimal stepover and stepdown values based on tool engagement,
+    /// scallop height, target surface finish, material, and machining operation.
+    /// </summary>
+    public class AdaptiveStepoverCalculator
+    {
+        // ── Operation-specific stepover ranges (fraction of tool diameter) ──
+
+        private static readonly Dictionary<string, (float min, float max)> OperationRanges
+            = new()
+            {
+                { "finishing",      (0.05f, 0.10f) },
+                { "semi_finishing", (0.25f, 0.40f) },
+                { "roughing",      (0.50f, 0.75f) }
+            };
+
+        // ── Material stepdown multipliers (fraction of tool diameter) ──
+
+        private static readonly Dictionary<string, float> MaterialStepdownFactors
+            = new()
+            {
+                { "aluminum",  1.0f  },
+                { "steel",     0.5f  },
+                { "stainless", 0.35f },
+                { "titanium",  0.25f },
+                { "cast_iron", 0.6f  },
+                { "brass",     0.8f  },
+                { "plastic",   1.2f  }
+            };
+
+        // ── Scallop-height geometry ─────────────────────────────────
+
+        /// <summary>
+        /// Calculates the scallop (cusp) height for a ball-end mill given
+        /// the tool diameter and radial stepover.
+        /// h = R - sqrt(R² - (ae/2)²)
+        /// </summary>
+        public float CalculateScallopHeight(float toolDiameter, float stepover)
+        {
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (stepover <= 0f)
+                return 0f;
+            if (stepover > toolDiameter)
+                throw new ArgumentException("Stepover cannot exceed tool diameter.");
+
+            float R = toolDiameter / 2f;
+            float half_ae = stepover / 2f;
+            float discriminant = R * R - half_ae * half_ae;
+            if (discriminant < 0f)
+                discriminant = 0f;
+            return R - Mathf.Sqrt(discriminant);
+        }
+
+        /// <summary>
+        /// Inverse of scallop-height formula: returns the stepover that
+        /// produces a given target scallop height.
+        /// ae = 2 * sqrt(2*R*h - h²)
+        /// </summary>
+        public float CalculateStepoverFromScallop(float toolDiameter,
+                                                   float targetScallopHeight)
+        {
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (targetScallopHeight <= 0f)
+                return 0f;
+
+            float R = toolDiameter / 2f;
+            if (targetScallopHeight > R)
+                throw new ArgumentException(
+                    "Target scallop height cannot exceed tool radius.");
+
+            float inner = 2f * R * targetScallopHeight
+                        - targetScallopHeight * targetScallopHeight;
+            if (inner < 0f)
+                inner = 0f;
+            return 2f * Mathf.Sqrt(inner);
+        }
+
+        // ── Optimal stepover for a target surface finish ────────────
+
+        /// <summary>
+        /// Recommends an optimal stepover (mm) for a given target surface
+        /// roughness Ra (µm) and machining operation category.
+        /// Uses the scallop-height relationship and clamps to the
+        /// operation-specific range.
+        /// </summary>
+        public StepoverResult CalculateOptimalStepover(float toolDiameter,
+                                                       float targetRa,
+                                                       string operation)
+        {
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (targetRa <= 0f)
+                throw new ArgumentException("Target Ra must be positive.");
+
+            string op = operation.ToLowerInvariant();
+            if (!OperationRanges.ContainsKey(op))
+                throw new ArgumentException(
+                    $"Unknown operation '{operation}'. Use finishing, semi_finishing, or roughing.");
+
+            var (minFrac, maxFrac) = OperationRanges[op];
+
+            // Convert Ra (µm) to approximate scallop height (mm).
+            // Empirical: scallop ≈ 4 × Ra (Ra is ~¼ of peak-to-valley).
+            float scallopTarget = targetRa * 4f / 1000f; // µm → mm
+
+            float stepover = CalculateStepoverFromScallop(toolDiameter, scallopTarget);
+
+            // Clamp to operation range
+            float minStep = minFrac * toolDiameter;
+            float maxStep = maxFrac * toolDiameter;
+            stepover = Mathf.Clamp(stepover, minStep, maxStep);
+
+            float scallop = CalculateScallopHeight(toolDiameter, stepover);
+            float engagement = GetEngagementAngle(toolDiameter, stepover);
+            float effectiveWidth = stepover; // for flat bottom: ae = effective width
+
+            return new StepoverResult(stepover, scallop, effectiveWidth, scallop, 0f);
+        }
+
+        // ── Axial depth of cut recommendation ───────────────────────
+
+        /// <summary>
+        /// Recommends an axial depth of cut (ap) based on tool diameter,
+        /// workpiece material, and machining operation.
+        /// </summary>
+        public float CalculateStepdown(float toolDiameter,
+                                        string material,
+                                        string operation)
+        {
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+
+            string mat = material.ToLowerInvariant();
+            string op = operation.ToLowerInvariant();
+
+            // Base factor from material (fraction of tool diameter)
+            float matFactor = MaterialStepdownFactors.ContainsKey(mat)
+                ? MaterialStepdownFactors[mat]
+                : 0.5f; // default for unknown material
+
+            // Operation modifier
+            float opFactor;
+            if (op == "finishing")
+                opFactor = 0.1f;
+            else if (op == "semi_finishing")
+                opFactor = 0.4f;
+            else if (op == "roughing")
+                opFactor = 1.0f;
+            else
+                throw new ArgumentException(
+                    $"Unknown operation '{operation}'.");
+
+            return toolDiameter * matFactor * opFactor;
+        }
+
+        // ── Tool engagement angle ───────────────────────────────────
+
+        /// <summary>
+        /// Calculates the tool engagement angle (degrees) for a given
+        /// radial stepover (ae) and tool diameter.
+        /// θ = arccos(1 - ae / R)
+        /// </summary>
+        public float GetEngagementAngle(float toolDiameter, float stepover)
+        {
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (stepover <= 0f)
+                return 0f;
+            if (stepover > toolDiameter)
+                throw new ArgumentException("Stepover cannot exceed tool diameter.");
+
+            float R = toolDiameter / 2f;
+            float cosVal = 1f - stepover / R;
+            cosVal = Mathf.Clamp(cosVal, -1f, 1f);
+            return Mathf.Acos(cosVal) * Mathf.Rad2Deg;
+        }
+
+        // ── Material removal rate ───────────────────────────────────
+
+        /// <summary>
+        /// Calculates material removal rate (mm³/min).
+        /// MRR = ae × ap × vf
+        /// where vf = feed per tooth × number of flutes × spindle RPM,
+        /// but here we accept feed (mm/min) directly.
+        /// </summary>
+        public float CalculateMRR(float stepover, float stepdown,
+                                   float feedMmPerMin, int numFlutes)
+        {
+            if (stepover <= 0f || stepdown <= 0f || feedMmPerMin <= 0f)
+                return 0f;
+            // MRR = ae * ap * vf  (vf already in mm/min)
+            return stepover * stepdown * feedMmPerMin;
+        }
+
+        // ── Convenience: full result with MRR ───────────────────────
+
+        /// <summary>
+        /// Builds a complete StepoverResult including material removal rate.
+        /// </summary>
+        public StepoverResult GetFullResult(float toolDiameter, float stepover,
+                                             float stepdown, float feedMmPerMin,
+                                             int numFlutes)
+        {
+            float scallop = CalculateScallopHeight(toolDiameter, stepover);
+            float mrr = CalculateMRR(stepover, stepdown, feedMmPerMin, numFlutes);
+            return new StepoverResult(stepover, scallop, stepover, scallop, mrr);
+        }
+    }
 }

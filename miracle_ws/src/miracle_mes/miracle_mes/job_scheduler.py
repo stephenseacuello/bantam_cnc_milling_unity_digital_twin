@@ -3085,6 +3085,344 @@ class ShiftHandoffManager:
         return list(reversed(history[-last_n:]))
 
 
+# ---------------------------------------------------------------------------
+# Changeover Optimizer (SMED)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChangeoverStep:
+    """A single step in a machine changeover procedure."""
+
+    step_id: str
+    description: str
+    duration_min: float
+    category: str  # 'internal' | 'external' | 'waste'
+    can_externalize: bool = False
+    dependencies: List[str] = field(default_factory=list)
+    tools_needed: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ChangeoverAnalysis:
+    """Result of analysing or optimising a changeover sequence."""
+
+    total_time_min: float
+    internal_time_min: float
+    external_time_min: float
+    waste_time_min: float
+    optimized_time_min: float
+    savings_min: float
+    savings_pct: float
+    recommendations: List[str] = field(default_factory=list)
+
+
+class ChangeoverOptimizer:
+    """SMED (Single Minute Exchange of Die) changeover optimizer.
+
+    Implements the core SMED methodology:
+    1. Separate internal and external setup operations.
+    2. Convert internal operations to external where possible.
+    3. Streamline remaining internal operations.
+    4. Eliminate waste steps entirely.
+
+    Usage::
+
+        opt = ChangeoverOptimizer()
+        opt.add_step(ChangeoverStep(...))
+        analysis = opt.analyze()      # current-state analysis
+        optimized = opt.optimize()    # future-state after SMED
+        groups = opt.get_parallel_groups()
+        path = opt.get_critical_path()
+    """
+
+    def __init__(self) -> None:
+        self._steps: Dict[str, ChangeoverStep] = {}
+
+    # -- mutators ------------------------------------------------------------
+
+    def add_step(self, step: ChangeoverStep) -> None:
+        """Register a changeover step."""
+        self._steps[step.step_id] = step
+
+    # -- analysis ------------------------------------------------------------
+
+    def analyze(self) -> ChangeoverAnalysis:
+        """Categorize and analyse all registered steps.
+
+        Returns a :class:`ChangeoverAnalysis` reflecting the *current* state
+        (no optimisation applied).
+        """
+        internal = 0.0
+        external = 0.0
+        waste = 0.0
+        for step in self._steps.values():
+            if step.category == 'internal':
+                internal += step.duration_min
+            elif step.category == 'external':
+                external += step.duration_min
+            elif step.category == 'waste':
+                waste += step.duration_min
+
+        total = internal + external + waste
+        # In the unoptimised view the "optimized_time" equals total (no
+        # savings yet).
+        return ChangeoverAnalysis(
+            total_time_min=total,
+            internal_time_min=internal,
+            external_time_min=external,
+            waste_time_min=waste,
+            optimized_time_min=total,
+            savings_min=0.0,
+            savings_pct=0.0,
+            recommendations=self._generate_recommendations(),
+        )
+
+    # -- optimisation --------------------------------------------------------
+
+    def optimize(self) -> ChangeoverAnalysis:
+        """Apply SMED optimisation and return the improved analysis.
+
+        Optimisation rules:
+        * Waste steps are eliminated entirely.
+        * Internal steps marked *can_externalize* are moved to external.
+        * External steps can be performed while the machine is running, so
+          only *internal* time counts towards machine downtime.
+
+        The ``optimized_time_min`` therefore equals the remaining internal
+        time after externalisation.
+        """
+        internal = 0.0
+        external = 0.0
+        waste = 0.0
+        optimized_internal = 0.0
+        externalized = 0.0
+
+        for step in self._steps.values():
+            if step.category == 'waste':
+                waste += step.duration_min
+            elif step.category == 'external':
+                external += step.duration_min
+            elif step.category == 'internal':
+                internal += step.duration_min
+                if step.can_externalize:
+                    externalized += step.duration_min
+                else:
+                    optimized_internal += step.duration_min
+
+        total = internal + external + waste
+        # Savings = time removed from machine downtime.  Waste is eliminated,
+        # and externalized internal steps move off-line.
+        savings = waste + externalized
+        savings_pct = (savings / total * 100.0) if total > 0 else 0.0
+
+        return ChangeoverAnalysis(
+            total_time_min=total,
+            internal_time_min=internal,
+            external_time_min=external,
+            waste_time_min=waste,
+            optimized_time_min=optimized_internal,
+            savings_min=savings,
+            savings_pct=savings_pct,
+            recommendations=self._generate_recommendations(),
+        )
+
+    # -- dependency / scheduling helpers ------------------------------------
+
+    def get_parallel_groups(self) -> List[List[str]]:
+        """Identify groups of steps that can run in parallel.
+
+        Two steps can run in parallel when neither depends on the other
+        (directly or transitively).  The method returns a list of groups
+        where each group is a list of step_ids that share no dependency
+        conflicts and can therefore be executed concurrently.
+        """
+        if not self._steps:
+            return []
+
+        # Build adjacency (step -> set of direct dependents)
+        dependents: Dict[str, Set[str]] = {sid: set() for sid in self._steps}
+        for sid, step in self._steps.items():
+            for dep in step.dependencies:
+                if dep in dependents:
+                    dependents[dep].add(sid)
+
+        # Topological-layer grouping (Kahn's algorithm variant).
+        in_degree: Dict[str, int] = {sid: 0 for sid in self._steps}
+        for step in self._steps.values():
+            for dep in step.dependencies:
+                if dep in in_degree:
+                    in_degree[step.step_id] += 1
+
+        groups: List[List[str]] = []
+        remaining = dict(in_degree)
+
+        while remaining:
+            layer = [sid for sid, deg in remaining.items() if deg == 0]
+            if not layer:
+                # Cycle detected – break out with remaining steps
+                layer = list(remaining.keys())
+            groups.append(sorted(layer))
+            for sid in layer:
+                del remaining[sid]
+                for dep_sid in list(remaining):
+                    step = self._steps[dep_sid]
+                    if sid in step.dependencies:
+                        remaining[dep_sid] = max(remaining[dep_sid] - 1, 0)
+
+        return groups
+
+    def get_critical_path(self) -> List[str]:
+        """Return the longest chain of dependent *internal* steps.
+
+        Only internal steps contribute to machine downtime; the critical
+        path is the longest sequential chain of such steps (by total
+        duration).
+        """
+        internal_ids = {
+            sid for sid, s in self._steps.items() if s.category == 'internal'
+        }
+        if not internal_ids:
+            return []
+
+        # For each internal step compute the longest path ending at that step
+        # considering only internal predecessors.
+        memo: Dict[str, Tuple[float, List[str]]] = {}
+
+        def _longest(sid: str) -> Tuple[float, List[str]]:
+            if sid in memo:
+                return memo[sid]
+            step = self._steps[sid]
+            best_dur = 0.0
+            best_path: List[str] = []
+            for dep in step.dependencies:
+                if dep in internal_ids:
+                    dur, path = _longest(dep)
+                    if dur > best_dur:
+                        best_dur = dur
+                        best_path = path
+            result = (best_dur + step.duration_min, best_path + [sid])
+            memo[sid] = result
+            return result
+
+        longest_dur = 0.0
+        longest_path: List[str] = []
+        for sid in internal_ids:
+            dur, path = _longest(sid)
+            if dur > longest_dur:
+                longest_dur = dur
+                longest_path = path
+
+        return longest_path
+
+    # -- estimation ----------------------------------------------------------
+
+    def estimate_savings(self, externalize_steps: List[str]) -> float:
+        """Estimate time saved by externalising the given steps.
+
+        Only internal steps that are currently *not* already external
+        contribute to savings.  Returns the total duration (in minutes)
+        that would be removed from machine downtime.
+        """
+        saved = 0.0
+        for sid in externalize_steps:
+            step = self._steps.get(sid)
+            if step and step.category == 'internal':
+                saved += step.duration_min
+        return saved
+
+    # -- checklist -----------------------------------------------------------
+
+    def get_checklist(self) -> List[Dict[str, Any]]:
+        """Generate an ordered changeover checklist.
+
+        Internal steps come first (they must be done while the machine is
+        stopped), then external steps (can be done before/after), waste
+        steps are excluded.  Within each group, dependency order is
+        respected.
+        """
+        ordered = self._topo_sort()
+
+        internal: List[Dict[str, Any]] = []
+        external: List[Dict[str, Any]] = []
+
+        seq = 1
+        for sid in ordered:
+            step = self._steps[sid]
+            if step.category == 'waste':
+                continue
+            entry = {
+                'sequence': seq,
+                'step_id': step.step_id,
+                'description': step.description,
+                'duration_min': step.duration_min,
+                'category': step.category,
+                'tools_needed': step.tools_needed,
+            }
+            if step.category == 'internal':
+                internal.append(entry)
+            else:
+                external.append(entry)
+            seq += 1
+
+        # Re-number: internal first, then external
+        result: List[Dict[str, Any]] = []
+        seq = 1
+        for item in internal + external:
+            item['sequence'] = seq
+            result.append(item)
+            seq += 1
+        return result
+
+    # -- private helpers -----------------------------------------------------
+
+    def _topo_sort(self) -> List[str]:
+        """Topological sort of all steps respecting dependencies."""
+        in_degree: Dict[str, int] = {sid: 0 for sid in self._steps}
+        for step in self._steps.values():
+            for dep in step.dependencies:
+                if dep in in_degree:
+                    in_degree[step.step_id] += 1
+
+        queue: List[str] = sorted(
+            [sid for sid, d in in_degree.items() if d == 0]
+        )
+        result: List[str] = []
+        while queue:
+            sid = queue.pop(0)
+            result.append(sid)
+            for other_sid, other_step in sorted(self._steps.items()):
+                if sid in other_step.dependencies and other_sid in in_degree:
+                    in_degree[other_sid] -= 1
+                    if in_degree[other_sid] == 0:
+                        queue.append(other_sid)
+                        queue.sort()
+
+        # Append any remaining (cycle) nodes
+        for sid in sorted(self._steps):
+            if sid not in result:
+                result.append(sid)
+        return result
+
+    def _generate_recommendations(self) -> List[str]:
+        """Generate SMED improvement recommendations."""
+        recs: List[str] = []
+        for step in self._steps.values():
+            if step.category == 'internal' and step.can_externalize:
+                recs.append(
+                    f"Externalize '{step.step_id}': {step.description} "
+                    f"(saves {step.duration_min:.1f} min)"
+                )
+            if step.category == 'waste':
+                recs.append(
+                    f"Eliminate waste '{step.step_id}': {step.description} "
+                    f"(saves {step.duration_min:.1f} min)"
+                )
+        if not recs:
+            recs.append("Changeover is already well-optimized.")
+        return recs
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

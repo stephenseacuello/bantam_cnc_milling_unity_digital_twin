@@ -3362,3 +3362,210 @@ class DependencyGraphManager:
             critical_path=critical,
             max_depth=len(critical),
         )
+
+
+# ---------------------------------------------------------------------------
+# Canary Deployment Manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DeploymentConfig:
+    """Configuration for a canary deployment."""
+    deployment_id: str
+    name: str
+    target_version: str
+    canary_pct: float = 10.0
+    max_error_rate: float = 5.0
+    min_success_count: int = 10
+    rollback_on_failure: bool = True
+
+
+@dataclass
+class DeploymentStatus:
+    """Live status of a canary deployment."""
+    deployment_id: str
+    phase: str  # 'canary' | 'rolling' | 'complete' | 'rolled_back'
+    canary_nodes: List[str] = field(default_factory=list)
+    stable_nodes: List[str] = field(default_factory=list)
+    error_count: int = 0
+    success_count: int = 0
+    current_pct: float = 0.0
+    start_time: float = 0.0
+
+
+@dataclass
+class _DeploymentRecord:
+    """Internal record kept by the manager for each deployment."""
+    config: DeploymentConfig
+    status: DeploymentStatus
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+    previous_version: Optional[str] = None
+
+
+class CanaryDeploymentManager:
+    """Manages canary (gradual) deployment of configuration/software updates.
+
+    Typical lifecycle:
+        1. ``start_deployment`` — select canary nodes and begin deployment.
+        2. ``record_result``    — record success/failure for each node.
+        3. ``evaluate_canary``  — check whether the canary phase is healthy.
+        4. ``promote``          — promote to full rollout once healthy.
+        5. ``rollback``         — rollback if errors exceed thresholds.
+    """
+
+    def __init__(self) -> None:
+        self._deployments: Dict[str, _DeploymentRecord] = {}
+        self._history: List[DeploymentStatus] = []
+        self._lock = threading.Lock()
+
+    # -- public API ---------------------------------------------------------
+
+    def start_deployment(
+        self, config: DeploymentConfig, all_nodes: List[str],
+    ) -> DeploymentStatus:
+        """Begin a canary deployment across *all_nodes*.
+
+        A subset of *all_nodes* (determined by ``config.canary_pct``) is
+        selected for the initial canary phase.  The remaining nodes stay on
+        the stable (current) version until the canary is promoted.
+        """
+        with self._lock:
+            if config.deployment_id in self._deployments:
+                raise ValueError(
+                    f"Deployment '{config.deployment_id}' already exists"
+                )
+
+            canary_count = max(1, int(len(all_nodes) * config.canary_pct / 100.0))
+            canary_nodes = list(all_nodes[:canary_count])
+            stable_nodes = list(all_nodes[canary_count:])
+
+            status = DeploymentStatus(
+                deployment_id=config.deployment_id,
+                phase='canary',
+                canary_nodes=canary_nodes,
+                stable_nodes=stable_nodes,
+                error_count=0,
+                success_count=0,
+                current_pct=config.canary_pct,
+                start_time=time.time(),
+            )
+
+            self._deployments[config.deployment_id] = _DeploymentRecord(
+                config=config,
+                status=status,
+            )
+
+            return copy.deepcopy(status)
+
+    def record_result(
+        self,
+        deployment_id: str,
+        node_id: str,
+        success: bool,
+        error_msg: Optional[str] = None,
+    ) -> None:
+        """Record a deployment result for a given node."""
+        with self._lock:
+            record = self._get_record(deployment_id)
+
+            if success:
+                record.status.success_count += 1
+            else:
+                record.status.error_count += 1
+                record.errors.append({
+                    'node_id': node_id,
+                    'error_msg': error_msg,
+                    'timestamp': time.time(),
+                })
+
+                # Auto-rollback when failure threshold is breached.
+                if record.config.rollback_on_failure:
+                    total = record.status.success_count + record.status.error_count
+                    if total > 0:
+                        error_rate = (record.status.error_count / total) * 100.0
+                        if (
+                            error_rate > record.config.max_error_rate
+                            and total >= record.config.min_success_count
+                        ):
+                            self._do_rollback(record)
+
+    def evaluate_canary(self, deployment_id: str) -> bool:
+        """Return ``True`` if the canary phase is healthy enough to promote.
+
+        Health criteria:
+        * At least ``min_success_count`` successes recorded.
+        * Error rate is at or below ``max_error_rate``.
+        * Phase must still be ``'canary'``.
+        """
+        with self._lock:
+            record = self._get_record(deployment_id)
+
+            if record.status.phase != 'canary':
+                return False
+
+            if record.status.success_count < record.config.min_success_count:
+                return False
+
+            total = record.status.success_count + record.status.error_count
+            if total == 0:
+                return False
+
+            error_rate = (record.status.error_count / total) * 100.0
+            return error_rate <= record.config.max_error_rate
+
+    def promote(self, deployment_id: str) -> DeploymentStatus:
+        """Promote the canary to a full (rolling) rollout and mark complete."""
+        with self._lock:
+            record = self._get_record(deployment_id)
+
+            if record.status.phase not in ('canary', 'rolling'):
+                raise ValueError(
+                    f"Cannot promote deployment in phase '{record.status.phase}'"
+                )
+
+            # Move all stable nodes into the canary set (i.e. they get the
+            # new version) and mark the deployment complete.
+            record.status.canary_nodes.extend(record.status.stable_nodes)
+            record.status.stable_nodes = []
+            record.status.current_pct = 100.0
+            record.status.phase = 'complete'
+
+            self._history.append(copy.deepcopy(record.status))
+
+            return copy.deepcopy(record.status)
+
+    def rollback(self, deployment_id: str) -> DeploymentStatus:
+        """Rollback the deployment to the previous version."""
+        with self._lock:
+            record = self._get_record(deployment_id)
+            self._do_rollback(record)
+            return copy.deepcopy(record.status)
+
+    def get_status(self, deployment_id: str) -> DeploymentStatus:
+        """Return a snapshot of the current ``DeploymentStatus``."""
+        with self._lock:
+            record = self._get_record(deployment_id)
+            return copy.deepcopy(record.status)
+
+    def get_deployment_history(self) -> List[DeploymentStatus]:
+        """Return all completed/rolled-back deployments."""
+        with self._lock:
+            return [copy.deepcopy(s) for s in self._history]
+
+    # -- helpers ------------------------------------------------------------
+
+    def _get_record(self, deployment_id: str) -> _DeploymentRecord:
+        try:
+            return self._deployments[deployment_id]
+        except KeyError:
+            raise KeyError(f"No deployment with id '{deployment_id}'")
+
+    def _do_rollback(self, record: _DeploymentRecord) -> None:
+        """Perform the actual rollback (must be called under lock)."""
+        if record.status.phase == 'rolled_back':
+            return
+        record.status.stable_nodes.extend(record.status.canary_nodes)
+        record.status.canary_nodes = []
+        record.status.current_pct = 0.0
+        record.status.phase = 'rolled_back'
+        self._history.append(copy.deepcopy(record.status))

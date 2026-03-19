@@ -2111,6 +2111,252 @@ class ScrapTracker:
             return [e for e in self._events if e.is_reworkable]
 
 
+# ------------------------------------------------------------------
+# Machine utilization tracking
+# ------------------------------------------------------------------
+
+VALID_MACHINE_STATES = ('running', 'idle', 'setup', 'maintenance', 'breakdown', 'off')
+
+
+@dataclass
+class MachineStateEvent:
+    """A single machine-state transition event."""
+
+    machine_id: str
+    state: str  # 'running' | 'idle' | 'setup' | 'maintenance' | 'breakdown' | 'off'
+    timestamp: float
+    operator: str
+    job_id: str
+
+
+@dataclass
+class UtilizationMetrics:
+    """Aggregated utilization metrics for a machine over a time window."""
+
+    machine_id: str
+    total_time_min: float
+    running_min: float
+    idle_min: float
+    setup_min: float
+    maintenance_min: float
+    breakdown_min: float
+    off_min: float
+    utilization_pct: float
+    availability_pct: float
+
+
+class MachineUtilizationTracker:
+    """Tracks detailed machine utilization across operating states.
+
+    Records timestamped state-change events per machine and provides
+    analysis methods including per-machine utilization, fleet-wide
+    aggregation, idle-period analysis, and machine comparison.
+    """
+
+    def __init__(self) -> None:
+        # machine_id -> list of MachineStateEvent (chronological)
+        self._events: Dict[str, List[MachineStateEvent]] = {}
+        self._lock = threading.Lock()
+
+    # -- recording ---------------------------------------------------------
+
+    def record_state_change(self, event: MachineStateEvent) -> None:
+        """Record a machine state transition."""
+        if event.state not in VALID_MACHINE_STATES:
+            raise ValueError(
+                f"Invalid state '{event.state}'. "
+                f"Must be one of {VALID_MACHINE_STATES}"
+            )
+        with self._lock:
+            self._events.setdefault(event.machine_id, []).append(event)
+            # Keep events sorted by timestamp
+            self._events[event.machine_id].sort(key=lambda e: e.timestamp)
+
+    # -- queries -----------------------------------------------------------
+
+    def get_current_state(self, machine_id: str) -> Optional[MachineStateEvent]:
+        """Return the most recent state event for *machine_id*, or None."""
+        with self._lock:
+            events = self._events.get(machine_id, [])
+            return events[-1] if events else None
+
+    def get_state_timeline(
+        self, machine_id: str, start_time: float, end_time: float
+    ) -> List[MachineStateEvent]:
+        """Return a chronological list of state events within the window."""
+        with self._lock:
+            events = self._events.get(machine_id, [])
+            return [
+                e for e in events
+                if start_time <= e.timestamp <= end_time
+            ]
+
+    # -- utilization -------------------------------------------------------
+
+    def _compute_state_durations(
+        self,
+        machine_id: str,
+        start_time: float,
+        end_time: float,
+    ) -> Dict[str, float]:
+        """Return seconds spent in each state within [start_time, end_time].
+
+        The algorithm considers the state that was active at *start_time*
+        (by looking at the most recent event at or before that moment) and
+        walks forward through subsequent events, clipping at *end_time*.
+        """
+        events = self._events.get(machine_id, [])
+        if not events:
+            return {s: 0.0 for s in VALID_MACHINE_STATES}
+
+        durations: Dict[str, float] = {s: 0.0 for s in VALID_MACHINE_STATES}
+
+        # Find the state active at start_time (latest event <= start_time)
+        active_state: Optional[str] = None
+        for e in events:
+            if e.timestamp <= start_time:
+                active_state = e.state
+            else:
+                break
+
+        # Walk events in the window
+        cursor = start_time
+        for e in events:
+            if e.timestamp <= start_time:
+                continue
+            if e.timestamp >= end_time:
+                break
+            # Time from cursor to this event in current active_state
+            if active_state is not None:
+                durations[active_state] += e.timestamp - cursor
+            cursor = e.timestamp
+            active_state = e.state
+
+        # Remaining time from cursor to end_time
+        if active_state is not None and cursor < end_time:
+            durations[active_state] += end_time - cursor
+
+        return durations
+
+    def get_utilization(
+        self, machine_id: str, start_time: float, end_time: float
+    ) -> UtilizationMetrics:
+        """Calculate *UtilizationMetrics* for a machine over a time period."""
+        with self._lock:
+            dur = self._compute_state_durations(machine_id, start_time, end_time)
+
+        total_sec = end_time - start_time
+        total_min = total_sec / 60.0
+
+        running_min = dur['running'] / 60.0
+        idle_min = dur['idle'] / 60.0
+        setup_min = dur['setup'] / 60.0
+        maintenance_min = dur['maintenance'] / 60.0
+        breakdown_min = dur['breakdown'] / 60.0
+        off_min = dur['off'] / 60.0
+
+        utilization_pct = (running_min / total_min * 100.0) if total_min > 0 else 0.0
+        # Availability = time not in breakdown or off
+        available_min = total_min - breakdown_min - off_min
+        availability_pct = (available_min / total_min * 100.0) if total_min > 0 else 0.0
+
+        return UtilizationMetrics(
+            machine_id=machine_id,
+            total_time_min=total_min,
+            running_min=running_min,
+            idle_min=idle_min,
+            setup_min=setup_min,
+            maintenance_min=maintenance_min,
+            breakdown_min=breakdown_min,
+            off_min=off_min,
+            utilization_pct=utilization_pct,
+            availability_pct=availability_pct,
+        )
+
+    def get_fleet_utilization(
+        self, start_time: float, end_time: float
+    ) -> List[UtilizationMetrics]:
+        """Return utilization metrics for every tracked machine."""
+        with self._lock:
+            machine_ids = list(self._events.keys())
+
+        return [
+            self.get_utilization(mid, start_time, end_time)
+            for mid in machine_ids
+        ]
+
+    # -- idle analysis -----------------------------------------------------
+
+    def get_idle_analysis(
+        self, machine_id: str, start_time: float, end_time: float
+    ) -> Dict[str, float]:
+        """Analyse idle periods within the window.
+
+        Returns a dict with:
+        - ``idle_count``: number of distinct idle periods
+        - ``avg_idle_duration_min``: average idle-period length in minutes
+        - ``total_idle_min``: total idle time in minutes
+        """
+        with self._lock:
+            events = self._events.get(machine_id, [])
+
+        if not events:
+            return {'idle_count': 0, 'avg_idle_duration_min': 0.0, 'total_idle_min': 0.0}
+
+        # Build a timeline of (state, start, end) intervals inside window
+        idle_periods: List[float] = []  # durations in seconds
+
+        # Find state active at start_time
+        active_state: Optional[str] = None
+        for e in events:
+            if e.timestamp <= start_time:
+                active_state = e.state
+            else:
+                break
+
+        cursor = start_time
+        for e in events:
+            if e.timestamp <= start_time:
+                continue
+            if e.timestamp >= end_time:
+                break
+            # Close out current segment
+            if active_state == 'idle':
+                idle_periods.append(e.timestamp - cursor)
+            cursor = e.timestamp
+            active_state = e.state
+
+        # Final segment to end_time
+        if active_state == 'idle' and cursor < end_time:
+            idle_periods.append(end_time - cursor)
+
+        total_idle_sec = sum(idle_periods)
+        count = len(idle_periods)
+        avg_sec = (total_idle_sec / count) if count > 0 else 0.0
+
+        return {
+            'idle_count': count,
+            'avg_idle_duration_min': avg_sec / 60.0,
+            'total_idle_min': total_idle_sec / 60.0,
+        }
+
+    # -- comparison --------------------------------------------------------
+
+    def compare_machines(
+        self,
+        machine_ids: List[str],
+        start_time: float,
+        end_time: float,
+    ) -> List[UtilizationMetrics]:
+        """Compare machines by utilization, ranked highest first."""
+        metrics = [
+            self.get_utilization(mid, start_time, end_time)
+            for mid in machine_ids
+        ]
+        metrics.sort(key=lambda m: m.utilization_pct, reverse=True)
+        return metrics
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

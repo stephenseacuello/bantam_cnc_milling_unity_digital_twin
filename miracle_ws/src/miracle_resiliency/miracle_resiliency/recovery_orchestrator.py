@@ -3569,3 +3569,301 @@ class CanaryDeploymentManager:
         record.status.current_pct = 0.0
         record.status.phase = 'rolled_back'
         self._history.append(copy.deepcopy(record.status))
+
+
+# ---------------------------------------------------------------------------
+# Chaos Engineering Runner
+# ---------------------------------------------------------------------------
+
+_VALID_FAULT_TYPES = frozenset({
+    'latency', 'error', 'shutdown', 'resource_exhaustion', 'network_partition',
+})
+
+_VALID_EXPERIMENT_STATUSES = frozenset({
+    'pending', 'running', 'completed', 'aborted',
+})
+
+
+@dataclass
+class ChaosExperiment:
+    """Definition of a chaos experiment."""
+    experiment_id: str
+    name: str
+    target_component: str
+    fault_type: str  # latency | error | shutdown | resource_exhaustion | network_partition
+    magnitude: float
+    duration_sec: float
+    steady_state_hypothesis: str
+    status: str = 'pending'  # pending | running | completed | aborted
+
+    def __post_init__(self) -> None:
+        if self.fault_type not in _VALID_FAULT_TYPES:
+            raise ValueError(
+                f"Invalid fault_type '{self.fault_type}'. "
+                f"Must be one of {sorted(_VALID_FAULT_TYPES)}"
+            )
+        if self.status not in _VALID_EXPERIMENT_STATUSES:
+            raise ValueError(
+                f"Invalid status '{self.status}'. "
+                f"Must be one of {sorted(_VALID_EXPERIMENT_STATUSES)}"
+            )
+
+
+@dataclass
+class ExperimentResult:
+    """Result of a completed (or aborted) chaos experiment."""
+    experiment_id: str
+    hypothesis_validated: bool
+    steady_state_before: Dict[str, Any]
+    steady_state_after: Dict[str, Any]
+    impact_summary: str
+    duration_sec: float
+    rollback_performed: bool
+    timestamp: float
+
+
+class ChaosEngineeringRunner:
+    """Runs controlled chaos experiments to test system resilience.
+
+    Provides helpers to create, execute, abort, and inspect chaos experiments.
+    Fault injection is *simulated* -- the runner records steady-state snapshots
+    before and after the experiment window and validates the hypothesis.
+    """
+
+    # Pre-defined experiment templates
+    SPINDLE_LATENCY = dict(
+        name='Spindle Latency Injection',
+        target='spindle_controller',
+        fault_type='latency',
+        magnitude=0.5,
+        duration=30.0,
+        hypothesis='Spindle RPM deviation stays within 5%',
+    )
+    SENSOR_DROPOUT = dict(
+        name='Sensor Dropout',
+        target='sensor_hub',
+        fault_type='shutdown',
+        magnitude=1.0,
+        duration=15.0,
+        hypothesis='Fallback sensor provides readings within 10% tolerance',
+    )
+    DATABASE_SLOW = dict(
+        name='Database Slowdown',
+        target='telemetry_db',
+        fault_type='latency',
+        magnitude=0.8,
+        duration=60.0,
+        hypothesis='Write queue does not exceed 1000 pending entries',
+    )
+    NETWORK_JITTER = dict(
+        name='Network Jitter',
+        target='ros_bridge',
+        fault_type='network_partition',
+        magnitude=0.3,
+        duration=20.0,
+        hypothesis='Message delivery rate remains above 95%',
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._experiments: Dict[str, ChaosExperiment] = {}
+        self._results: Dict[str, ExperimentResult] = {}
+        self._history: List[ChaosExperiment] = []
+
+    # -- public API ---------------------------------------------------------
+
+    def create_experiment(
+        self,
+        name: str,
+        target: str,
+        fault_type: str,
+        magnitude: float,
+        duration: float,
+        hypothesis: str,
+    ) -> ChaosExperiment:
+        """Define a new chaos experiment and return it."""
+        experiment_id = str(uuid.uuid4())
+        experiment = ChaosExperiment(
+            experiment_id=experiment_id,
+            name=name,
+            target_component=target,
+            fault_type=fault_type,
+            magnitude=magnitude,
+            duration_sec=duration,
+            steady_state_hypothesis=hypothesis,
+        )
+        with self._lock:
+            self._experiments[experiment_id] = experiment
+        return experiment
+
+    def run_experiment(
+        self,
+        experiment_id: str,
+        steady_state_checker: Any = None,
+    ) -> ExperimentResult:
+        """Execute a chaos experiment (simulated).
+
+        Parameters
+        ----------
+        experiment_id:
+            ID of a previously created experiment.
+        steady_state_checker:
+            A callable ``() -> dict`` that returns current steady-state
+            metrics.  If *None*, empty dicts are used.
+
+        Returns
+        -------
+        ExperimentResult with hypothesis validation outcome.
+        """
+        with self._lock:
+            experiment = self._get_experiment(experiment_id)
+            if experiment.status not in ('pending',):
+                raise RuntimeError(
+                    f"Experiment '{experiment_id}' cannot be run "
+                    f"(current status: {experiment.status})"
+                )
+            experiment.status = 'running'
+
+        # -- Record steady-state BEFORE fault injection ---------------------
+        if steady_state_checker is not None:
+            state_before = dict(steady_state_checker())
+        else:
+            state_before = {}
+
+        start = time.monotonic()
+
+        # -- Simulate fault injection (no real side-effects) ----------------
+        #    In a real system this would delegate to a FaultExecutor or
+        #    similar mechanism.  Here we simply record timing.
+        simulated_duration = min(experiment.duration_sec, 0.01)
+        time.sleep(simulated_duration)
+
+        # Check if experiment was aborted during the run
+        with self._lock:
+            if experiment.status == 'aborted':
+                elapsed = time.monotonic() - start
+                result = ExperimentResult(
+                    experiment_id=experiment_id,
+                    hypothesis_validated=False,
+                    steady_state_before=state_before,
+                    steady_state_after={},
+                    impact_summary='Experiment aborted before completion',
+                    duration_sec=elapsed,
+                    rollback_performed=True,
+                    timestamp=time.time(),
+                )
+                self._results[experiment_id] = result
+                self._history.append(copy.deepcopy(experiment))
+                return result
+
+        # -- Record steady-state AFTER fault injection ----------------------
+        if steady_state_checker is not None:
+            state_after = dict(steady_state_checker())
+        else:
+            state_after = {}
+
+        elapsed = time.monotonic() - start
+
+        # Validate hypothesis
+        hypothesis_ok = self.validate_hypothesis(state_before, state_after)
+
+        impact = (
+            'Steady state maintained within tolerance'
+            if hypothesis_ok
+            else 'Steady state deviation exceeded tolerance'
+        )
+
+        result = ExperimentResult(
+            experiment_id=experiment_id,
+            hypothesis_validated=hypothesis_ok,
+            steady_state_before=state_before,
+            steady_state_after=state_after,
+            impact_summary=impact,
+            duration_sec=elapsed,
+            rollback_performed=not hypothesis_ok,
+            timestamp=time.time(),
+        )
+
+        with self._lock:
+            experiment.status = 'completed'
+            self._results[experiment_id] = result
+            self._history.append(copy.deepcopy(experiment))
+
+        return result
+
+    def abort_experiment(self, experiment_id: str) -> ChaosExperiment:
+        """Abort a running (or pending) experiment."""
+        with self._lock:
+            experiment = self._get_experiment(experiment_id)
+            if experiment.status in ('completed', 'aborted'):
+                raise RuntimeError(
+                    f"Cannot abort experiment '{experiment_id}' "
+                    f"(status: {experiment.status})"
+                )
+            experiment.status = 'aborted'
+            if experiment_id not in self._results:
+                self._results[experiment_id] = ExperimentResult(
+                    experiment_id=experiment_id,
+                    hypothesis_validated=False,
+                    steady_state_before={},
+                    steady_state_after={},
+                    impact_summary='Experiment aborted by operator',
+                    duration_sec=0.0,
+                    rollback_performed=True,
+                    timestamp=time.time(),
+                )
+                self._history.append(copy.deepcopy(experiment))
+            return copy.deepcopy(experiment)
+
+    def get_results(self, experiment_id: str) -> ExperimentResult:
+        """Return the ``ExperimentResult`` for a given experiment."""
+        with self._lock:
+            if experiment_id not in self._results:
+                raise KeyError(
+                    f"No results for experiment '{experiment_id}'"
+                )
+            return copy.deepcopy(self._results[experiment_id])
+
+    def get_experiment_history(self) -> List[ChaosExperiment]:
+        """Return all past experiments (completed or aborted)."""
+        with self._lock:
+            return [copy.deepcopy(e) for e in self._history]
+
+    @staticmethod
+    def validate_hypothesis(
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        tolerance_pct: float = 10.0,
+    ) -> bool:
+        """Check if steady-state metrics stayed within *tolerance_pct*.
+
+        For every numeric key present in both *before* and *after*, verify
+        that the relative change does not exceed *tolerance_pct* percent.
+        Non-numeric keys and keys present in only one dict are ignored.
+
+        Returns ``True`` if all checked metrics are within tolerance (or if
+        there are no comparable numeric keys).
+        """
+        for key in before:
+            if key not in after:
+                continue
+            val_before = before[key]
+            val_after = after[key]
+            if not isinstance(val_before, (int, float)) or not isinstance(val_after, (int, float)):
+                continue
+            if val_before == 0:
+                if val_after != 0:
+                    return False
+                continue
+            pct_change = abs(val_after - val_before) / abs(val_before) * 100.0
+            if pct_change > tolerance_pct:
+                return False
+        return True
+
+    # -- helpers ------------------------------------------------------------
+
+    def _get_experiment(self, experiment_id: str) -> ChaosExperiment:
+        try:
+            return self._experiments[experiment_id]
+        except KeyError:
+            raise KeyError(f"No experiment with id '{experiment_id}'")

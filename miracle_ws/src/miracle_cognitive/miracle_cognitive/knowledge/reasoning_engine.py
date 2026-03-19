@@ -2120,6 +2120,183 @@ class FeatureImportanceRanker:
         return pairs
 
 
+# ---------------------------------------------------------------------------
+# FMEA Risk Priority Number Calculator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FailureMode:
+    """A single failure mode entry for FMEA analysis."""
+
+    mode_id: str
+    description: str
+    component: str
+    severity: int        # 1-10
+    occurrence: int      # 1-10
+    detection: int       # 1-10
+    rpn: int = 0
+    current_controls: str = ""
+    recommended_action: str = ""
+
+
+@dataclass
+class FMEAReport:
+    """Aggregated FMEA report across all registered failure modes."""
+
+    failure_modes: List['FailureMode']
+    total_rpn: int
+    avg_rpn: float
+    high_risk_count: int
+    critical_modes: List['FailureMode']
+    timestamp: float = 0.0
+
+
+class FMEARiskCalculator:
+    """Calculates Failure Mode and Effects Analysis Risk Priority Numbers.
+
+    Provides registration of failure modes, RPN calculation, risk
+    classification, report generation, and before/after comparison for
+    tracking the effectiveness of corrective actions.
+    """
+
+    def __init__(self) -> None:
+        self._modes: Dict[str, FailureMode] = {}
+
+    # -- core helpers -------------------------------------------------------
+
+    @staticmethod
+    def calculate_rpn(severity: int, occurrence: int, detection: int) -> int:
+        """Compute Risk Priority Number = Severity * Occurrence * Detection.
+
+        Each factor must be in the range [1, 10].
+        """
+        for name, val in [('severity', severity),
+                          ('occurrence', occurrence),
+                          ('detection', detection)]:
+            if not (1 <= val <= 10):
+                raise ValueError(
+                    f"{name} must be between 1 and 10, got {val}")
+        return severity * occurrence * detection
+
+    @staticmethod
+    def get_risk_level(rpn: int) -> str:
+        """Classify an RPN value into a risk level string.
+
+        * ``'low'``      – RPN < 50
+        * ``'medium'``   – 50 <= RPN <= 100
+        * ``'high'``     – 100 < RPN <= 200
+        * ``'critical'`` – RPN > 200
+        """
+        if rpn < 50:
+            return 'low'
+        elif rpn <= 100:
+            return 'medium'
+        elif rpn <= 200:
+            return 'high'
+        else:
+            return 'critical'
+
+    # -- mode management ----------------------------------------------------
+
+    def add_failure_mode(self, mode: FailureMode) -> FailureMode:
+        """Register a failure mode, auto-calculating its RPN."""
+        mode.rpn = self.calculate_rpn(
+            mode.severity, mode.occurrence, mode.detection)
+        self._modes[mode.mode_id] = mode
+        return mode
+
+    def get_critical_modes(self, threshold: int = 125) -> List[FailureMode]:
+        """Return failure modes whose RPN exceeds *threshold*, sorted desc."""
+        critical = [m for m in self._modes.values() if m.rpn > threshold]
+        critical.sort(key=lambda m: m.rpn, reverse=True)
+        return critical
+
+    # -- reporting ----------------------------------------------------------
+
+    def get_report(self) -> FMEAReport:
+        """Generate a full FMEA report with modes sorted by RPN descending."""
+        modes = sorted(self._modes.values(),
+                       key=lambda m: m.rpn, reverse=True)
+        total = sum(m.rpn for m in modes)
+        avg = total / len(modes) if modes else 0.0
+        high_risk = sum(1 for m in modes if m.rpn > 200)
+        critical = [m for m in modes if m.rpn > 125]
+        return FMEAReport(
+            failure_modes=modes,
+            total_rpn=total,
+            avg_rpn=avg,
+            high_risk_count=high_risk,
+            critical_modes=critical,
+            timestamp=time.time(),
+        )
+
+    # -- recommendations ----------------------------------------------------
+
+    def suggest_action(self, mode: FailureMode) -> str:
+        """Suggest a corrective action targeting the highest contributing factor.
+
+        The suggestion targets whichever of severity, occurrence, or
+        detection is the largest contributor to the RPN.
+        """
+        factors = {
+            'severity': mode.severity,
+            'occurrence': mode.occurrence,
+            'detection': mode.detection,
+        }
+        worst = max(factors, key=factors.get)  # type: ignore[arg-type]
+        suggestions = {
+            'severity': (
+                f"Reduce severity (currently {mode.severity}/10): "
+                "redesign the component or add redundancy to mitigate the "
+                "effect of failure mode '{mode.description}'."
+            ),
+            'occurrence': (
+                f"Reduce occurrence (currently {mode.occurrence}/10): "
+                "improve process controls, use higher-reliability parts, "
+                "or add preventive maintenance for '{mode.component}'."
+            ),
+            'detection': (
+                f"Improve detection (currently {mode.detection}/10): "
+                "add sensors, inspections, or automated monitoring to "
+                "detect '{mode.description}' earlier."
+            ),
+        }
+        return suggestions[worst]
+
+    # -- before / after comparison ------------------------------------------
+
+    def compare_before_after(
+        self,
+        mode_id: str,
+        new_severity: int,
+        new_occurrence: int,
+        new_detection: int,
+    ) -> Dict[str, Any]:
+        """Compare original RPN with a proposed new set of S/O/D ratings.
+
+        Returns a dict with keys ``before_rpn``, ``after_rpn``,
+        ``rpn_reduction``, ``reduction_pct``, ``before_risk``, and
+        ``after_risk``.
+        """
+        if mode_id not in self._modes:
+            raise KeyError(f"Unknown failure mode: {mode_id}")
+        original = self._modes[mode_id]
+        before_rpn = original.rpn
+        after_rpn = self.calculate_rpn(
+            new_severity, new_occurrence, new_detection)
+        reduction = before_rpn - after_rpn
+        pct = (reduction / before_rpn * 100.0) if before_rpn else 0.0
+        return {
+            'before_rpn': before_rpn,
+            'after_rpn': after_rpn,
+            'rpn_reduction': reduction,
+            'reduction_pct': round(pct, 2),
+            'before_risk': self.get_risk_level(before_rpn),
+            'after_risk': self.get_risk_level(after_rpn),
+        }
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

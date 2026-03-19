@@ -3616,4 +3616,232 @@ namespace MiracleTwin.Cutting
             return new StepoverResult(stepover, scallop, stepover, scallop, mrr);
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Constant Chip Load Optimizer
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Describes a contiguous segment of the tool path that shares a common
+    /// radial engagement and the feed rate adjusted to maintain constant chip load.
+    /// </summary>
+    [Serializable]
+    public class EngagementSegment
+    {
+        /// <summary>Start index within the path point list.</summary>
+        public int startIndex;
+        /// <summary>End index (inclusive) within the path point list.</summary>
+        public int endIndex;
+        /// <summary>Radial engagement angle (degrees) for this segment.</summary>
+        public float engagementAngleDeg;
+        /// <summary>Radial depth of cut (mm) for this segment.</summary>
+        public float radialDepthMm;
+        /// <summary>Feed rate (mm/min) adjusted to maintain constant chip load.</summary>
+        public float adjustedFeedMmMin;
+
+        public EngagementSegment() { }
+
+        public EngagementSegment(int start, int end, float angleDeg,
+                                  float radialDepth, float adjustedFeed)
+        {
+            startIndex = start;
+            endIndex = end;
+            engagementAngleDeg = angleDeg;
+            radialDepthMm = radialDepth;
+            adjustedFeedMmMin = adjustedFeed;
+        }
+    }
+
+    /// <summary>
+    /// Aggregated result of the constant-chip-load optimization pass.
+    /// </summary>
+    [Serializable]
+    public class ChipLoadOptResult
+    {
+        /// <summary>Per-segment engagement/feed data.</summary>
+        public List<EngagementSegment> segments = new();
+        /// <summary>Original (base) feed rate (mm/min).</summary>
+        public float originalFeed;
+        /// <summary>Average adjusted feed across all segments (mm/min).</summary>
+        public float avgAdjustedFeed;
+        /// <summary>Maximum feed increase ratio (adjusted / base).</summary>
+        public float maxFeedIncrease;
+        /// <summary>Minimum feed decrease ratio (adjusted / base).</summary>
+        public float minFeedDecrease;
+        /// <summary>Estimated cycle time reduction (percent, 0-100).</summary>
+        public float timeReductionPct;
+    }
+
+    /// <summary>
+    /// Adjusts feed rate along tool paths to maintain constant chip load
+    /// when radial engagement varies.  Lighter engagement allows higher
+    /// feed because chip thickness decreases; heavier engagement requires
+    /// slower feed to avoid overloading the cutter.
+    ///
+    /// Core formula:  adjustedFeed = baseFeed * sqrt(fullAngle / currentAngle)
+    /// Safety clamp:  adjustedFeed &lt;= 1.5 * baseFeed  (150 %)
+    /// </summary>
+    public class ConstantChipLoadOptimizer
+    {
+        /// <summary>Maximum multiplier applied to the base feed for safety.</summary>
+        public const float MaxFeedMultiplier = 1.5f;
+
+        // ── Calculate adjusted feed ─────────────────────────────────
+
+        /// <summary>
+        /// Returns the feed rate required to maintain constant chip thickness
+        /// at <paramref name="currentEngagementAngle"/> when the base feed is
+        /// calibrated for <paramref name="fullEngagementAngle"/>.
+        ///
+        /// Formula: feed * sqrt(fullAngle / currentAngle), clamped to 150 % of base.
+        /// </summary>
+        /// <param name="baseFeed">Feed rate (mm/min) at full engagement.</param>
+        /// <param name="fullEngagementAngle">Reference full engagement angle (deg).</param>
+        /// <param name="currentEngagementAngle">Current engagement angle (deg).</param>
+        /// <returns>Adjusted feed (mm/min).</returns>
+        public float CalculateAdjustedFeed(float baseFeed,
+                                            float fullEngagementAngle,
+                                            float currentEngagementAngle)
+        {
+            if (baseFeed <= 0f)
+                throw new ArgumentException("Base feed must be positive.");
+            if (fullEngagementAngle <= 0f)
+                throw new ArgumentException("Full engagement angle must be positive.");
+            if (currentEngagementAngle <= 0f)
+                throw new ArgumentException("Current engagement angle must be positive.");
+
+            float ratio = fullEngagementAngle / currentEngagementAngle;
+            float adjusted = baseFeed * Mathf.Sqrt(ratio);
+
+            // Safety clamp – never exceed 150 % of base feed
+            float maxFeed = baseFeed * MaxFeedMultiplier;
+            return Mathf.Min(adjusted, maxFeed);
+        }
+
+        // ── Engagement angle from radial depth ─────────────────────
+
+        /// <summary>
+        /// Calculates the engagement angle (degrees) from tool diameter and
+        /// radial depth of cut using:
+        ///   angle = acos(1 - radialDepth / radius) * 2    (full included angle)
+        /// When radialDepth equals the full radius the angle is 180°.
+        /// </summary>
+        public float CalculateEngagement(float toolDiameter, float radialDepth)
+        {
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (radialDepth < 0f)
+                throw new ArgumentException("Radial depth cannot be negative.");
+
+            float radius = toolDiameter / 2f;
+            if (radialDepth > toolDiameter)
+                radialDepth = toolDiameter;
+
+            float cosVal = 1f - radialDepth / radius;
+            cosVal = Mathf.Clamp(cosVal, -1f, 1f);
+            return Mathf.Acos(cosVal) * Mathf.Rad2Deg;
+        }
+
+        // ── Optimize an entire path ─────────────────────────────────
+
+        /// <summary>
+        /// Analyses engagement changes along a tool path (given as a list of
+        /// radial-depth values per point) and adjusts feed for each segment.
+        /// </summary>
+        /// <param name="radialDepths">Radial depth (mm) at each path point.</param>
+        /// <param name="baseFeed">Baseline feed rate at full engagement (mm/min).</param>
+        /// <param name="toolDiameter">Cutter diameter (mm).</param>
+        /// <returns>A <see cref="ChipLoadOptResult"/> with per-segment data.</returns>
+        public ChipLoadOptResult OptimizePath(List<float> radialDepths,
+                                               float baseFeed,
+                                               float toolDiameter)
+        {
+            if (radialDepths == null || radialDepths.Count == 0)
+                throw new ArgumentException("Path must contain at least one point.");
+            if (baseFeed <= 0f)
+                throw new ArgumentException("Base feed must be positive.");
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+
+            float fullEngagement = CalculateEngagement(toolDiameter, toolDiameter);
+
+            var segments = new List<EngagementSegment>();
+
+            // Build segments – a new segment starts whenever the radial depth changes
+            int segStart = 0;
+            float prevDepth = radialDepths[0];
+
+            for (int i = 1; i <= radialDepths.Count; i++)
+            {
+                bool changed = (i == radialDepths.Count) ||
+                               (Mathf.Abs(radialDepths[i] - prevDepth) > 1e-6f);
+
+                if (changed)
+                {
+                    float depth = prevDepth;
+                    float angle = CalculateEngagement(toolDiameter, depth);
+                    float adjFeed = (angle > 0f)
+                        ? CalculateAdjustedFeed(baseFeed, fullEngagement, angle)
+                        : baseFeed;
+
+                    segments.Add(new EngagementSegment(segStart, i - 1, angle, depth, adjFeed));
+
+                    if (i < radialDepths.Count)
+                    {
+                        segStart = i;
+                        prevDepth = radialDepths[i];
+                    }
+                }
+            }
+
+            // Build result
+            var result = new ChipLoadOptResult
+            {
+                segments = segments,
+                originalFeed = baseFeed,
+            };
+
+            if (segments.Count == 0)
+                return result;
+
+            float sumFeed = 0f;
+            float maxRatio = float.MinValue;
+            float minRatio = float.MaxValue;
+
+            foreach (var seg in segments)
+            {
+                sumFeed += seg.adjustedFeedMmMin;
+                float ratio = seg.adjustedFeedMmMin / baseFeed;
+                if (ratio > maxRatio) maxRatio = ratio;
+                if (ratio < minRatio) minRatio = ratio;
+            }
+
+            result.avgAdjustedFeed = sumFeed / segments.Count;
+            result.maxFeedIncrease = maxRatio;
+            result.minFeedDecrease = minRatio;
+            result.timeReductionPct = EstimateTimeSavings(baseFeed, result.avgAdjustedFeed);
+
+            return result;
+        }
+
+        // ── Time savings estimate ───────────────────────────────────
+
+        /// <summary>
+        /// Estimates cycle time reduction (%) when feed increases from
+        /// <paramref name="originalFeed"/> to <paramref name="optimizedFeed"/>.
+        ///
+        /// Positive value = time saved; zero when optimized &lt;= original.
+        /// </summary>
+        public float EstimateTimeSavings(float originalFeed, float optimizedFeed)
+        {
+            if (originalFeed <= 0f || optimizedFeed <= 0f)
+                return 0f;
+            if (optimizedFeed <= originalFeed)
+                return 0f;
+
+            // time ∝ 1/feed  →  saving = 1 − (original / optimized)
+            float saving = (1f - originalFeed / optimizedFeed) * 100f;
+            return Mathf.Clamp(saving, 0f, 100f);
+        }
+    }
 }

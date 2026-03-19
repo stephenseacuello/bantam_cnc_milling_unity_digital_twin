@@ -3355,6 +3355,240 @@ class DataQualityScorer:
         )
 
 
+# ---------------------------------------------------------------------------
+# Real-Time Dashboard Data Aggregator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DashboardWidget:
+    """A single dashboard widget definition and state."""
+    widget_id: str
+    title: str
+    widget_type: str          # 'gauge' | 'chart' | 'indicator' | 'table' | 'counter'
+    data_source: str
+    current_value: float = 0.0
+    min_value: float = 0.0
+    max_value: float = 100.0
+    unit: str = ''
+    status: str = 'normal'    # 'normal' | 'warning' | 'alarm'
+    update_rate_sec: float = 1.0
+
+
+@dataclass
+class DashboardLayout:
+    """A collection of widgets for a specific machine dashboard."""
+    layout_id: str
+    name: str
+    widgets: List[DashboardWidget] = field(default_factory=list)
+    machine_id: str = ''
+    refresh_rate_sec: float = 1.0
+
+
+class RealTimeDashboardAggregator:
+    """Aggregates real-time machine data for dashboard widgets.
+
+    Manages widget registration, value updates, layout creation, and
+    history tracking to drive SCADA dashboard displays.
+    """
+
+    # Default history depth per widget
+    _DEFAULT_HISTORY_SIZE = 500
+
+    def __init__(self, history_size: int = _DEFAULT_HISTORY_SIZE) -> None:
+        self._widgets: Dict[str, DashboardWidget] = {}
+        self._layouts: Dict[str, DashboardLayout] = {}
+        self._history: Dict[str, List[Tuple[float, float, str]]] = {}  # widget_id -> [(ts, value, status)]
+        self._history_size = history_size
+        self._lock = threading.Lock()
+
+    # -- widget CRUD --------------------------------------------------------
+
+    def register_widget(self, widget: DashboardWidget) -> None:
+        """Register a dashboard widget."""
+        with self._lock:
+            self._widgets[widget.widget_id] = widget
+            if widget.widget_id not in self._history:
+                self._history[widget.widget_id] = []
+
+    def update_widget(self, widget_id: str, value: float, status: str = 'normal') -> None:
+        """Update a widget's current value and status."""
+        with self._lock:
+            if widget_id not in self._widgets:
+                raise KeyError(f"Widget '{widget_id}' is not registered")
+            w = self._widgets[widget_id]
+            w.current_value = value
+            w.status = status
+            history = self._history.setdefault(widget_id, [])
+            history.append((time.time(), value, status))
+            if len(history) > self._history_size:
+                history[:] = history[-self._history_size:]
+
+    def get_widget(self, widget_id: str) -> Optional[DashboardWidget]:
+        """Return the widget state, or ``None`` if not found."""
+        return self._widgets.get(widget_id)
+
+    # -- layout management --------------------------------------------------
+
+    def create_default_layout(self, machine_id: str) -> DashboardLayout:
+        """Create a standard CNC milling dashboard layout.
+
+        Includes: spindle speed, feed rate, spindle load, axis positions
+        (X/Y/Z), coolant status, part count, cycle time, and OEE gauge.
+        """
+        layout_id = f'default_{machine_id}'
+        prefix = f'{machine_id}_'
+
+        widget_defs: List[DashboardWidget] = [
+            DashboardWidget(
+                widget_id=f'{prefix}spindle_speed',
+                title='Spindle Speed',
+                widget_type='gauge',
+                data_source=f'{machine_id}/spindle_speed',
+                min_value=0.0,
+                max_value=24000.0,
+                unit='RPM',
+                update_rate_sec=0.5,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}feed_rate',
+                title='Feed Rate',
+                widget_type='gauge',
+                data_source=f'{machine_id}/feed_rate',
+                min_value=0.0,
+                max_value=15000.0,
+                unit='mm/min',
+                update_rate_sec=0.5,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}spindle_load',
+                title='Spindle Load',
+                widget_type='gauge',
+                data_source=f'{machine_id}/spindle_load',
+                min_value=0.0,
+                max_value=100.0,
+                unit='%',
+                update_rate_sec=1.0,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}axis_x',
+                title='Axis X Position',
+                widget_type='chart',
+                data_source=f'{machine_id}/axis_x',
+                min_value=-500.0,
+                max_value=500.0,
+                unit='mm',
+                update_rate_sec=0.25,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}axis_y',
+                title='Axis Y Position',
+                widget_type='chart',
+                data_source=f'{machine_id}/axis_y',
+                min_value=-500.0,
+                max_value=500.0,
+                unit='mm',
+                update_rate_sec=0.25,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}axis_z',
+                title='Axis Z Position',
+                widget_type='chart',
+                data_source=f'{machine_id}/axis_z',
+                min_value=-300.0,
+                max_value=0.0,
+                unit='mm',
+                update_rate_sec=0.25,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}coolant_status',
+                title='Coolant Status',
+                widget_type='indicator',
+                data_source=f'{machine_id}/coolant',
+                min_value=0.0,
+                max_value=1.0,
+                unit='',
+                update_rate_sec=5.0,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}part_count',
+                title='Part Count',
+                widget_type='counter',
+                data_source=f'{machine_id}/part_count',
+                min_value=0.0,
+                max_value=999999.0,
+                unit='pcs',
+                update_rate_sec=5.0,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}cycle_time',
+                title='Cycle Time',
+                widget_type='chart',
+                data_source=f'{machine_id}/cycle_time',
+                min_value=0.0,
+                max_value=3600.0,
+                unit='sec',
+                update_rate_sec=5.0,
+            ),
+            DashboardWidget(
+                widget_id=f'{prefix}oee',
+                title='OEE',
+                widget_type='gauge',
+                data_source=f'{machine_id}/oee',
+                min_value=0.0,
+                max_value=100.0,
+                unit='%',
+                update_rate_sec=10.0,
+            ),
+        ]
+
+        for w in widget_defs:
+            self.register_widget(w)
+
+        layout = DashboardLayout(
+            layout_id=layout_id,
+            name=f'{machine_id} CNC Dashboard',
+            widgets=widget_defs,
+            machine_id=machine_id,
+            refresh_rate_sec=1.0,
+        )
+        self._layouts[layout_id] = layout
+        return layout
+
+    def get_layout(self, layout_id: str) -> Optional[DashboardLayout]:
+        """Return a complete layout with current widget values.
+
+        Widget references inside the layout point to the same objects held
+        in the internal registry, so values are always up-to-date.
+        """
+        layout = self._layouts.get(layout_id)
+        if layout is None:
+            return None
+        # Refresh widget references to current state
+        layout.widgets = [
+            self._widgets.get(w.widget_id, w)
+            for w in layout.widgets
+        ]
+        return layout
+
+    # -- queries ------------------------------------------------------------
+
+    def get_alarm_widgets(self) -> List[DashboardWidget]:
+        """Return all widgets currently in *alarm* status."""
+        return [w for w in self._widgets.values() if w.status == 'alarm']
+
+    def get_widget_history(
+        self,
+        widget_id: str,
+        last_n: int = 50,
+    ) -> List[Tuple[float, float, str]]:
+        """Return the most recent *last_n* values for a widget.
+
+        Each entry is a tuple ``(timestamp, value, status)``.
+        """
+        history = self._history.get(widget_id, [])
+        return history[-last_n:]
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

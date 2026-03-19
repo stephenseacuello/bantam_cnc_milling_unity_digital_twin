@@ -5484,3 +5484,438 @@ class ToolRunoutCompensator:
     def is_acceptable(self, tir_mm: float, tolerance_mm: float = 0.01) -> bool:
         """Return ``True`` if the measured TIR is within *tolerance_mm*."""
         return tir_mm <= tolerance_mm
+
+
+# ===========================================================================
+# Coolant Flow Simulator
+# ===========================================================================
+
+@dataclass
+class NozzleConfig:
+    """Configuration for a single coolant nozzle."""
+    nozzle_id: str
+    position_offset_mm: Tuple[float, float, float]  # (x, y, z) offset from tool tip
+    angle_deg: float  # spray angle relative to cutting zone
+    flow_rate_lpm: float  # liters per minute
+    pressure_bar: float  # coolant pressure
+    nozzle_type: str = 'flood'  # 'flood' | 'mist' | 'through_tool' | 'jet'
+
+    def __post_init__(self) -> None:
+        valid_types = ('flood', 'mist', 'through_tool', 'jet')
+        if self.nozzle_type not in valid_types:
+            raise ValueError(
+                f"nozzle_type must be one of {valid_types}, got '{self.nozzle_type}'"
+            )
+
+
+@dataclass
+class CoolantEffectiveness:
+    """Result of coolant effectiveness evaluation."""
+    coverage_pct: float  # 0-100
+    penetration_depth_mm: float
+    thermal_reduction_pct: float  # 0-100
+    chip_evacuation_score: float  # 0-100
+    lubrication_score: float  # 0-100
+    overall_effectiveness: float  # 0-100
+
+
+class CoolantFlowSimulator:
+    """Simulates coolant delivery effectiveness based on nozzle position and
+    cutting parameters.
+
+    Provides evaluation of individual nozzles, complete coolant systems,
+    position recommendations, and flow-rate requirements.
+    """
+
+    # Base effectiveness caps per nozzle type
+    _TYPE_BASE: Dict[str, float] = {
+        'flood': 70.0,
+        'mist': 50.0,
+        'through_tool': 90.0,
+        'jet': 85.0,
+    }
+
+    # Ideal nozzle angles per nozzle type (degrees from horizontal)
+    _IDEAL_ANGLE: Dict[str, float] = {
+        'flood': 45.0,
+        'mist': 30.0,
+        'through_tool': 0.0,  # inline with tool axis
+        'jet': 15.0,
+    }
+
+    # ------------------------------------------------------------------
+    # Single nozzle evaluation
+    # ------------------------------------------------------------------
+
+    def evaluate_nozzle(
+        self,
+        nozzle: NozzleConfig,
+        tool_diameter: float,
+        cutting_depth: float,
+        spindle_rpm: float,
+    ) -> CoolantEffectiveness:
+        """Evaluate the effectiveness of a single coolant nozzle.
+
+        Parameters
+        ----------
+        nozzle:
+            Nozzle configuration.
+        tool_diameter:
+            Tool diameter in mm.
+        cutting_depth:
+            Axial depth of cut in mm.
+        spindle_rpm:
+            Spindle rotational speed in RPM.
+
+        Returns
+        -------
+        CoolantEffectiveness
+        """
+        if tool_diameter <= 0:
+            raise ValueError("tool_diameter must be > 0")
+        if cutting_depth < 0:
+            raise ValueError("cutting_depth must be >= 0")
+        if spindle_rpm < 0:
+            raise ValueError("spindle_rpm must be >= 0")
+
+        base = self._TYPE_BASE.get(nozzle.nozzle_type, 50.0)
+
+        # -- Coverage: affected by distance from tool and flow rate --------
+        distance = math.sqrt(sum(c ** 2 for c in nozzle.position_offset_mm))
+        # Closer is better; normalise with tool_diameter as reference length
+        distance_factor = max(0.0, 1.0 - distance / (5.0 * tool_diameter))
+        flow_factor = min(1.0, nozzle.flow_rate_lpm / 15.0)
+        coverage_pct = min(100.0, base * distance_factor * flow_factor * 1.5)
+
+        # -- Penetration depth: pressure driven ----------------------------
+        pressure_factor = min(1.0, nozzle.pressure_bar / 70.0)
+        penetration_depth_mm = cutting_depth * pressure_factor
+
+        # -- Thermal reduction: depends on angle alignment -----------------
+        ideal_angle = self._IDEAL_ANGLE.get(nozzle.nozzle_type, 45.0)
+        angle_error = abs(nozzle.angle_deg - ideal_angle)
+        angle_factor = max(0.0, 1.0 - angle_error / 90.0)
+        # Higher RPM generates more heat and makes cooling harder
+        rpm_penalty = max(0.0, 1.0 - spindle_rpm / 30000.0)
+        thermal_reduction_pct = min(100.0, base * angle_factor * rpm_penalty)
+
+        # -- Chip evacuation: flow rate + pressure -------------------------
+        chip_evacuation_score = min(
+            100.0,
+            (flow_factor * 60.0 + pressure_factor * 40.0),
+        )
+
+        # -- Lubrication score: nozzle-type dependent + flow ---------------
+        lube_base = {
+            'flood': 0.8,
+            'mist': 0.6,
+            'through_tool': 0.95,
+            'jet': 0.7,
+        }.get(nozzle.nozzle_type, 0.5)
+        lubrication_score = min(100.0, lube_base * flow_factor * 125.0)
+
+        # -- Overall effectiveness: weighted average -----------------------
+        overall_effectiveness = (
+            coverage_pct * 0.25
+            + thermal_reduction_pct * 0.30
+            + chip_evacuation_score * 0.20
+            + lubrication_score * 0.15
+            + (penetration_depth_mm / max(cutting_depth, 0.01)) * 100.0 * 0.10
+        )
+        overall_effectiveness = min(100.0, max(0.0, overall_effectiveness))
+
+        return CoolantEffectiveness(
+            coverage_pct=round(coverage_pct, 2),
+            penetration_depth_mm=round(penetration_depth_mm, 4),
+            thermal_reduction_pct=round(thermal_reduction_pct, 2),
+            chip_evacuation_score=round(chip_evacuation_score, 2),
+            lubrication_score=round(lubrication_score, 2),
+            overall_effectiveness=round(overall_effectiveness, 2),
+        )
+
+    # ------------------------------------------------------------------
+    # System-level evaluation
+    # ------------------------------------------------------------------
+
+    def evaluate_system(
+        self,
+        nozzles: List[NozzleConfig],
+        tool_diameter: float,
+        cutting_depth: float,
+        spindle_rpm: float,
+    ) -> CoolantEffectiveness:
+        """Evaluate complete coolant system composed of multiple nozzles.
+
+        Individual nozzle scores are combined with diminishing returns to
+        produce an overall system effectiveness.
+
+        Parameters
+        ----------
+        nozzles:
+            List of nozzle configurations.
+        tool_diameter:
+            Tool diameter in mm.
+        cutting_depth:
+            Axial depth of cut in mm.
+        spindle_rpm:
+            Spindle RPM.
+
+        Returns
+        -------
+        CoolantEffectiveness
+        """
+        if not nozzles:
+            return CoolantEffectiveness(
+                coverage_pct=0.0,
+                penetration_depth_mm=0.0,
+                thermal_reduction_pct=0.0,
+                chip_evacuation_score=0.0,
+                lubrication_score=0.0,
+                overall_effectiveness=0.0,
+            )
+
+        results = [
+            self.evaluate_nozzle(n, tool_diameter, cutting_depth, spindle_rpm)
+            for n in nozzles
+        ]
+
+        # Combine with diminishing returns: each additional nozzle adds less
+        def _combine(values: List[float], cap: float = 100.0) -> float:
+            sorted_vals = sorted(values, reverse=True)
+            total = 0.0
+            for i, v in enumerate(sorted_vals):
+                contribution = v * (0.7 ** i)  # 30% diminishing per extra nozzle
+                total += contribution
+            return min(cap, total)
+
+        coverage = _combine([r.coverage_pct for r in results])
+        thermal = _combine([r.thermal_reduction_pct for r in results])
+        chip_evac = _combine([r.chip_evacuation_score for r in results])
+        lube = _combine([r.lubrication_score for r in results])
+        pen_depth = max(r.penetration_depth_mm for r in results)
+
+        overall = (
+            coverage * 0.25
+            + thermal * 0.30
+            + chip_evac * 0.20
+            + lube * 0.15
+            + (pen_depth / max(cutting_depth, 0.01)) * 100.0 * 0.10
+        )
+        overall = min(100.0, max(0.0, overall))
+
+        return CoolantEffectiveness(
+            coverage_pct=round(coverage, 2),
+            penetration_depth_mm=round(pen_depth, 4),
+            thermal_reduction_pct=round(thermal, 2),
+            chip_evacuation_score=round(chip_evac, 2),
+            lubrication_score=round(lube, 2),
+            overall_effectiveness=round(overall, 2),
+        )
+
+    # ------------------------------------------------------------------
+    # Nozzle position recommendation
+    # ------------------------------------------------------------------
+
+    def recommend_nozzle_position(
+        self,
+        tool_diameter: float,
+        operation: str = 'general',
+    ) -> Dict[str, float]:
+        """Suggest optimal nozzle angle and distance for a given tool and
+        operation type.
+
+        Parameters
+        ----------
+        tool_diameter:
+            Tool diameter in mm.
+        operation:
+            One of 'general', 'drilling', 'slotting', 'finishing',
+            'roughing', 'threading'.
+
+        Returns
+        -------
+        Dict with keys:
+            angle_deg, distance_mm, recommended_flow_lpm, recommended_pressure_bar,
+            recommended_nozzle_type
+        """
+        op_profiles: Dict[str, Dict[str, float]] = {
+            'general': {
+                'angle_deg': 45.0,
+                'distance_factor': 2.0,
+                'flow_factor': 1.0,
+                'pressure_bar': 10.0,
+                'nozzle_type_code': 0,  # flood
+            },
+            'drilling': {
+                'angle_deg': 0.0,
+                'distance_factor': 0.0,
+                'flow_factor': 0.8,
+                'pressure_bar': 40.0,
+                'nozzle_type_code': 2,  # through_tool
+            },
+            'slotting': {
+                'angle_deg': 30.0,
+                'distance_factor': 1.5,
+                'flow_factor': 1.3,
+                'pressure_bar': 15.0,
+                'nozzle_type_code': 0,  # flood
+            },
+            'finishing': {
+                'angle_deg': 30.0,
+                'distance_factor': 1.5,
+                'flow_factor': 0.5,
+                'pressure_bar': 5.0,
+                'nozzle_type_code': 1,  # mist
+            },
+            'roughing': {
+                'angle_deg': 45.0,
+                'distance_factor': 2.5,
+                'flow_factor': 1.5,
+                'pressure_bar': 20.0,
+                'nozzle_type_code': 0,  # flood
+            },
+            'threading': {
+                'angle_deg': 15.0,
+                'distance_factor': 1.0,
+                'flow_factor': 0.7,
+                'pressure_bar': 30.0,
+                'nozzle_type_code': 3,  # jet
+            },
+        }
+
+        type_map = {0: 'flood', 1: 'mist', 2: 'through_tool', 3: 'jet'}
+        profile = op_profiles.get(operation, op_profiles['general'])
+
+        distance_mm = tool_diameter * profile['distance_factor']
+        recommended_flow = 10.0 * profile['flow_factor']
+
+        return {
+            'angle_deg': profile['angle_deg'],
+            'distance_mm': round(distance_mm, 2),
+            'recommended_flow_lpm': round(recommended_flow, 2),
+            'recommended_pressure_bar': profile['pressure_bar'],
+            'recommended_nozzle_type': type_map[int(profile['nozzle_type_code'])],
+        }
+
+    # ------------------------------------------------------------------
+    # Required flow rate calculation
+    # ------------------------------------------------------------------
+
+    def calculate_required_flow(
+        self,
+        tool_diameter: float,
+        cutting_speed: float,
+        material: str = 'steel',
+    ) -> float:
+        """Calculate the minimum coolant flow rate in LPM for effective cooling.
+
+        Uses a simplified model based on tool diameter, cutting speed, and
+        material thermal conductivity.
+
+        Parameters
+        ----------
+        tool_diameter:
+            Tool diameter in mm.
+        cutting_speed:
+            Cutting speed in m/min.
+        material:
+            Material name. Supported: 'steel', 'aluminum', 'titanium',
+            'stainless', 'cast_iron', 'inconel'.
+
+        Returns
+        -------
+        float:
+            Minimum recommended flow rate in liters per minute.
+        """
+        # Material heat factors (higher = needs more coolant)
+        heat_factors: Dict[str, float] = {
+            'steel': 1.0,
+            'aluminum': 0.7,
+            'titanium': 1.8,
+            'stainless': 1.3,
+            'cast_iron': 0.9,
+            'inconel': 2.0,
+        }
+
+        hf = heat_factors.get(material.lower(), 1.0)
+
+        # Base flow: proportional to cutting area proxy (diameter * speed)
+        base_flow = 0.02 * tool_diameter * cutting_speed * hf
+        # Minimum 2 LPM regardless
+        return round(max(2.0, base_flow), 2)
+
+    # ------------------------------------------------------------------
+    # Through-tool coolant effectiveness
+    # ------------------------------------------------------------------
+
+    def get_through_tool_effectiveness(
+        self,
+        pressure_bar: float,
+        hole_diameter: float,
+        depth: float,
+    ) -> CoolantEffectiveness:
+        """Evaluate through-tool coolant delivery effectiveness for drilling.
+
+        Through-tool coolant is critical for deep-hole drilling where
+        external nozzles cannot reach.
+
+        Parameters
+        ----------
+        pressure_bar:
+            Coolant pressure in bar.
+        hole_diameter:
+            Drill/hole diameter in mm.
+        depth:
+            Hole depth in mm.
+
+        Returns
+        -------
+        CoolantEffectiveness
+        """
+        if hole_diameter <= 0:
+            raise ValueError("hole_diameter must be > 0")
+        if depth < 0:
+            raise ValueError("depth must be >= 0")
+
+        aspect_ratio = depth / hole_diameter if hole_diameter > 0 else 0.0
+
+        # Pressure effectiveness decays with aspect ratio
+        pressure_factor = min(1.0, pressure_bar / 70.0)
+        depth_penalty = max(0.0, 1.0 - aspect_ratio / 20.0)
+        effective_pressure = pressure_factor * depth_penalty
+
+        # Coverage is high for through-tool by design
+        coverage_pct = min(100.0, 85.0 * effective_pressure + 10.0)
+
+        # Penetration: through-tool always reaches full depth at sufficient
+        # pressure
+        penetration_depth_mm = depth * min(1.0, pressure_factor)
+
+        # Thermal reduction: very effective when pressure is adequate
+        thermal_reduction_pct = min(100.0, 80.0 * effective_pressure + 5.0)
+
+        # Chip evacuation is the primary advantage of through-tool coolant
+        chip_evacuation_score = min(
+            100.0,
+            90.0 * pressure_factor * max(0.3, depth_penalty) + 5.0,
+        )
+
+        lubrication_score = min(100.0, 75.0 * pressure_factor + 10.0)
+
+        overall = (
+            coverage_pct * 0.20
+            + thermal_reduction_pct * 0.25
+            + chip_evacuation_score * 0.30
+            + lubrication_score * 0.15
+            + (penetration_depth_mm / max(depth, 0.01)) * 100.0 * 0.10
+        )
+        overall = min(100.0, max(0.0, overall))
+
+        return CoolantEffectiveness(
+            coverage_pct=round(coverage_pct, 2),
+            penetration_depth_mm=round(penetration_depth_mm, 4),
+            thermal_reduction_pct=round(thermal_reduction_pct, 2),
+            chip_evacuation_score=round(chip_evacuation_score, 2),
+            lubrication_score=round(lubrication_score, 2),
+            overall_effectiveness=round(overall, 2),
+        )

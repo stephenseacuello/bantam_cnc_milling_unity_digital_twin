@@ -1311,6 +1311,273 @@ class AlertCorrelatorNode(MiracleLifecycleNode):
         return self._fleet_alert_count
 
 
+# ---------------------------------------------------------------------------
+# Alarm Analytics Engine
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AlarmHistoryEntry:
+    """A single historical alarm record."""
+    alarm_id: str
+    alarm_type: str
+    machine_id: str
+    severity: float
+    timestamp: float
+    duration_sec: float
+    acknowledged: bool
+    root_cause: str
+
+
+@dataclass
+class AlarmTrendAnalysis:
+    """Trend analysis for a specific alarm type over time periods."""
+    alarm_type: str
+    count_trend: List[int]
+    avg_severity_trend: List[float]
+    period_labels: List[str]
+    increasing: bool
+
+
+@dataclass
+class AlarmAnalyticsSummary:
+    """Summary statistics for alarm history over a time range."""
+    total_alarms: int
+    unique_types: int
+    avg_response_time_sec: float
+    top_alarm_types: List[Tuple[str, int]]
+    top_machines: List[Tuple[str, int]]
+    alarm_rate_per_hour: float
+    repeat_alarm_pct: float
+
+
+class AlarmAnalyticsEngine:
+    """Historical alarm analytics and pattern mining engine.
+
+    Stores alarm history entries and provides analytical queries including
+    summaries, trend analysis, repeat-alarm detection, mean-time-to-respond,
+    and alarm heatmaps.
+    """
+
+    def __init__(self) -> None:
+        self._history: List[AlarmHistoryEntry] = []
+        self._lock = threading.Lock()
+
+    # -- recording ---------------------------------------------------------
+
+    def record_alarm(self, entry: AlarmHistoryEntry) -> None:
+        """Store an alarm history entry."""
+        with self._lock:
+            self._history.append(entry)
+
+    # -- summary -----------------------------------------------------------
+
+    def get_summary(
+        self, start_time: float, end_time: float
+    ) -> AlarmAnalyticsSummary:
+        """Generate an :class:`AlarmAnalyticsSummary` for *[start_time, end_time]*."""
+        with self._lock:
+            entries = [
+                e for e in self._history
+                if start_time <= e.timestamp <= end_time
+            ]
+
+        total = len(entries)
+        if total == 0:
+            return AlarmAnalyticsSummary(
+                total_alarms=0,
+                unique_types=0,
+                avg_response_time_sec=0.0,
+                top_alarm_types=[],
+                top_machines=[],
+                alarm_rate_per_hour=0.0,
+                repeat_alarm_pct=0.0,
+            )
+
+        # Unique types
+        type_counts: Dict[str, int] = {}
+        machine_counts: Dict[str, int] = {}
+        for e in entries:
+            type_counts[e.alarm_type] = type_counts.get(e.alarm_type, 0) + 1
+            machine_counts[e.machine_id] = machine_counts.get(e.machine_id, 0) + 1
+
+        unique_types = len(type_counts)
+
+        # Average response time (duration_sec for acknowledged alarms)
+        ack_durations = [e.duration_sec for e in entries if e.acknowledged]
+        avg_response = (
+            sum(ack_durations) / len(ack_durations) if ack_durations else 0.0
+        )
+
+        # Top alarm types / machines (sorted descending by count)
+        top_alarm_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+        top_machines = sorted(machine_counts.items(), key=lambda x: x[1], reverse=True)
+
+        # Rate
+        span_hours = max((end_time - start_time) / 3600.0, 1e-9)
+        alarm_rate = total / span_hours
+
+        # Repeat alarm percentage: alarms whose (alarm_type, machine_id) pair
+        # appears more than once in the window.
+        pair_counts: Dict[Tuple[str, str], int] = {}
+        for e in entries:
+            key = (e.alarm_type, e.machine_id)
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+        repeat_count = sum(c for c in pair_counts.values() if c > 1)
+        repeat_pct = (repeat_count / total) * 100.0 if total else 0.0
+
+        return AlarmAnalyticsSummary(
+            total_alarms=total,
+            unique_types=unique_types,
+            avg_response_time_sec=avg_response,
+            top_alarm_types=top_alarm_types,
+            top_machines=top_machines,
+            alarm_rate_per_hour=alarm_rate,
+            repeat_alarm_pct=repeat_pct,
+        )
+
+    # -- trend analysis ----------------------------------------------------
+
+    def get_trend(
+        self,
+        alarm_type: str,
+        periods: int = 5,
+        period_duration_sec: float = 3600.0,
+    ) -> AlarmTrendAnalysis:
+        """Analyse alarm count and severity trend over *periods* windows.
+
+        Windows are defined backwards from the most recent alarm of *alarm_type*
+        (or from the latest alarm overall when none of the requested type exist).
+        """
+        with self._lock:
+            typed = [e for e in self._history if e.alarm_type == alarm_type]
+
+        if not typed:
+            return AlarmTrendAnalysis(
+                alarm_type=alarm_type,
+                count_trend=[0] * periods,
+                avg_severity_trend=[0.0] * periods,
+                period_labels=[f"P{i}" for i in range(periods)],
+                increasing=False,
+            )
+
+        latest_ts = max(e.timestamp for e in typed)
+
+        count_trend: List[int] = []
+        severity_trend: List[float] = []
+        labels: List[str] = []
+
+        for i in range(periods - 1, -1, -1):
+            p_start = latest_ts - (i + 1) * period_duration_sec
+            p_end = latest_ts - i * period_duration_sec
+            bucket = [e for e in typed if p_start <= e.timestamp < p_end]
+            count_trend.append(len(bucket))
+            if bucket:
+                severity_trend.append(
+                    sum(e.severity for e in bucket) / len(bucket)
+                )
+            else:
+                severity_trend.append(0.0)
+            labels.append(f"P{periods - i - 1}")
+
+        # Determine if increasing (simple linear check on counts)
+        increasing = False
+        if len(count_trend) >= 2:
+            first_half = count_trend[: len(count_trend) // 2]
+            second_half = count_trend[len(count_trend) // 2:]
+            if sum(second_half) > sum(first_half):
+                increasing = True
+
+        return AlarmTrendAnalysis(
+            alarm_type=alarm_type,
+            count_trend=count_trend,
+            avg_severity_trend=severity_trend,
+            period_labels=labels,
+            increasing=increasing,
+        )
+
+    # -- repeat alarms -----------------------------------------------------
+
+    def get_repeat_alarms(
+        self, window_sec: float = 300.0
+    ) -> List[List[AlarmHistoryEntry]]:
+        """Find groups of alarms with the same type on the same machine within *window_sec*.
+
+        Returns a list of groups, each group being a list of related entries.
+        """
+        with self._lock:
+            entries = list(self._history)
+
+        # Group by (alarm_type, machine_id)
+        groups: Dict[Tuple[str, str], List[AlarmHistoryEntry]] = {}
+        for e in entries:
+            key = (e.alarm_type, e.machine_id)
+            groups.setdefault(key, []).append(e)
+
+        result: List[List[AlarmHistoryEntry]] = []
+        for _key, group in groups.items():
+            if len(group) < 2:
+                continue
+            # Sort by timestamp
+            group.sort(key=lambda x: x.timestamp)
+            # Find clusters within window_sec
+            cluster: List[AlarmHistoryEntry] = [group[0]]
+            for i in range(1, len(group)):
+                if group[i].timestamp - cluster[0].timestamp <= window_sec:
+                    cluster.append(group[i])
+                else:
+                    if len(cluster) >= 2:
+                        result.append(cluster)
+                    cluster = [group[i]]
+            if len(cluster) >= 2:
+                result.append(cluster)
+
+        return result
+
+    # -- MTTR (mean time to respond / acknowledge) -------------------------
+
+    def get_mttr(self, alarm_type: Optional[str] = None) -> float:
+        """Mean time to respond (duration_sec for acknowledged alarms).
+
+        If *alarm_type* is given, restrict to that type.  Returns 0.0 when
+        no acknowledged alarms exist.
+        """
+        with self._lock:
+            entries = list(self._history)
+
+        if alarm_type is not None:
+            entries = [e for e in entries if e.alarm_type == alarm_type]
+
+        ack = [e.duration_sec for e in entries if e.acknowledged]
+        return sum(ack) / len(ack) if ack else 0.0
+
+    # -- heatmap -----------------------------------------------------------
+
+    def get_alarm_heatmap(
+        self,
+        machines: List[str],
+        alarm_types: List[str],
+    ) -> List[List[int]]:
+        """Build a matrix of alarm counts — rows=machines, cols=alarm_types.
+
+        Returns a list-of-lists where ``result[i][j]`` is the alarm count for
+        ``machines[i]`` and ``alarm_types[j]``.
+        """
+        with self._lock:
+            entries = list(self._history)
+
+        # Pre-compute counts
+        pair_counts: Dict[Tuple[str, str], int] = {}
+        for e in entries:
+            key = (e.machine_id, e.alarm_type)
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+
+        return [
+            [pair_counts.get((m, t), 0) for t in alarm_types]
+            for m in machines
+        ]
+
+
 def main(args=None):
     """Entry point for the alert correlator node."""
     import rclpy

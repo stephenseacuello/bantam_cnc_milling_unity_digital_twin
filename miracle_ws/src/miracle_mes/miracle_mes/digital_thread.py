@@ -1906,6 +1906,211 @@ class SPCRunRulesEngine:
         return violations
 
 
+# ------------------------------------------------------------------
+# Scrap / Reject Tracking
+# ------------------------------------------------------------------
+
+
+@dataclass
+class ScrapEvent:
+    """A single scrap or reject event."""
+
+    event_id: str
+    part_id: str
+    job_id: str
+    machine_id: str
+    reason_code: str
+    reason_description: str
+    timestamp: float
+    quantity: int
+    material_cost: float
+    labor_cost: float
+    operation: str
+    is_reworkable: bool
+
+
+@dataclass
+class ScrapSummary:
+    """Aggregated scrap summary over a time window."""
+
+    total_scrap_count: int
+    total_cost: float
+    scrap_rate_pct: float
+    top_reasons: List[Tuple[str, int, float]]
+    by_machine: Dict[str, int]
+    by_operation: Dict[str, int]
+    rework_pct: float
+
+
+class ScrapTracker:
+    """Tracks scrap / reject parts with reason codes and cost analysis.
+
+    Provides Pareto analysis, trend reporting, cost-of-poor-quality
+    calculation, and rework candidate identification.
+    """
+
+    def __init__(self) -> None:
+        self._events: List[ScrapEvent] = []
+        self._lock = threading.Lock()
+
+    # -- recording ---------------------------------------------------
+
+    def record_scrap(self, event: ScrapEvent) -> None:
+        """Record a scrap event."""
+        with self._lock:
+            self._events.append(event)
+
+    # -- querying ----------------------------------------------------
+
+    def get_summary(
+        self,
+        start_time: float,
+        end_time: float,
+        total_parts_produced: int,
+    ) -> ScrapSummary:
+        """Generate a :class:`ScrapSummary` for the given time window."""
+        with self._lock:
+            window = [
+                e for e in self._events
+                if start_time <= e.timestamp <= end_time
+            ]
+
+        total_scrap = sum(e.quantity for e in window)
+        total_cost = sum(e.material_cost + e.labor_cost for e in window)
+
+        if total_parts_produced > 0:
+            scrap_rate = (total_scrap / total_parts_produced) * 100.0
+        else:
+            scrap_rate = 0.0
+
+        # Top reasons by count
+        reason_counts: Dict[str, int] = {}
+        reason_costs: Dict[str, float] = {}
+        for e in window:
+            reason_counts[e.reason_code] = reason_counts.get(e.reason_code, 0) + e.quantity
+            reason_costs[e.reason_code] = reason_costs.get(e.reason_code, 0.0) + e.material_cost + e.labor_cost
+        top_reasons = sorted(
+            [(rc, reason_counts[rc], reason_costs[rc]) for rc in reason_counts],
+            key=lambda t: t[1],
+            reverse=True,
+        )
+
+        by_machine: Dict[str, int] = {}
+        for e in window:
+            by_machine[e.machine_id] = by_machine.get(e.machine_id, 0) + e.quantity
+
+        by_operation: Dict[str, int] = {}
+        for e in window:
+            by_operation[e.operation] = by_operation.get(e.operation, 0) + e.quantity
+
+        rework_count = sum(e.quantity for e in window if e.is_reworkable)
+        rework_pct = (rework_count / total_scrap * 100.0) if total_scrap > 0 else 0.0
+
+        return ScrapSummary(
+            total_scrap_count=total_scrap,
+            total_cost=total_cost,
+            scrap_rate_pct=scrap_rate,
+            top_reasons=top_reasons,
+            by_machine=by_machine,
+            by_operation=by_operation,
+            rework_pct=rework_pct,
+        )
+
+    def get_scrap_by_reason(self, reason_code: str) -> List[ScrapEvent]:
+        """Return all scrap events matching *reason_code*."""
+        with self._lock:
+            return [e for e in self._events if e.reason_code == reason_code]
+
+    def get_pareto_analysis(self, top_n: int = 5) -> List[Tuple[str, float, float]]:
+        """Pareto analysis of scrap reasons by cost.
+
+        Returns a list of ``(reason_code, cost, cumulative_pct)`` tuples
+        sorted by descending cost, limited to *top_n* entries.
+        """
+        with self._lock:
+            events = list(self._events)
+
+        reason_costs: Dict[str, float] = {}
+        for e in events:
+            reason_costs[e.reason_code] = reason_costs.get(e.reason_code, 0.0) + e.material_cost + e.labor_cost
+
+        sorted_reasons = sorted(reason_costs.items(), key=lambda t: t[1], reverse=True)
+        total_cost = sum(c for _, c in sorted_reasons) if sorted_reasons else 1.0
+
+        result: List[Tuple[str, float, float]] = []
+        cumulative = 0.0
+        for reason, cost in sorted_reasons[:top_n]:
+            cumulative += cost
+            result.append((reason, cost, (cumulative / total_cost) * 100.0))
+        return result
+
+    def get_scrap_trend(
+        self,
+        periods: int,
+        period_duration_sec: float,
+    ) -> List[Tuple[float, int]]:
+        """Return scrap count per period.
+
+        *periods* buckets are created, each spanning *period_duration_sec*
+        seconds, ending at the latest event timestamp.  Returns a list
+        of ``(period_start, scrap_count)`` tuples.
+        """
+        with self._lock:
+            events = list(self._events)
+
+        if not events:
+            return []
+
+        latest = max(e.timestamp for e in events)
+        overall_start = latest - periods * period_duration_sec
+
+        buckets: List[Tuple[float, int]] = []
+        for i in range(periods):
+            bucket_start = overall_start + i * period_duration_sec
+            bucket_end = bucket_start + period_duration_sec
+            is_last = (i == periods - 1)
+            count = sum(
+                e.quantity for e in events
+                if bucket_start <= e.timestamp < bucket_end
+                or (is_last and e.timestamp == bucket_end)
+            )
+            buckets.append((bucket_start, count))
+        return buckets
+
+    def get_cost_of_poor_quality(
+        self,
+        start_time: float,
+        end_time: float,
+    ) -> Dict[str, float]:
+        """Total cost of poor quality (COPQ) in the given window.
+
+        Returns a dict with ``scrap_cost``, ``rework_cost``, and
+        ``total_copq`` keys.
+        """
+        with self._lock:
+            window = [
+                e for e in self._events
+                if start_time <= e.timestamp <= end_time
+            ]
+
+        scrap_cost = sum(
+            e.material_cost + e.labor_cost for e in window if not e.is_reworkable
+        )
+        rework_cost = sum(
+            e.labor_cost for e in window if e.is_reworkable
+        )
+        return {
+            'scrap_cost': scrap_cost,
+            'rework_cost': rework_cost,
+            'total_copq': scrap_cost + rework_cost,
+        }
+
+    def get_rework_candidates(self) -> List[ScrapEvent]:
+        """Return all reworkable scrap events."""
+        with self._lock:
+            return [e for e in self._events if e.is_reworkable]
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

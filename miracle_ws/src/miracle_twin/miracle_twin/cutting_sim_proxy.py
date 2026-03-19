@@ -4960,3 +4960,190 @@ class ChipEvacuationModel:
             return 90.0  # degenerate case
         phi = math.atan2(numerator, denominator)
         return round(math.degrees(phi), 4)
+
+
+# ---------------------------------------------------------------------------
+# Spindle Torque Limiter
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TorqueReading:
+    """A single spindle torque measurement."""
+    timestamp: float
+    torque_nm: float
+    rpm: float
+    power_kw: float
+
+
+@dataclass
+class TorqueLimit:
+    """Configurable torque threshold with associated action."""
+    max_torque_nm: float
+    warning_pct: float = 80.0
+    critical_pct: float = 95.0
+    action: str = 'reduce_feed'  # 'reduce_feed' | 'stop' | 'alarm'
+
+
+@dataclass
+class TorqueStatus:
+    """Current torque status relative to the configured limit."""
+    current_torque_nm: float
+    limit_nm: float
+    utilization_pct: float
+    status: str  # 'normal' | 'warning' | 'critical' | 'overload'
+    recommended_feed_pct: float
+
+
+_TORQUE_CONSTANT = 9549.0  # P(kW) = T(Nm) * RPM / 9549
+
+
+class SpindleTorqueLimiter:
+    """Monitors and limits spindle torque to protect the machine and workpiece.
+
+    Provides real-time torque tracking, limit enforcement, and feed-rate
+    reduction recommendations based on configurable thresholds.
+    """
+
+    def __init__(self) -> None:
+        self._limit: Optional[TorqueLimit] = None
+        self._readings: List[TorqueReading] = []
+
+    # -- configuration ------------------------------------------------------
+
+    def set_limit(self, limit: TorqueLimit) -> None:
+        """Set the torque limit configuration."""
+        if limit.max_torque_nm <= 0:
+            raise ValueError("max_torque_nm must be positive")
+        if not (0 < limit.warning_pct < limit.critical_pct <= 100):
+            raise ValueError(
+                "warning_pct must be less than critical_pct and both in (0, 100]"
+            )
+        if limit.action not in ('reduce_feed', 'stop', 'alarm'):
+            raise ValueError(
+                f"Invalid action '{limit.action}'; "
+                "must be 'reduce_feed', 'stop', or 'alarm'"
+            )
+        self._limit = limit
+
+    # -- recording ----------------------------------------------------------
+
+    def record_reading(self, reading: TorqueReading) -> TorqueStatus:
+        """Store a torque reading and return the current status.
+
+        The reading is always appended.  If a limit has been configured the
+        returned ``TorqueStatus`` reflects the current state against that
+        limit; otherwise a default *normal* status is returned.
+        """
+        self._readings.append(reading)
+        return self.get_status()
+
+    # -- queries ------------------------------------------------------------
+
+    def get_status(self) -> TorqueStatus:
+        """Return the current ``TorqueStatus`` based on the latest reading."""
+        if not self._readings:
+            return TorqueStatus(
+                current_torque_nm=0.0,
+                limit_nm=self._limit.max_torque_nm if self._limit else 0.0,
+                utilization_pct=0.0,
+                status='normal',
+                recommended_feed_pct=100.0,
+            )
+
+        current = self._readings[-1].torque_nm
+
+        if self._limit is None:
+            return TorqueStatus(
+                current_torque_nm=current,
+                limit_nm=0.0,
+                utilization_pct=0.0,
+                status='normal',
+                recommended_feed_pct=100.0,
+            )
+
+        limit_nm = self._limit.max_torque_nm
+        utilization = (current / limit_nm) * 100.0 if limit_nm > 0 else 0.0
+
+        if utilization > 100.0:
+            status = 'overload'
+        elif utilization >= self._limit.critical_pct:
+            status = 'critical'
+        elif utilization >= self._limit.warning_pct:
+            status = 'warning'
+        else:
+            status = 'normal'
+
+        # Recommended feed: when in warning or above, scale feed down so
+        # that torque would drop to the middle of the normal band.
+        if status == 'normal':
+            recommended_feed_pct = 100.0
+        else:
+            target_pct = self._limit.warning_pct * 0.9  # aim for 90% of warning
+            recommended_feed_pct = max(
+                0.0, min(100.0, (target_pct / utilization) * 100.0)
+            )
+
+        return TorqueStatus(
+            current_torque_nm=round(current, 4),
+            limit_nm=round(limit_nm, 4),
+            utilization_pct=round(utilization, 4),
+            status=status,
+            recommended_feed_pct=round(recommended_feed_pct, 4),
+        )
+
+    # -- calculations -------------------------------------------------------
+
+    @staticmethod
+    def calculate_torque(power_kw: float, rpm: float) -> float:
+        """Calculate torque from power and RPM.
+
+        T = P * 9549 / RPM   (Nm)
+        """
+        if rpm == 0:
+            return 0.0
+        return (power_kw * _TORQUE_CONSTANT) / rpm
+
+    @staticmethod
+    def calculate_power(torque_nm: float, rpm: float) -> float:
+        """Calculate power from torque and RPM.
+
+        P = T * RPM / 9549   (kW)
+        """
+        return (torque_nm * rpm) / _TORQUE_CONSTANT
+
+    def get_feed_reduction(
+        self, current_torque: float, target_pct: float
+    ) -> float:
+        """Return the recommended feed percentage to reach *target_pct* of the limit.
+
+        Parameters
+        ----------
+        current_torque : float
+            Current torque in Nm.
+        target_pct : float
+            Desired torque as a percentage of the configured limit.
+
+        Returns
+        -------
+        float
+            Feed rate as a percentage of current feed (0-100).
+        """
+        if self._limit is None:
+            return 100.0
+        if current_torque <= 0:
+            return 100.0
+        target_torque = self._limit.max_torque_nm * (target_pct / 100.0)
+        reduction = (target_torque / current_torque) * 100.0
+        return round(max(0.0, min(100.0, reduction)), 4)
+
+    # -- history ------------------------------------------------------------
+
+    def get_torque_history(self, last_n: int = 10) -> List[TorqueReading]:
+        """Return the most recent *last_n* readings."""
+        return list(self._readings[-last_n:])
+
+    def get_peak_torque(self) -> Optional[TorqueReading]:
+        """Return the reading with the maximum torque, or ``None``."""
+        if not self._readings:
+            return None
+        return max(self._readings, key=lambda r: r.torque_nm)

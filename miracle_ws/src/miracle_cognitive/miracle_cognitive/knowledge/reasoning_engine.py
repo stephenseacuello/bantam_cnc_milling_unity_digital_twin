@@ -1802,6 +1802,324 @@ class CausalImpactAnalyzer:
         )
 
 
+# ---------------------------------------------------------------------------
+# Feature Importance Ranker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FeatureScore:
+    """Importance score for a single input feature."""
+    feature_name: str
+    importance_score: float
+    rank: int
+    correlation: float
+    direction: str  # 'positive' | 'negative' | 'neutral'
+
+
+@dataclass
+class ImportanceReport:
+    """Full report of feature importance analysis."""
+    features: List[FeatureScore]
+    target_metric: str
+    method: str
+    total_features: int
+    timestamp: float
+
+
+class FeatureImportanceRanker:
+    """Ranks input features by their importance to manufacturing outcomes.
+
+    Supports three methods for computing feature importance:
+
+    * **correlation** -- Pearson |r| between each feature and the target.
+    * **mutual_information** -- Binned mutual-information approximation.
+    * **permutation** -- Measures how much target variance increases when a
+      feature column is randomly shuffled.
+
+    Typical usage::
+
+        ranker = FeatureImportanceRanker()
+        ranker.train(data, target)
+        top = ranker.rank_features(top_n=5)
+    """
+
+    _VALID_METHODS = ('correlation', 'mutual_information', 'permutation')
+
+    def __init__(self, method: str = 'permutation', n_bins: int = 10,
+                 n_repeats: int = 5, seed: int = 42) -> None:
+        self._method = method
+        self._n_bins = n_bins
+        self._n_repeats = n_repeats
+        self._seed = seed
+        self._data: Dict[str, List[float]] = {}
+        self._target: List[float] = []
+        self._scores: Dict[str, FeatureScore] = {}
+        self._trained = False
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pearson(xs: List[float], ys: List[float]) -> float:
+        """Pearson correlation coefficient.  Returns 0.0 on degenerate input."""
+        n = len(xs)
+        if n < 2 or n != len(ys):
+            return 0.0
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+        var_x = sum((x - mean_x) ** 2 for x in xs)
+        var_y = sum((y - mean_y) ** 2 for y in ys)
+        denom = math.sqrt(var_x * var_y)
+        if denom == 0.0:
+            return 0.0
+        return cov / denom
+
+    @staticmethod
+    def _variance(values: List[float]) -> float:
+        """Population variance of *values*."""
+        n = len(values)
+        if n == 0:
+            return 0.0
+        mean = sum(values) / n
+        return sum((v - mean) ** 2 for v in values) / n
+
+    def _bin_values(self, values: List[float]) -> List[int]:
+        """Assign each value to an equal-width bin index."""
+        lo = min(values)
+        hi = max(values)
+        if hi == lo:
+            return [0] * len(values)
+        width = (hi - lo) / self._n_bins
+        return [min(int((v - lo) / width), self._n_bins - 1) for v in values]
+
+    def _mutual_information(self, xs: List[float], ys: List[float]) -> float:
+        """Binned mutual-information approximation."""
+        n = len(xs)
+        if n < 2:
+            return 0.0
+        bx = self._bin_values(xs)
+        by = self._bin_values(ys)
+
+        # Joint and marginal counts
+        joint: Dict[Tuple[int, int], int] = {}
+        cx: Dict[int, int] = {}
+        cy: Dict[int, int] = {}
+        for i in range(n):
+            key = (bx[i], by[i])
+            joint[key] = joint.get(key, 0) + 1
+            cx[bx[i]] = cx.get(bx[i], 0) + 1
+            cy[by[i]] = cy.get(by[i], 0) + 1
+
+        mi = 0.0
+        for (a, b), count in joint.items():
+            p_xy = count / n
+            p_x = cx[a] / n
+            p_y = cy[b] / n
+            if p_xy > 0 and p_x > 0 and p_y > 0:
+                mi += p_xy * math.log(p_xy / (p_x * p_y))
+        return max(mi, 0.0)
+
+    def _permutation_importance(self, feature: List[float],
+                                target: List[float]) -> float:
+        """Permutation importance: mean increase in target prediction error
+        when *feature* is shuffled."""
+        import random
+        rng = random.Random(self._seed)
+        n = len(target)
+        if n < 2:
+            return 0.0
+
+        # Baseline: variance of residuals using simple linear prediction
+        r = self._pearson(feature, target)
+        baseline_var = self._variance(target) * (1.0 - r * r)
+
+        shuffled_vars: List[float] = []
+        for _ in range(self._n_repeats):
+            perm = list(feature)
+            rng.shuffle(perm)
+            r_perm = self._pearson(perm, target)
+            perm_var = self._variance(target) * (1.0 - r_perm * r_perm)
+            shuffled_vars.append(perm_var)
+
+        mean_shuffled = sum(shuffled_vars) / len(shuffled_vars)
+        target_var = self._variance(target)
+        if target_var == 0.0:
+            return 0.0
+        return max((mean_shuffled - baseline_var) / target_var, 0.0)
+
+    def _compute_importance(self, feature: List[float],
+                            target: List[float]) -> float:
+        """Compute importance score using the configured method."""
+        if self._method == 'correlation':
+            return abs(self._pearson(feature, target))
+        elif self._method == 'mutual_information':
+            return self._mutual_information(feature, target)
+        elif self._method == 'permutation':
+            return self._permutation_importance(feature, target)
+        raise ValueError(f"Unknown method: {self._method}")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def train(self, data: Dict[str, List[float]],
+              target: List[float]) -> None:
+        """Compute feature correlations and importance scores.
+
+        Parameters
+        ----------
+        data : dict
+            Mapping of feature name to list of float observations.
+        target : list of float
+            Target outcome values aligned with the feature observations.
+        """
+        if not data or not target:
+            raise ValueError("data and target must be non-empty")
+
+        n = len(target)
+        for name, values in data.items():
+            if len(values) != n:
+                raise ValueError(
+                    f"Feature '{name}' has {len(values)} samples, "
+                    f"expected {n}")
+
+        self._data = {k: list(v) for k, v in data.items()}
+        self._target = list(target)
+
+        raw_scores: Dict[str, Tuple[float, float]] = {}
+        for name, values in self._data.items():
+            corr = self._pearson(values, self._target)
+            importance = self._compute_importance(values, self._target)
+            raw_scores[name] = (importance, corr)
+
+        # Sort by importance descending to assign ranks
+        ranked = sorted(raw_scores.items(), key=lambda item: item[1][0],
+                        reverse=True)
+
+        self._scores = {}
+        for rank_idx, (name, (imp, corr)) in enumerate(ranked, start=1):
+            if abs(corr) < 0.1:
+                direction = 'neutral'
+            elif corr > 0:
+                direction = 'positive'
+            else:
+                direction = 'negative'
+            self._scores[name] = FeatureScore(
+                feature_name=name,
+                importance_score=imp,
+                rank=rank_idx,
+                correlation=corr,
+                direction=direction,
+            )
+
+        self._trained = True
+
+    def rank_features(self, top_n: Optional[int] = None) -> List[FeatureScore]:
+        """Return features sorted by importance, optionally limited to *top_n*.
+
+        Parameters
+        ----------
+        top_n : int or None
+            If given, only the top *top_n* features are returned.
+
+        Returns
+        -------
+        list of FeatureScore
+        """
+        if not self._trained:
+            raise RuntimeError("Must call train() before rank_features()")
+        ordered = sorted(self._scores.values(), key=lambda s: s.rank)
+        if top_n is not None:
+            ordered = ordered[:top_n]
+        return ordered
+
+    def get_importance(self, feature_name: str) -> FeatureScore:
+        """Return the :class:`FeatureScore` for a specific feature.
+
+        Raises
+        ------
+        KeyError
+            If the feature was not part of the training data.
+        """
+        if not self._trained:
+            raise RuntimeError("Must call train() before get_importance()")
+        if feature_name not in self._scores:
+            raise KeyError(f"Unknown feature: {feature_name}")
+        return self._scores[feature_name]
+
+    def get_report(self, target_metric_name: str) -> ImportanceReport:
+        """Generate a full :class:`ImportanceReport`.
+
+        Parameters
+        ----------
+        target_metric_name : str
+            Human-readable name of the target metric (stored in the report).
+
+        Returns
+        -------
+        ImportanceReport
+        """
+        if not self._trained:
+            raise RuntimeError("Must call train() before get_report()")
+        features = self.rank_features()
+        return ImportanceReport(
+            features=features,
+            target_metric=target_metric_name,
+            method=self._method,
+            total_features=len(features),
+            timestamp=time.time(),
+        )
+
+    def compare_features(self, feature_a: str,
+                         feature_b: str) -> Dict[str, Any]:
+        """Compare two features' relative importance.
+
+        Returns a dict with keys: ``feature_a``, ``feature_b``,
+        ``more_important``, ``importance_difference``, and
+        ``correlation_difference``.
+        """
+        if not self._trained:
+            raise RuntimeError("Must call train() before compare_features()")
+        sa = self.get_importance(feature_a)
+        sb = self.get_importance(feature_b)
+        if sa.importance_score >= sb.importance_score:
+            more_important = feature_a
+        else:
+            more_important = feature_b
+        return {
+            'feature_a': sa,
+            'feature_b': sb,
+            'more_important': more_important,
+            'importance_difference': abs(sa.importance_score - sb.importance_score),
+            'correlation_difference': abs(sa.correlation - sb.correlation),
+        }
+
+    def identify_redundant_features(
+        self, threshold: float = 0.9,
+    ) -> List[Tuple[str, str, float]]:
+        """Find highly correlated feature pairs.
+
+        Returns a list of ``(feature_a, feature_b, |r|)`` tuples where the
+        absolute Pearson correlation exceeds *threshold*.
+        """
+        if not self._trained:
+            raise RuntimeError(
+                "Must call train() before identify_redundant_features()")
+        names = list(self._data.keys())
+        pairs: List[Tuple[str, str, float]] = []
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                r = abs(self._pearson(self._data[names[i]],
+                                      self._data[names[j]]))
+                if r > threshold:
+                    pairs.append((names[i], names[j], r))
+        pairs.sort(key=lambda t: t[2], reverse=True)
+        return pairs
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

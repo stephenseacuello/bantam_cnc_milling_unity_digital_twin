@@ -2897,3 +2897,206 @@ class BulkheadIsolator:
         if partition is None:
             raise KeyError(f"No bulkhead named '{name}'")
         return partition
+
+
+# ---------------------------------------------------------------------------
+# Health Check Endpoint Manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HealthCheck:
+    """Result of a single health check probe."""
+    service_id: str
+    check_name: str
+    status: str            # 'healthy' | 'degraded' | 'unhealthy'
+    message: str
+    timestamp: float
+    latency_ms: float
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HealthCheckConfig:
+    """Configuration for health-checking a service."""
+    service_id: str
+    check_interval_sec: float = 30.0
+    timeout_sec: float = 5.0
+    healthy_threshold: int = 3
+    unhealthy_threshold: int = 2
+
+
+@dataclass
+class SystemHealthReport:
+    """Snapshot of overall system health."""
+    timestamp: float
+    overall_status: str
+    services: Dict[str, HealthCheck] = field(default_factory=dict)
+    healthy_count: int = 0
+    total_count: int = 0
+    uptime_pct: float = 100.0
+
+
+class HealthCheckManager:
+    """Manages health check endpoints for all system services.
+
+    Features
+    --------
+    * Register services with individual health-check configuration.
+    * Record incoming health-check results and track history.
+    * Flap detection – if a service's status changes more than 3 times in 60
+      seconds it is automatically marked ``'degraded'``.
+    * Query individual or aggregate health status.
+    * Calculate per-service uptime over a sliding time window.
+    """
+
+    _FLAP_WINDOW_SEC: float = 60.0
+    _FLAP_THRESHOLD: int = 3
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # service_id -> HealthCheckConfig
+        self._configs: Dict[str, HealthCheckConfig] = {}
+        # service_id -> list of HealthCheck (most recent last)
+        self._history: Dict[str, List[HealthCheck]] = {}
+
+    # -- registration -------------------------------------------------------
+
+    def register_service(self, config: HealthCheckConfig) -> None:
+        """Register a service for health checking."""
+        with self._lock:
+            self._configs[config.service_id] = config
+            if config.service_id not in self._history:
+                self._history[config.service_id] = []
+
+    # -- recording ----------------------------------------------------------
+
+    def record_check(self, check: HealthCheck) -> None:
+        """Record a health check result for a service."""
+        with self._lock:
+            if check.service_id not in self._configs:
+                raise KeyError(
+                    f"Service '{check.service_id}' is not registered"
+                )
+            self._history[check.service_id].append(check)
+
+    # -- queries ------------------------------------------------------------
+
+    def get_service_health(self, service_id: str) -> Optional[HealthCheck]:
+        """Return the latest health status for *service_id*.
+
+        Applies flap detection: if the service's status changed more than
+        ``_FLAP_THRESHOLD`` times within the last ``_FLAP_WINDOW_SEC``
+        seconds the returned status is overridden to ``'degraded'``.
+        """
+        with self._lock:
+            history = self._history.get(service_id)
+            if not history:
+                return None
+            latest = copy.deepcopy(history[-1])
+
+        # Flap detection
+        if self._is_flapping(service_id):
+            latest.status = 'degraded'
+            latest.message = (
+                f"[flap-detected] {latest.message}"
+            )
+        return latest
+
+    def get_system_report(self) -> SystemHealthReport:
+        """Generate a ``SystemHealthReport`` covering every registered service."""
+        now = time.time()
+        services: Dict[str, HealthCheck] = {}
+        healthy_count = 0
+
+        with self._lock:
+            service_ids = list(self._configs.keys())
+
+        for sid in service_ids:
+            health = self.get_service_health(sid)
+            if health is not None:
+                services[sid] = health
+                if health.status in ('healthy', 'degraded'):
+                    healthy_count += 1
+
+        total_count = len(service_ids)
+
+        # Overall status
+        if healthy_count == total_count:
+            overall = 'healthy'
+        elif healthy_count == 0 and total_count > 0:
+            overall = 'unhealthy'
+        else:
+            overall = 'degraded'
+
+        uptime_pct = (healthy_count / total_count * 100.0) if total_count else 100.0
+
+        return SystemHealthReport(
+            timestamp=now,
+            overall_status=overall,
+            services=services,
+            healthy_count=healthy_count,
+            total_count=total_count,
+            uptime_pct=uptime_pct,
+        )
+
+    def is_system_healthy(self) -> bool:
+        """Return ``True`` if every service is ``'healthy'`` or ``'degraded'``."""
+        with self._lock:
+            service_ids = list(self._configs.keys())
+
+        for sid in service_ids:
+            health = self.get_service_health(sid)
+            if health is not None and health.status == 'unhealthy':
+                return False
+        return True
+
+    def get_unhealthy_services(self) -> List[str]:
+        """Return service IDs whose latest status is ``'unhealthy'``."""
+        result: List[str] = []
+        with self._lock:
+            service_ids = list(self._configs.keys())
+
+        for sid in service_ids:
+            health = self.get_service_health(sid)
+            if health is not None and health.status == 'unhealthy':
+                result.append(sid)
+        return result
+
+    def get_uptime(self, service_id: str, window_sec: float = 300.0) -> float:
+        """Calculate uptime percentage for *service_id* over *window_sec*.
+
+        Uptime is defined as the fraction of check results within the window
+        that reported ``'healthy'`` or ``'degraded'``.  Returns ``100.0``
+        when there are no checks in the window.
+        """
+        now = time.time()
+        cutoff = now - window_sec
+        with self._lock:
+            history = self._history.get(service_id, [])
+            window_checks = [c for c in history if c.timestamp >= cutoff]
+
+        if not window_checks:
+            return 100.0
+
+        up = sum(1 for c in window_checks if c.status in ('healthy', 'degraded'))
+        return up / len(window_checks) * 100.0
+
+    # -- internals ----------------------------------------------------------
+
+    def _is_flapping(self, service_id: str) -> bool:
+        """Detect status flapping within the flap window."""
+        now = time.time()
+        cutoff = now - self._FLAP_WINDOW_SEC
+        with self._lock:
+            history = self._history.get(service_id, [])
+            recent = [c for c in history if c.timestamp >= cutoff]
+
+        if len(recent) < 2:
+            return False
+
+        changes = 0
+        for i in range(1, len(recent)):
+            if recent[i].status != recent[i - 1].status:
+                changes += 1
+
+        return changes > self._FLAP_THRESHOLD

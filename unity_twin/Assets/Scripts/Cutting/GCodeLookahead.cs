@@ -3016,4 +3016,359 @@ namespace MiracleTwin.Cutting
             AddMove(exp, xyZ, xyR);
         }
     }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Tool Path Lead-In / Lead-Out Generator
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Describes the geometric strategy used when the tool enters or
+    /// exits material.  Each type produces a different shaped approach
+    /// move that protects the cutter and workpiece surface.
+    /// </summary>
+    public enum ApproachType
+    {
+        LINEAR,
+        ARC,
+        TANGENTIAL,
+        RAMP,
+        HELICAL
+    }
+
+    /// <summary>
+    /// A single lead-in or lead-out move primitive produced by the generator.
+    /// For arc-based types the <see cref="ArcCenter"/> and <see cref="Radius"/>
+    /// fields are populated; for ramp moves <see cref="RampAngleDeg"/> is set.
+    /// </summary>
+    [Serializable]
+    public class LeadMove
+    {
+        public Vector3 StartPoint;
+        public Vector3 EndPoint;
+        public ApproachType Approach;
+        public Vector3 ArcCenter;
+        public float Radius;
+        public float RampAngleDeg;
+
+        public LeadMove() { }
+
+        public LeadMove(Vector3 start, Vector3 end, ApproachType approach)
+        {
+            StartPoint = start;
+            EndPoint = end;
+            Approach = approach;
+        }
+    }
+
+    /// <summary>
+    /// Configuration parameters that control how lead-in / lead-out
+    /// geometry is generated.  All lengths are in millimetres, angles in degrees.
+    /// </summary>
+    [Serializable]
+    public class LeadConfig
+    {
+        public ApproachType Approach = ApproachType.ARC;
+        public float Radius = 5.0f;          // mm
+        public float RampAngle = 3.0f;       // degrees
+        public float OverlapPct = 10.0f;     // percent 0-100
+        public float HelicalPitch = 2.0f;    // mm per revolution
+
+        public LeadConfig() { }
+
+        public LeadConfig(ApproachType approach, float radius = 5.0f,
+                          float rampAngle = 3.0f, float overlapPct = 10.0f,
+                          float helicalPitch = 2.0f)
+        {
+            Approach = approach;
+            Radius = radius;
+            RampAngle = rampAngle;
+            OverlapPct = overlapPct;
+            HelicalPitch = helicalPitch;
+        }
+    }
+
+    /// <summary>
+    /// Generates smooth lead-in and lead-out approach / retract moves
+    /// so the tool never plunges straight into or pulls straight out of
+    /// the material.  Supports linear, arc, tangential, ramp and helical
+    /// entry strategies.
+    /// </summary>
+    public class LeadInOutGenerator
+    {
+        // ── Validation ──────────────────────────────────────────
+
+        /// <summary>
+        /// Validates a <see cref="LeadConfig"/>.  Returns a list of human-readable
+        /// error strings; an empty list means the config is valid.
+        /// </summary>
+        public List<string> ValidateConfig(LeadConfig config)
+        {
+            var errors = new List<string>();
+            if (config == null)
+            {
+                errors.Add("Config is null");
+                return errors;
+            }
+            if (config.Radius <= 0f)
+                errors.Add("Radius must be > 0");
+            if (config.RampAngle < 0.1f || config.RampAngle > 89.9f)
+                errors.Add("RampAngle must be between 0.1 and 89.9 degrees");
+            if (config.OverlapPct < 0f || config.OverlapPct > 100f)
+                errors.Add("OverlapPct must be between 0 and 100");
+            if (config.HelicalPitch <= 0f)
+                errors.Add("HelicalPitch must be > 0");
+            return errors;
+        }
+
+        // ── Lead-in generation ──────────────────────────────────
+
+        /// <summary>
+        /// Produces a sequence of <see cref="LeadMove"/> objects that guide
+        /// the tool from a safe position into the cut at <paramref name="entryPoint"/>.
+        /// <paramref name="cutDirection"/> is the unit vector of the first
+        /// cutting segment (XY plane).
+        /// </summary>
+        public List<LeadMove> GenerateLeadIn(Vector3 entryPoint,
+                                              Vector3 cutDirection,
+                                              LeadConfig config)
+        {
+            var moves = new List<LeadMove>();
+            var dir = cutDirection.normalized;
+            if (dir.sqrMagnitude < 1e-6f)
+                dir = Vector3.right;
+
+            switch (config.Approach)
+            {
+                case ApproachType.LINEAR:
+                    moves.Add(BuildLinearLead(entryPoint, dir, config.Radius, isLeadIn: true));
+                    break;
+
+                case ApproachType.ARC:
+                    moves.Add(BuildArcLead(entryPoint, dir, config.Radius, isLeadIn: true));
+                    break;
+
+                case ApproachType.TANGENTIAL:
+                    moves.Add(BuildTangentialLead(entryPoint, dir, config.Radius, isLeadIn: true));
+                    break;
+
+                case ApproachType.RAMP:
+                    moves.Add(BuildRampLead(entryPoint, dir, config.Radius,
+                                            config.RampAngle, isLeadIn: true));
+                    break;
+
+                case ApproachType.HELICAL:
+                    moves.AddRange(BuildHelicalLeadMoves(entryPoint, config.Radius,
+                                                         config.HelicalPitch, isLeadIn: true));
+                    break;
+            }
+
+            return moves;
+        }
+
+        // ── Lead-out generation ─────────────────────────────────
+
+        /// <summary>
+        /// Produces lead-out moves that safely retract the tool from the cut
+        /// at <paramref name="exitPoint"/> along <paramref name="cutDirection"/>.
+        /// </summary>
+        public List<LeadMove> GenerateLeadOut(Vector3 exitPoint,
+                                               Vector3 cutDirection,
+                                               LeadConfig config)
+        {
+            var moves = new List<LeadMove>();
+            var dir = cutDirection.normalized;
+            if (dir.sqrMagnitude < 1e-6f)
+                dir = Vector3.right;
+
+            switch (config.Approach)
+            {
+                case ApproachType.LINEAR:
+                    moves.Add(BuildLinearLead(exitPoint, dir, config.Radius, isLeadIn: false));
+                    break;
+
+                case ApproachType.ARC:
+                    moves.Add(BuildArcLead(exitPoint, dir, config.Radius, isLeadIn: false));
+                    break;
+
+                case ApproachType.TANGENTIAL:
+                    moves.Add(BuildTangentialLead(exitPoint, dir, config.Radius, isLeadIn: false));
+                    break;
+
+                case ApproachType.RAMP:
+                    moves.Add(BuildRampLead(exitPoint, dir, config.Radius,
+                                            config.RampAngle, isLeadIn: false));
+                    break;
+
+                case ApproachType.HELICAL:
+                    moves.AddRange(BuildHelicalLeadMoves(exitPoint, config.Radius,
+                                                         config.HelicalPitch, isLeadIn: false));
+                    break;
+            }
+
+            return moves;
+        }
+
+        // ── Helical entry for pocketing ─────────────────────────
+
+        /// <summary>
+        /// Creates a helical ramp entry suitable for pocket milling.
+        /// The tool spirals from the surface down to <paramref name="targetDepth"/>
+        /// around <paramref name="center"/> with the given <paramref name="diameter"/>
+        /// and <paramref name="pitch"/> (mm per full revolution).
+        /// Returns a list of discrete moves approximating the helix.
+        /// </summary>
+        public List<LeadMove> GenerateHelicalEntry(Vector3 center,
+                                                    float targetDepth,
+                                                    float diameter,
+                                                    float pitch)
+        {
+            var moves = new List<LeadMove>();
+            float radius = diameter * 0.5f;
+            if (radius <= 0f || pitch <= 0f) return moves;
+
+            float totalDescent = Mathf.Abs(targetDepth);
+            float revolutions = totalDescent / pitch;
+            int segments = Mathf.Max(8, Mathf.CeilToInt(revolutions * 16));
+            float angleStep = revolutions * 2f * Mathf.PI / segments;
+            float zStep = totalDescent / segments;
+
+            Vector3 prev = center + new Vector3(radius, 0f, 0f);
+            for (int i = 1; i <= segments; i++)
+            {
+                float angle = i * angleStep;
+                float z = -i * zStep;
+                Vector3 next = center + new Vector3(
+                    radius * Mathf.Cos(angle),
+                    radius * Mathf.Sin(angle),
+                    z);
+                var move = new LeadMove(prev, next, ApproachType.HELICAL)
+                {
+                    ArcCenter = center,
+                    Radius = radius
+                };
+                moves.Add(move);
+                prev = next;
+            }
+
+            return moves;
+        }
+
+        // ── Material / operation recommendation ─────────────────
+
+        /// <summary>
+        /// Suggests an <see cref="ApproachType"/> based on the material being
+        /// machined and the operation type (e.g. "profile", "pocket", "drill").
+        /// This is a heuristic lookup and may be overridden by the operator.
+        /// </summary>
+        public ApproachType GetRecommendedApproach(string material, string operation)
+        {
+            if (string.IsNullOrEmpty(material)) material = "";
+            if (string.IsNullOrEmpty(operation)) operation = "";
+
+            string mat = material.ToUpperInvariant();
+            string op  = operation.ToUpperInvariant();
+
+            // Pocketing always benefits from helical entry
+            if (op.Contains("POCKET"))
+                return ApproachType.HELICAL;
+
+            // Drilling-like operations use ramp
+            if (op.Contains("DRILL") || op.Contains("BORE"))
+                return ApproachType.RAMP;
+
+            // Hard materials: arc entry reduces shock
+            if (mat.Contains("TITANIUM") || mat.Contains("INCONEL") ||
+                mat.Contains("HARDENED") || mat.Contains("STAINLESS"))
+                return ApproachType.ARC;
+
+            // Profiling in soft metals — tangential for best finish
+            if (op.Contains("PROFILE") || op.Contains("CONTOUR"))
+                return ApproachType.TANGENTIAL;
+
+            // Default
+            return ApproachType.LINEAR;
+        }
+
+        // ── Private helpers ─────────────────────────────────────
+
+        private LeadMove BuildLinearLead(Vector3 point, Vector3 dir,
+                                          float radius, bool isLeadIn)
+        {
+            Vector3 offset = dir * radius;
+            Vector3 start = isLeadIn ? point - offset : point;
+            Vector3 end   = isLeadIn ? point : point + offset;
+            return new LeadMove(start, end, ApproachType.LINEAR) { Radius = radius };
+        }
+
+        private LeadMove BuildArcLead(Vector3 point, Vector3 dir,
+                                       float radius, bool isLeadIn)
+        {
+            // Arc perpendicular to cut direction in XY plane
+            Vector3 perp = new Vector3(-dir.y, dir.x, 0f).normalized;
+            Vector3 center = point + perp * radius;
+            Vector3 arcStart = isLeadIn ? center - dir * radius : point;
+            Vector3 arcEnd   = isLeadIn ? point : center + dir * radius;
+            return new LeadMove(arcStart, arcEnd, ApproachType.ARC)
+            {
+                ArcCenter = center,
+                Radius = radius
+            };
+        }
+
+        private LeadMove BuildTangentialLead(Vector3 point, Vector3 dir,
+                                              float radius, bool isLeadIn)
+        {
+            // 45° tangent blend into the cut direction
+            Vector3 perp = new Vector3(-dir.y, dir.x, 0f).normalized;
+            Vector3 offset = (dir + perp).normalized * radius;
+            Vector3 start = isLeadIn ? point - offset : point;
+            Vector3 end   = isLeadIn ? point : point + offset;
+            return new LeadMove(start, end, ApproachType.TANGENTIAL) { Radius = radius };
+        }
+
+        private LeadMove BuildRampLead(Vector3 point, Vector3 dir,
+                                        float radius, float angleDeg, bool isLeadIn)
+        {
+            float zDelta = radius * Mathf.Tan(angleDeg * Mathf.Deg2Rad);
+            Vector3 offset = dir * radius + Vector3.forward * zDelta;
+            Vector3 start = isLeadIn ? point - offset : point;
+            Vector3 end   = isLeadIn ? point : point + offset;
+            return new LeadMove(start, end, ApproachType.RAMP)
+            {
+                RampAngleDeg = angleDeg,
+                Radius = radius
+            };
+        }
+
+        private List<LeadMove> BuildHelicalLeadMoves(Vector3 point,
+                                                      float radius,
+                                                      float pitch,
+                                                      bool isLeadIn)
+        {
+            // Single-revolution helix as entry/exit
+            var moves = new List<LeadMove>();
+            int segments = 16;
+            float angleStep = 2f * Mathf.PI / segments;
+            float zStep = pitch / segments;
+            int direction = isLeadIn ? -1 : 1;
+
+            Vector3 prev = point;
+            for (int i = 1; i <= segments; i++)
+            {
+                float angle = i * angleStep;
+                float z = direction * i * zStep;
+                Vector3 next = point + new Vector3(
+                    radius * Mathf.Cos(angle) - radius,
+                    radius * Mathf.Sin(angle),
+                    z);
+                moves.Add(new LeadMove(prev, next, ApproachType.HELICAL)
+                {
+                    ArcCenter = point,
+                    Radius = radius
+                });
+                prev = next;
+            }
+            return moves;
+        }
+    }
 }

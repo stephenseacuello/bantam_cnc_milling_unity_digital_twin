@@ -3099,6 +3099,262 @@ class GaugeRRAnalyzer:
         return var_repeatability, var_reproducibility, var_part, var_total
 
 
+# ---------------------------------------------------------------------------
+# Data Quality Scorer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DataQualityCheck:
+    """Result of a single data quality check."""
+    check_name: str
+    passed: bool
+    score: float        # 0-100
+    details: str
+
+
+@dataclass
+class DataQualityReport:
+    """Aggregated data quality report."""
+    overall_score: float        # 0-100
+    checks: List[DataQualityCheck] = field(default_factory=list)
+    timestamp: float = 0.0
+    data_source: str = ''
+    record_count: int = 0
+    recommendations: List[str] = field(default_factory=list)
+
+
+class DataQualityScorer:
+    """Scores data quality of sensor and process measurements.
+
+    Evaluates completeness, range validity, freshness, consistency,
+    resolution (stuck sensor detection), and noise level for incoming
+    numeric datasets.
+    """
+
+    # Default consistency threshold: a value that deviates more than
+    # this many standard deviations from the mean is a "jump".
+    _CONSISTENCY_STD_MULTIPLIER: float = 3.0
+
+    def __init__(self) -> None:
+        # data_source -> (lower, upper) expected bounds
+        self._bounds: Dict[str, Tuple[float, float]] = {}
+        # maximum acceptable data age in seconds (default 60 s)
+        self._freshness_threshold: float = 60.0
+        # timestamp of the most recent data delivery, per source
+        self._last_data_time: Dict[str, float] = {}
+
+    # -- configuration -------------------------------------------------------
+
+    def set_bounds(self, data_source: str, lower: float, upper: float) -> None:
+        """Set expected value range for *data_source*."""
+        self._bounds[data_source] = (lower, upper)
+
+    def set_freshness_threshold(self, max_age_sec: float) -> None:
+        """Set maximum acceptable data age in seconds."""
+        self._freshness_threshold = max_age_sec
+
+    def record_data_time(self, data_source: str, ts: Optional[float] = None) -> None:
+        """Record the timestamp of the latest data delivery."""
+        self._last_data_time[data_source] = ts if ts is not None else time.time()
+
+    # -- individual checks ---------------------------------------------------
+
+    def _check_completeness(self, data: List[Optional[float]]) -> DataQualityCheck:
+        """Percentage of non-None / non-NaN values."""
+        if not data:
+            return DataQualityCheck('completeness', False, 0.0, 'No data provided')
+        valid = sum(
+            1 for v in data
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
+        )
+        score = (valid / len(data)) * 100.0
+        passed = score >= 95.0
+        return DataQualityCheck(
+            'completeness', passed, round(score, 2),
+            f'{valid}/{len(data)} values present',
+        )
+
+    def _check_range_validity(self, data: List[Optional[float]], data_source: str) -> DataQualityCheck:
+        """Percentage of values within expected bounds."""
+        bounds = self._bounds.get(data_source)
+        if bounds is None:
+            return DataQualityCheck(
+                'range_validity', True, 100.0,
+                'No bounds configured; skipping range check',
+            )
+        lower, upper = bounds
+        valid_values = [
+            v for v in data
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
+        ]
+        if not valid_values:
+            return DataQualityCheck('range_validity', False, 0.0, 'No valid values to check')
+        in_range = sum(1 for v in valid_values if lower <= v <= upper)
+        score = (in_range / len(valid_values)) * 100.0
+        passed = score >= 95.0
+        return DataQualityCheck(
+            'range_validity', passed, round(score, 2),
+            f'{in_range}/{len(valid_values)} values in [{lower}, {upper}]',
+        )
+
+    def _check_freshness(self, data_source: str) -> DataQualityCheck:
+        """Data age within acceptable window."""
+        last_ts = self._last_data_time.get(data_source)
+        if last_ts is None:
+            return DataQualityCheck(
+                'freshness', False, 0.0,
+                'No data timestamp recorded for source',
+            )
+        age = time.time() - last_ts
+        if age <= 0:
+            score = 100.0
+        elif age >= self._freshness_threshold:
+            score = 0.0
+        else:
+            score = max(0.0, (1.0 - age / self._freshness_threshold) * 100.0)
+        passed = age <= self._freshness_threshold
+        return DataQualityCheck(
+            'freshness', passed, round(score, 2),
+            f'Data age {age:.1f}s (threshold {self._freshness_threshold:.1f}s)',
+        )
+
+    def _check_consistency(self, data: List[Optional[float]]) -> DataQualityCheck:
+        """Detect sudden jumps > N*std from mean."""
+        valid = [
+            v for v in data
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
+        ]
+        if len(valid) < 3:
+            return DataQualityCheck(
+                'consistency', True, 100.0,
+                'Insufficient data for consistency check',
+            )
+        mean = sum(valid) / len(valid)
+        var = sum((v - mean) ** 2 for v in valid) / len(valid)
+        std = math.sqrt(var) if var > 0 else 0.0
+
+        if std == 0.0:
+            # All values identical — consistent by definition.
+            return DataQualityCheck('consistency', True, 100.0, 'Zero variance — all values identical')
+
+        threshold = self._CONSISTENCY_STD_MULTIPLIER * std
+        jumps = sum(1 for v in valid if abs(v - mean) > threshold)
+        score = ((len(valid) - jumps) / len(valid)) * 100.0
+        passed = score >= 95.0
+        return DataQualityCheck(
+            'consistency', passed, round(score, 2),
+            f'{jumps} outlier(s) beyond {self._CONSISTENCY_STD_MULTIPLIER}*std',
+        )
+
+    def get_stuck_sensor_check(self, data: List[Optional[float]]) -> DataQualityCheck:
+        """Detect if sensor is outputting a constant value (stuck sensor)."""
+        valid = [
+            v for v in data
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
+        ]
+        if len(valid) < 2:
+            return DataQualityCheck(
+                'resolution', True, 100.0,
+                'Not enough data points for stuck sensor detection',
+            )
+        unique = len(set(valid))
+        if unique == 1:
+            return DataQualityCheck(
+                'resolution', False, 0.0,
+                f'All {len(valid)} values identical — possible stuck sensor',
+            )
+        diversity_ratio = unique / len(valid)
+        score = min(100.0, diversity_ratio * 100.0)
+        passed = unique > 1
+        return DataQualityCheck(
+            'resolution', passed, round(score, 2),
+            f'{unique} unique values out of {len(valid)}',
+        )
+
+    def get_noise_level(self, data: List[Optional[float]]) -> DataQualityCheck:
+        """Compute coefficient of variation (CV) as a noise indicator.
+
+        A very high CV (> 0.5) indicates excessive noise and yields a lower
+        quality score.  A CV near 0 indicates a clean signal.
+        """
+        valid = [
+            v for v in data
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
+        ]
+        if len(valid) < 2:
+            return DataQualityCheck(
+                'noise_level', True, 100.0,
+                'Not enough data for noise assessment',
+            )
+        mean = sum(valid) / len(valid)
+        if mean == 0.0:
+            # Cannot compute CV when mean is zero; use std only
+            var = sum((v - mean) ** 2 for v in valid) / len(valid)
+            std = math.sqrt(var)
+            cv = std  # dimensionless substitute
+        else:
+            var = sum((v - mean) ** 2 for v in valid) / len(valid)
+            std = math.sqrt(var)
+            cv = std / abs(mean)
+
+        # Map CV to a score: CV=0 -> 100, CV>=1 -> 0
+        score = max(0.0, min(100.0, (1.0 - cv) * 100.0))
+        passed = cv <= 0.5
+        return DataQualityCheck(
+            'noise_level', passed, round(score, 2),
+            f'CV={cv:.4f} (std={std:.4f}, mean={mean:.4f})',
+        )
+
+    # -- main entry point ----------------------------------------------------
+
+    def assess(self, data: List[Optional[float]], data_source: str) -> DataQualityReport:
+        """Run all quality checks on *data* and return a DataQualityReport."""
+        # Record delivery time for freshness tracking
+        self.record_data_time(data_source)
+
+        checks: List[DataQualityCheck] = [
+            self._check_completeness(data),
+            self._check_range_validity(data, data_source),
+            self._check_freshness(data_source),
+            self._check_consistency(data),
+            self.get_stuck_sensor_check(data),
+            self.get_noise_level(data),
+        ]
+
+        scores = [c.score for c in checks]
+        overall = sum(scores) / len(scores) if scores else 0.0
+
+        recommendations: List[str] = []
+        for chk in checks:
+            if not chk.passed:
+                if chk.check_name == 'completeness':
+                    recommendations.append('Investigate missing or NaN values in data stream')
+                elif chk.check_name == 'range_validity':
+                    recommendations.append('Sensor readings outside expected bounds — verify calibration')
+                elif chk.check_name == 'freshness':
+                    recommendations.append('Data is stale — check sensor connectivity')
+                elif chk.check_name == 'consistency':
+                    recommendations.append('Sudden value jumps detected — check for electrical interference')
+                elif chk.check_name == 'resolution':
+                    recommendations.append('Sensor may be stuck — schedule maintenance inspection')
+                elif chk.check_name == 'noise_level':
+                    recommendations.append('High noise level — consider adding signal filtering')
+
+        valid_count = sum(
+            1 for v in data
+            if v is not None and not (isinstance(v, float) and math.isnan(v))
+        )
+
+        return DataQualityReport(
+            overall_score=round(overall, 2),
+            checks=checks,
+            timestamp=time.time(),
+            data_source=data_source,
+            record_count=valid_count,
+            recommendations=recommendations,
+        )
+
+
 def main(args=None):
     """Entry point for the KPI calculator node."""
     import rclpy

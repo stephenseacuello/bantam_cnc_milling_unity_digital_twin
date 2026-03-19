@@ -5147,3 +5147,144 @@ class SpindleTorqueLimiter:
         if not self._readings:
             return None
         return max(self._readings, key=lambda r: r.torque_nm)
+
+
+# ---------------------------------------------------------------------------
+# Thermal Compensation Calculator
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CTE = 11.7e-6  # steel, per degree C
+
+
+@dataclass
+class ThermalReading:
+    """A single temperature measurement from a sensor on a machine axis."""
+    axis: str
+    temperature_c: float
+    timestamp: float
+    sensor_location: str
+
+
+@dataclass
+class CompensationOffset:
+    """Computed thermal expansion compensation for one axis."""
+    axis: str
+    offset_um: float           # micrometres of expansion
+    temperature_delta_c: float # current temp minus reference temp
+    reference_temp_c: float
+    cte: float                 # coefficient of thermal expansion used
+
+
+@dataclass
+class ThermalCompensationReport:
+    """Aggregated compensation report across all configured axes."""
+    offsets: List[CompensationOffset]
+    total_compensation_um: float
+    max_axis_error_um: float
+    timestamp: float
+    is_significant: bool
+
+
+class ThermalCompensationCalculator:
+    """Calculate thermal expansion compensation for CNC machine axes.
+
+    Thermal growth of each axis is modelled as:
+
+        DeltaL = L * CTE * DeltaT
+
+    where *L* is the effective axis length, *CTE* is the coefficient of
+    thermal expansion, and *DeltaT* is the temperature difference from the
+    reference (cold-start) temperature.
+    """
+
+    def __init__(self) -> None:
+        self._reference_temps: Dict[str, float] = {}
+        self._ctes: Dict[str, float] = {}
+        self._axis_lengths: Dict[str, float] = {}
+        self._readings: Dict[str, List[ThermalReading]] = {}
+
+    # -- configuration -------------------------------------------------------
+
+    def set_reference_temperature(self, axis: str, temp_c: float) -> None:
+        """Set the reference (cold-start) temperature for *axis*."""
+        self._reference_temps[axis] = temp_c
+
+    def set_cte(self, axis: str, cte_per_c: float) -> None:
+        """Set the coefficient of thermal expansion for *axis*.
+
+        Default if never called: 11.7e-6 /degC (steel).
+        """
+        self._ctes[axis] = cte_per_c
+
+    def set_axis_length(self, axis: str, length_mm: float) -> None:
+        """Set the effective travel length (mm) of *axis*."""
+        self._axis_lengths[axis] = length_mm
+
+    # -- measurement ---------------------------------------------------------
+
+    def record_temperature(self, reading: ThermalReading) -> None:
+        """Record a temperature measurement for the axis in *reading*."""
+        self._readings.setdefault(reading.axis, []).append(reading)
+
+    # -- calculation ---------------------------------------------------------
+
+    def calculate_compensation(self, axis: str) -> CompensationOffset:
+        """Calculate the thermal expansion offset for *axis*.
+
+        Returns a :class:`CompensationOffset` with the computed values.
+        Raises ``ValueError`` if the axis has no recorded readings or no
+        configured length.
+        """
+        if axis not in self._readings or not self._readings[axis]:
+            raise ValueError(f"No temperature readings for axis '{axis}'")
+        if axis not in self._axis_lengths:
+            raise ValueError(f"No axis length configured for axis '{axis}'")
+
+        latest = self._readings[axis][-1]
+        ref_temp = self._reference_temps.get(axis, 20.0)  # default 20 degC
+        cte = self._ctes.get(axis, _DEFAULT_CTE)
+        length_mm = self._axis_lengths[axis]
+
+        delta_t = latest.temperature_c - ref_temp
+        # DeltaL in mm then convert to micrometres (* 1000)
+        delta_l_um = length_mm * cte * delta_t * 1000.0
+
+        return CompensationOffset(
+            axis=axis,
+            offset_um=round(delta_l_um, 4),
+            temperature_delta_c=round(delta_t, 4),
+            reference_temp_c=ref_temp,
+            cte=cte,
+        )
+
+    def get_report(self) -> ThermalCompensationReport:
+        """Generate a :class:`ThermalCompensationReport` for all axes with data."""
+        offsets: List[CompensationOffset] = []
+        for axis in sorted(self._readings):
+            if self._readings[axis] and axis in self._axis_lengths:
+                offsets.append(self.calculate_compensation(axis))
+
+        abs_offsets = [abs(o.offset_um) for o in offsets] if offsets else [0.0]
+        total = sum(abs_offsets)
+        max_err = max(abs_offsets)
+        now = time.time()
+
+        return ThermalCompensationReport(
+            offsets=offsets,
+            total_compensation_um=round(total, 4),
+            max_axis_error_um=round(max_err, 4),
+            timestamp=now,
+            is_significant=max_err > 5.0,
+        )
+
+    def is_compensation_needed(self, threshold_um: float = 5.0) -> bool:
+        """Return ``True`` if any axis exceeds *threshold_um* of expansion."""
+        for axis in self._readings:
+            if axis not in self._axis_lengths:
+                continue
+            if not self._readings[axis]:
+                continue
+            offset = self.calculate_compensation(axis)
+            if abs(offset.offset_um) > threshold_um:
+                return True
+        return False

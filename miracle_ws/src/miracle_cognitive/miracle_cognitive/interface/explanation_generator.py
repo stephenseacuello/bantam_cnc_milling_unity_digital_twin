@@ -3104,6 +3104,357 @@ class ConfidenceIntervalCalculator:
         return max(n, 2)
 
 
+# ---------------------------------------------------------------------------
+# Time Series Forecaster
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ForecastPoint:
+    """A single forecasted data point with confidence interval."""
+    timestamp: float
+    value: float
+    lower_bound: float
+    upper_bound: float
+    confidence: float
+
+
+@dataclass
+class ForecastResult:
+    """Complete result of a forecasting operation."""
+    forecasts: List[ForecastPoint]
+    method: str
+    mape: float
+    rmse: float
+    trend: str  # 'increasing' | 'decreasing' | 'stable'
+
+
+class TimeSeriesForecaster:
+    """Forecasts manufacturing time series using simple statistical methods.
+
+    Supported methods:
+      - moving_average: configurable window size
+      - exponential_smoothing: single-parameter (alpha) smoothing
+      - linear_trend: ordinary least-squares fit + extrapolation
+    """
+
+    _VALID_METHODS = ('moving_average', 'exponential_smoothing', 'linear_trend')
+
+    def __init__(
+        self,
+        method: str = 'exponential_smoothing',
+        window: int = 5,
+        alpha: float = 0.3,
+    ) -> None:
+        if method not in self._VALID_METHODS:
+            raise ValueError(
+                f"Unknown method '{method}'. Choose from {self._VALID_METHODS}"
+            )
+        self._method: str = method
+        self._window: int = max(window, 1)
+        self._alpha: float = max(0.0, min(alpha, 1.0))
+
+        # Populated by fit()
+        self._timestamps: List[float] = []
+        self._values: List[float] = []
+        self._fitted: bool = False
+
+        # Linear-trend coefficients (slope, intercept)
+        self._slope: float = 0.0
+        self._intercept: float = 0.0
+
+        # Residual standard deviation (used for confidence intervals)
+        self._residual_std: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_method(self, method: str) -> None:
+        """Switch forecasting method at runtime."""
+        if method not in self._VALID_METHODS:
+            raise ValueError(
+                f"Unknown method '{method}'. Choose from {self._VALID_METHODS}"
+            )
+        self._method = method
+
+    def fit(self, timestamps: List[float], values: List[float]) -> None:
+        """Fit the model to historical data.
+
+        Args:
+            timestamps: Monotonically increasing time values.
+            values: Observed measurements corresponding to each timestamp.
+        """
+        if len(timestamps) != len(values):
+            raise ValueError("timestamps and values must have the same length")
+        if len(values) < 2:
+            raise ValueError("Need at least 2 data points to fit")
+
+        self._timestamps = list(timestamps)
+        self._values = list(values)
+
+        # Always compute linear trend coefficients (used for trend detection too)
+        self._slope, self._intercept = self._least_squares(
+            self._timestamps, self._values
+        )
+
+        # Compute residual std for confidence intervals
+        predicted = [
+            self._slope * t + self._intercept for t in self._timestamps
+        ]
+        residuals = [a - p for a, p in zip(self._values, predicted)]
+        self._residual_std = self._std(residuals)
+
+        self._fitted = True
+
+    def forecast(
+        self,
+        n_steps: int = 10,
+        step_size_sec: float = 1.0,
+    ) -> ForecastResult:
+        """Generate *n_steps* future predictions with confidence intervals.
+
+        Args:
+            n_steps: Number of future points to forecast.
+            step_size_sec: Time gap (seconds) between consecutive forecasts.
+
+        Returns:
+            A :class:`ForecastResult` containing the forecasts and quality
+            metrics computed via leave-one-out on the training data.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before forecast()")
+
+        last_ts = self._timestamps[-1]
+        future_ts = [last_ts + step_size_sec * (i + 1) for i in range(n_steps)]
+
+        raw_forecasts = self._predict(future_ts)
+
+        # Build ForecastPoints with confidence intervals
+        z95 = 1.96  # ~95 % confidence
+        points: List[ForecastPoint] = []
+        for i, (ts, val) in enumerate(zip(future_ts, raw_forecasts)):
+            # Widen interval with forecast horizon
+            horizon_factor = math.sqrt(1 + i)
+            half_width = z95 * self._residual_std * horizon_factor
+            points.append(ForecastPoint(
+                timestamp=ts,
+                value=val,
+                lower_bound=val - half_width,
+                upper_bound=val + half_width,
+                confidence=0.95,
+            ))
+
+        # In-sample evaluation (leave-last-out)
+        mape, rmse = self._in_sample_metrics()
+
+        trend = self.get_trend(self._values)
+
+        return ForecastResult(
+            forecasts=points,
+            method=self._method,
+            mape=mape,
+            rmse=rmse,
+            trend=trend,
+        )
+
+    # ------------------------------------------------------------------
+    # Evaluation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def evaluate(
+        actual: List[float],
+        predicted: List[float],
+    ) -> Tuple[float, float]:
+        """Compute MAPE and RMSE between *actual* and *predicted*.
+
+        Returns:
+            (mape, rmse) tuple.
+        """
+        if len(actual) != len(predicted):
+            raise ValueError("actual and predicted must have the same length")
+        n = len(actual)
+        if n == 0:
+            return 0.0, 0.0
+
+        sum_ape = 0.0
+        sum_sq = 0.0
+        count_ape = 0
+        for a, p in zip(actual, predicted):
+            diff = a - p
+            sum_sq += diff * diff
+            if abs(a) > 1e-12:
+                sum_ape += abs(diff / a)
+                count_ape += 1
+
+        mape = (sum_ape / count_ape * 100.0) if count_ape > 0 else 0.0
+        rmse = math.sqrt(sum_sq / n)
+        return mape, rmse
+
+    @staticmethod
+    def detect_seasonality(
+        data: List[float],
+        max_period: int = 50,
+    ) -> Optional[int]:
+        """Detect repeating patterns via autocorrelation.
+
+        Scans lags from 2 to *max_period* and returns the lag with the
+        highest positive autocorrelation.  Returns ``None`` when no
+        significant seasonality is found (peak autocorrelation < 0.3).
+        """
+        n = len(data)
+        if n < 4:
+            return None
+
+        mean = sum(data) / n
+        centered = [v - mean for v in data]
+
+        # Denominator (variance * n)
+        denom = sum(c * c for c in centered)
+        if denom < 1e-12:
+            return None
+
+        best_lag: Optional[int] = None
+        best_corr = 0.3  # threshold
+
+        upper = min(max_period, n // 2) + 1
+        for lag in range(2, upper):
+            num = sum(centered[i] * centered[i + lag] for i in range(n - lag))
+            corr = num / denom
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
+
+        return best_lag
+
+    @staticmethod
+    def get_trend(data: List[float]) -> str:
+        """Classify the overall trend as 'increasing', 'decreasing', or 'stable'.
+
+        Uses the slope of a simple linear regression normalised by the data
+        range.  A normalised slope whose absolute value is below 0.01 is
+        considered 'stable'.
+        """
+        n = len(data)
+        if n < 2:
+            return 'stable'
+
+        xs = list(range(n))
+        slope, _ = TimeSeriesForecaster._least_squares(
+            [float(x) for x in xs], data
+        )
+
+        data_range = max(data) - min(data)
+        if data_range < 1e-12:
+            return 'stable'
+
+        normalised = slope * n / data_range
+        if normalised > 0.01:
+            return 'increasing'
+        elif normalised < -0.01:
+            return 'decreasing'
+        return 'stable'
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _predict(self, future_timestamps: List[float]) -> List[float]:
+        """Route to the active forecasting method."""
+        if self._method == 'moving_average':
+            return self._predict_moving_average(future_timestamps)
+        elif self._method == 'exponential_smoothing':
+            return self._predict_exponential_smoothing(future_timestamps)
+        else:  # linear_trend
+            return self._predict_linear_trend(future_timestamps)
+
+    def _predict_moving_average(self, future_ts: List[float]) -> List[float]:
+        """Moving average forecast: the predicted value is the mean of the
+        last *window* observations.  For multi-step ahead, newly predicted
+        values are appended to the rolling window."""
+        window = min(self._window, len(self._values))
+        recent = list(self._values[-window:])
+        preds: List[float] = []
+        for _ in future_ts:
+            val = sum(recent) / len(recent)
+            preds.append(val)
+            recent.append(val)
+            if len(recent) > window:
+                recent.pop(0)
+        return preds
+
+    def _predict_exponential_smoothing(
+        self, future_ts: List[float]
+    ) -> List[float]:
+        """Simple (single) exponential smoothing.  The level at end of
+        training is extrapolated for all future steps."""
+        level = self._values[0]
+        for v in self._values[1:]:
+            level = self._alpha * v + (1.0 - self._alpha) * level
+        return [level] * len(future_ts)
+
+    def _predict_linear_trend(self, future_ts: List[float]) -> List[float]:
+        """Linear trend extrapolation using pre-computed OLS coefficients."""
+        return [self._slope * t + self._intercept for t in future_ts]
+
+    def _in_sample_metrics(self) -> Tuple[float, float]:
+        """Compute in-sample MAPE and RMSE using one-step-ahead predictions."""
+        n = len(self._values)
+        if n < 3:
+            return 0.0, 0.0
+
+        actual: List[float] = []
+        predicted: List[float] = []
+
+        if self._method == 'moving_average':
+            w = min(self._window, n - 1)
+            for i in range(w, n):
+                window_vals = self._values[i - w:i]
+                predicted.append(sum(window_vals) / len(window_vals))
+                actual.append(self._values[i])
+        elif self._method == 'exponential_smoothing':
+            level = self._values[0]
+            for i in range(1, n):
+                predicted.append(level)
+                actual.append(self._values[i])
+                level = self._alpha * self._values[i] + (1.0 - self._alpha) * level
+        else:  # linear_trend
+            for i, t in enumerate(self._timestamps):
+                predicted.append(self._slope * t + self._intercept)
+                actual.append(self._values[i])
+
+        return self.evaluate(actual, predicted)
+
+    @staticmethod
+    def _least_squares(
+        xs: List[float], ys: List[float]
+    ) -> Tuple[float, float]:
+        """Ordinary least squares for a simple linear model y = slope*x + intercept."""
+        n = len(xs)
+        sum_x = sum(xs)
+        sum_y = sum(ys)
+        sum_xx = sum(x * x for x in xs)
+        sum_xy = sum(x * y for x, y in zip(xs, ys))
+
+        denom = n * sum_xx - sum_x * sum_x
+        if abs(denom) < 1e-12:
+            return 0.0, sum_y / n if n else 0.0
+
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - slope * sum_x) / n
+        return slope, intercept
+
+    @staticmethod
+    def _std(values: List[float]) -> float:
+        """Population standard deviation."""
+        n = len(values)
+        if n < 2:
+            return 0.0
+        mean = sum(values) / n
+        var = sum((v - mean) ** 2 for v in values) / n
+        return math.sqrt(var)
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

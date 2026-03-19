@@ -3100,3 +3100,265 @@ class HealthCheckManager:
                 changes += 1
 
         return changes > self._FLAP_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Service Dependency Graph Manager
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ServiceNode:
+    """Represents a service and its dependency metadata."""
+    service_id: str
+    service_name: str
+    version: str
+    dependencies: List[str] = field(default_factory=list)
+    is_critical: bool = False
+    startup_order: int = 0
+
+
+@dataclass
+class DependencyAnalysis:
+    """Complete dependency-graph analysis result."""
+    startup_order: List[str] = field(default_factory=list)
+    circular_dependencies: List[List[str]] = field(default_factory=list)
+    orphan_services: List[str] = field(default_factory=list)
+    critical_path: List[str] = field(default_factory=list)
+    max_depth: int = 0
+
+
+class DependencyGraphManager:
+    """Manages and analyzes service dependencies for startup ordering and
+    impact analysis.
+
+    Services are registered as ``ServiceNode`` instances.  The manager builds
+    an internal directed graph (adjacency list) and exposes queries such as
+    topological startup ordering, shutdown ordering, impact analysis,
+    circular-dependency detection, critical-path calculation, and orphan
+    discovery.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: Dict[str, ServiceNode] = {}
+        # Adjacency list: service_id -> list of service_ids it depends on
+        self._edges: Dict[str, List[str]] = {}
+
+    # -- mutation ------------------------------------------------------------
+
+    def register_service(self, node: ServiceNode) -> None:
+        """Register a service node and its declared dependencies."""
+        self._nodes[node.service_id] = node
+        self._edges[node.service_id] = list(node.dependencies)
+
+    def remove_service(self, service_id: str) -> None:
+        """Remove a service from the graph."""
+        self._nodes.pop(service_id, None)
+        self._edges.pop(service_id, None)
+        # Also remove this id from other nodes' dependency lists
+        for sid in self._edges:
+            if service_id in self._edges[sid]:
+                self._edges[sid] = [
+                    d for d in self._edges[sid] if d != service_id
+                ]
+
+    # -- queries -------------------------------------------------------------
+
+    def get_startup_order(self) -> List[str]:
+        """Return service ids in topological order (dependencies first).
+
+        Uses Kahn's algorithm.  If cycles exist the remaining nodes are
+        appended at the end in arbitrary order so that callers always receive
+        a complete list.
+        """
+        if not self._edges:
+            return []
+
+        # Build in-degree map only for registered nodes
+        in_degree: Dict[str, int] = {sid: 0 for sid in self._edges}
+        for sid, deps in self._edges.items():
+            for dep in deps:
+                if dep in in_degree:
+                    in_degree[dep] = in_degree.get(dep, 0)
+                # Increment in-degree of the *current* node for each
+                # dependency it has that is known.
+                pass
+
+        # Recompute properly: in_degree counts how many registered services
+        # depend on a given service.  For startup ordering we want
+        # "dependency-first", which means a node with no *outgoing*
+        # dependency edges should come first.  We therefore compute in-degree
+        # as the count of unsatisfied dependencies for each service.
+        in_degree = {sid: 0 for sid in self._edges}
+        for sid, deps in self._edges.items():
+            for dep in deps:
+                if dep in self._edges:
+                    in_degree[sid] += 1
+
+        # Wait -- that gives "how many deps does sid have?", i.e. the number
+        # of edges going OUT.  For Kahn's algorithm on "must start deps
+        # first" we actually need: in_degree[x] = number of deps of x that
+        # haven't been started yet.  Nodes with 0 un-started deps can start.
+        # Whenever we "start" a node we decrement in_degree for every node
+        # that lists this node as a dependency.
+
+        # Rebuild correctly:
+        in_degree = {sid: 0 for sid in self._edges}
+        for sid, deps in self._edges.items():
+            count = 0
+            for dep in deps:
+                if dep in self._edges:
+                    count += 1
+            in_degree[sid] = count
+
+        queue: List[str] = [sid for sid, deg in in_degree.items() if deg == 0]
+        queue.sort()  # deterministic ordering
+        order: List[str] = []
+
+        while queue:
+            current = queue.pop(0)
+            order.append(current)
+            # For every other node that depends on *current*, decrement
+            for sid, deps in self._edges.items():
+                if current in deps and sid not in order:
+                    in_degree[sid] -= 1
+                    if in_degree[sid] == 0:
+                        queue.append(sid)
+            queue.sort()
+
+        # Append any remaining nodes (part of cycles)
+        remaining = [sid for sid in self._edges if sid not in order]
+        remaining.sort()
+        order.extend(remaining)
+
+        return order
+
+    def get_shutdown_order(self) -> List[str]:
+        """Return service ids in reverse startup order (dependents first)."""
+        return list(reversed(self.get_startup_order()))
+
+    def get_impact_analysis(self, service_id: str) -> List[str]:
+        """Return all services that transitively depend on *service_id*.
+
+        If *service_id* goes down, every returned service is affected.
+        """
+        dependents: List[str] = []
+        visited: set = set()
+        stack = [service_id]
+
+        while stack:
+            current = stack.pop()
+            for sid, deps in self._edges.items():
+                if current in deps and sid not in visited:
+                    visited.add(sid)
+                    dependents.append(sid)
+                    stack.append(sid)
+
+        return dependents
+
+    def detect_circular_dependencies(self) -> List[List[str]]:
+        """Find all elementary cycles in the dependency graph.
+
+        Returns a list of cycles, where each cycle is a list of service ids
+        forming the loop (the first element is repeated at the end).
+        """
+        cycles: List[List[str]] = []
+        visited_global: set = set()
+
+        for start in sorted(self._edges.keys()):
+            # DFS from each node
+            stack: List[Tuple[str, List[str]]] = [(start, [start])]
+            visited_local: set = set()
+
+            while stack:
+                node, path = stack.pop()
+                deps = self._edges.get(node, [])
+                for dep in sorted(deps):
+                    if dep not in self._edges:
+                        continue
+                    if dep == start and len(path) > 1:
+                        cycle = path + [dep]
+                        # Normalise: rotate so smallest id is first
+                        body = cycle[:-1]
+                        min_idx = body.index(min(body))
+                        normalised = body[min_idx:] + body[:min_idx]
+                        normalised.append(normalised[0])
+                        if normalised not in cycles:
+                            cycles.append(normalised)
+                    elif dep not in visited_local and dep not in path:
+                        visited_local.add(dep)
+                        stack.append((dep, path + [dep]))
+
+            visited_global.add(start)
+
+        return cycles
+
+    def get_critical_path(self) -> List[str]:
+        """Return the longest dependency chain in the graph.
+
+        The critical path is the chain of services whose sequential startup
+        takes the most steps (i.e. longest path in the DAG).
+        """
+        if not self._edges:
+            return []
+
+        memo: Dict[str, List[str]] = {}
+
+        def _longest(sid: str, visiting: set) -> List[str]:
+            if sid in memo:
+                return memo[sid]
+            if sid in visiting:
+                # cycle – stop recursion
+                return [sid]
+            visiting.add(sid)
+
+            best: List[str] = []
+            for dep in self._edges.get(sid, []):
+                if dep not in self._edges:
+                    continue
+                candidate = _longest(dep, visiting)
+                if len(candidate) > len(best):
+                    best = candidate
+
+            visiting.discard(sid)
+            result = best + [sid]
+            memo[sid] = result
+            return result
+
+        longest: List[str] = []
+        for sid in self._edges:
+            path = _longest(sid, set())
+            if len(path) > len(longest):
+                longest = path
+
+        return longest
+
+    def get_orphan_services(self) -> List[str]:
+        """Return services that have no dependencies and no dependents."""
+        orphans: List[str] = []
+        for sid in sorted(self._edges.keys()):
+            # Has dependencies?
+            has_deps = any(
+                dep in self._edges for dep in self._edges.get(sid, [])
+            )
+            # Is depended upon by anyone?
+            is_depended = any(
+                sid in deps for deps in self._edges.values()
+            )
+            if not has_deps and not is_depended:
+                orphans.append(sid)
+        return orphans
+
+    def get_full_analysis(self) -> DependencyAnalysis:
+        """Compute and return a complete ``DependencyAnalysis``."""
+        startup = self.get_startup_order()
+        circular = self.detect_circular_dependencies()
+        orphans = self.get_orphan_services()
+        critical = self.get_critical_path()
+        return DependencyAnalysis(
+            startup_order=startup,
+            circular_dependencies=circular,
+            orphan_services=orphans,
+            critical_path=critical,
+            max_depth=len(critical),
+        )

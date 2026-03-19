@@ -1853,4 +1853,230 @@ namespace MiracleTwin.Cutting
             return total;
         }
     }
+
+    // ── Rest Machining Detector ─────────────────────────────────────
+
+    /// <summary>
+    /// Describes a single region of unmachined (rest) material left by a
+    /// larger tool that requires cleanup with a smaller tool.
+    /// </summary>
+    [Serializable]
+    public class RestRegion
+    {
+        public Vector3 center;
+        public Vector3 extentMm;
+        public float volumeMm3;
+        public float cornerRadius;
+        public float requiredToolDiaMm;
+        public float depth;
+    }
+
+    /// <summary>
+    /// Aggregate analysis of rest-material regions produced by the detector.
+    /// </summary>
+    [Serializable]
+    public class RestAnalysis
+    {
+        public List<RestRegion> regions = new List<RestRegion>();
+        public float totalRestVolumeMm3;
+        public float largestRegionVolumeMm3;
+        public float suggestedToolDiaMm;
+        public float estimatedCleanupTimeMin;
+        public int regionCount;
+    }
+
+    /// <summary>
+    /// Detects unmachined material (rest material) left by larger tools that
+    /// needs cleanup with smaller tools.  Analyses internal corners, fillet
+    /// regions, and recommends appropriate cleanup tooling and time estimates.
+    /// </summary>
+    public class RestMachiningDetector
+    {
+        // ── Corner rest-volume calculation ─────────────────────────────
+
+        /// <summary>
+        /// Calculate the volume of rest material left in a single internal
+        /// corner by a tool of diameter <paramref name="toolDia"/>.
+        /// The corner has the given <paramref name="cornerRadius"/> and
+        /// <paramref name="depth"/>.
+        ///
+        /// The rest material is the difference between the square corner
+        /// and the arc swept by the tool:
+        ///   V = (R^2 - pi/4 * R^2) * depth   where R = toolDia / 2
+        /// but only the portion beyond the desired corner radius matters.
+        /// When the tool radius equals the corner radius, rest volume is zero.
+        /// </summary>
+        public float GetRestVolume(float toolDia, float cornerRadius, float depth)
+        {
+            if (toolDia <= 0f || depth <= 0f)
+                return 0f;
+
+            float toolRadius = toolDia / 2f;
+
+            // If the tool fits within the corner radius, no rest material
+            if (toolRadius <= cornerRadius)
+                return 0f;
+
+            // Rest area in cross-section: quarter-circle area of tool minus
+            // quarter-circle area that the desired corner would occupy.
+            // A_rest = (1 - pi/4) * R_tool^2 - (1 - pi/4) * R_corner^2
+            //        = (1 - pi/4) * (R_tool^2 - R_corner^2)
+            float factor = 1f - Mathf.PI / 4f;
+            float area = factor * (toolRadius * toolRadius - cornerRadius * cornerRadius);
+
+            return area * depth;
+        }
+
+        // ── Analyse internal corners of a rectangular pocket ──────────
+
+        /// <summary>
+        /// Find rest-material regions in the four internal corners of a
+        /// rectangular pocket machined with the given tool diameter.
+        /// </summary>
+        public RestAnalysis AnalyzeCorners(
+            float pocketWidth, float pocketLength, float pocketDepth, float toolDiameter)
+        {
+            RestAnalysis analysis = new RestAnalysis();
+
+            if (pocketWidth <= 0f || pocketLength <= 0f ||
+                pocketDepth <= 0f || toolDiameter <= 0f)
+                return analysis;
+
+            float toolRadius = toolDiameter / 2f;
+            float cornerRadius = 0f; // sharp internal corners
+
+            float vol = GetRestVolume(toolDiameter, cornerRadius, pocketDepth);
+            if (vol <= 0f)
+                return analysis;
+
+            // Four corners of the pocket
+            Vector3[] corners = new Vector3[]
+            {
+                new Vector3(0f, 0f, 0f),
+                new Vector3(pocketWidth, 0f, 0f),
+                new Vector3(pocketWidth, pocketLength, 0f),
+                new Vector3(0f, pocketLength, 0f)
+            };
+
+            foreach (Vector3 c in corners)
+            {
+                RestRegion region = new RestRegion
+                {
+                    center = c,
+                    extentMm = new Vector3(toolRadius, toolRadius, pocketDepth),
+                    volumeMm3 = vol,
+                    cornerRadius = toolRadius, // radius left by the tool
+                    requiredToolDiaMm = toolRadius, // need a tool with radius < toolRadius
+                    depth = pocketDepth
+                };
+                analysis.regions.Add(region);
+            }
+
+            analysis.regionCount = analysis.regions.Count;
+            analysis.totalRestVolumeMm3 = vol * analysis.regionCount;
+            analysis.largestRegionVolumeMm3 = vol;
+            analysis.suggestedToolDiaMm = SuggestCleanupTool(toolRadius);
+            analysis.estimatedCleanupTimeMin = 0f;
+
+            return analysis;
+        }
+
+        // ── Analyse fillet regions ────────────────────────────────────
+
+        /// <summary>
+        /// Detect rest material along a fillet where the tool diameter is
+        /// too large to machine the desired fillet radius.  The rest region
+        /// is spread along the <paramref name="pathLength"/>.
+        /// </summary>
+        public RestAnalysis AnalyzeFillets(
+            float filletRadius, float toolDiameter, float pathLength)
+        {
+            RestAnalysis analysis = new RestAnalysis();
+
+            if (filletRadius <= 0f || toolDiameter <= 0f || pathLength <= 0f)
+                return analysis;
+
+            float toolRadius = toolDiameter / 2f;
+
+            if (toolRadius <= filletRadius)
+                return analysis; // tool can already machine the fillet
+
+            // Rest cross-section area — same (1 - pi/4) approach
+            float factor = 1f - Mathf.PI / 4f;
+            float restArea = factor * (toolRadius * toolRadius - filletRadius * filletRadius);
+            float vol = restArea * pathLength;
+
+            RestRegion region = new RestRegion
+            {
+                center = new Vector3(pathLength / 2f, 0f, 0f),
+                extentMm = new Vector3(pathLength, toolRadius - filletRadius, 0f),
+                volumeMm3 = vol,
+                cornerRadius = toolRadius,
+                requiredToolDiaMm = filletRadius * 2f,
+                depth = pathLength
+            };
+
+            analysis.regions.Add(region);
+            analysis.regionCount = 1;
+            analysis.totalRestVolumeMm3 = vol;
+            analysis.largestRegionVolumeMm3 = vol;
+            analysis.suggestedToolDiaMm = SuggestCleanupTool(filletRadius);
+            analysis.estimatedCleanupTimeMin = 0f;
+
+            return analysis;
+        }
+
+        // ── Tool recommendation ──────────────────────────────────────
+
+        /// <summary>
+        /// Suggest a cleanup tool diameter that can reach into corners
+        /// with the given <paramref name="maxRestCornerRadius"/>.
+        /// The tool diameter must be less than 2 * cornerRadius.
+        /// Returns 80 % of the theoretical maximum for safety margin.
+        /// </summary>
+        public float SuggestCleanupTool(float maxRestCornerRadius)
+        {
+            if (maxRestCornerRadius <= 0f)
+                return 0f;
+
+            // Maximum tool diameter that can fit: 2 * cornerRadius
+            // Apply 80 % safety factor
+            return 2f * maxRestCornerRadius * 0.8f;
+        }
+
+        // ── Cleanup time estimation ──────────────────────────────────
+
+        /// <summary>
+        /// Estimate the time required to machine the given rest regions
+        /// at the specified feed rate and stepover.
+        /// </summary>
+        public float EstimateCleanupTime(
+            List<RestRegion> regions, float feedRateMmPerMin, float stepoverMm)
+        {
+            if (regions == null || regions.Count == 0)
+                return 0f;
+            if (feedRateMmPerMin <= 0f || stepoverMm <= 0f)
+                return 0f;
+
+            float totalTime = 0f;
+
+            foreach (RestRegion region in regions)
+            {
+                // Approximate the number of passes needed to cover the rest area
+                float width = Mathf.Max(region.extentMm.x, region.extentMm.y);
+                float passCount = Mathf.Ceil(width / stepoverMm);
+
+                // Each pass traverses the depth direction
+                float passLength = region.depth;
+
+                // Total path length for this region
+                float pathLength = passCount * passLength;
+
+                // Time = distance / feed rate
+                totalTime += pathLength / feedRateMmPerMin;
+            }
+
+            return totalTime;
+        }
+    }
 }

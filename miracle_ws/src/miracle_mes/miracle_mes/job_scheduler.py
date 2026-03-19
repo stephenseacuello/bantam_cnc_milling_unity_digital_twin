@@ -2896,6 +2896,195 @@ class RecipeVersionControl:
         return versions[version]
 
 
+# ---------------------------------------------------------------------------
+# Shift Handoff Manager
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ShiftInfo:
+    """Information about a manufacturing shift."""
+
+    shift_id: str
+    shift_name: str
+    start_time: float
+    end_time: float
+    supervisor: str
+    operators: List[str] = field(default_factory=list)
+
+
+@dataclass
+class HandoffItem:
+    """A single item to be communicated during a shift handoff."""
+
+    item_id: str
+    category: str  # 'job_in_progress'|'pending_issue'|'safety_note'|'quality_alert'|'maintenance_needed'
+    description: str
+    priority: int  # 1 (highest) – 5 (lowest)
+    machine_id: str
+    status: str = 'open'  # 'open'|'acknowledged'|'resolved'
+
+
+@dataclass
+class HandoffReport:
+    """Report generated when one shift hands off to another."""
+
+    report_id: str
+    from_shift: ShiftInfo
+    to_shift: ShiftInfo
+    items: List[HandoffItem] = field(default_factory=list)
+    created_at: float = 0.0
+    acknowledged_by: str = ''
+    notes: str = ''
+
+
+_VALID_CATEGORIES: Set[str] = {
+    'job_in_progress',
+    'pending_issue',
+    'safety_note',
+    'quality_alert',
+    'maintenance_needed',
+}
+
+_VALID_ITEM_STATUSES: Set[str] = {'open', 'acknowledged', 'resolved'}
+
+
+class ShiftHandoffManager:
+    """Manages shift handoffs with status tracking and task transfer.
+
+    Tracks shifts, handoff items (open issues, jobs in progress, safety notes,
+    etc.) and generates handoff reports that the incoming shift can acknowledge.
+    """
+
+    def __init__(self) -> None:
+        self._shifts: Dict[str, ShiftInfo] = {}
+        self._items: Dict[str, HandoffItem] = {}
+        self._reports: Dict[str, HandoffReport] = {}
+        self._report_history: List[HandoffReport] = []
+        self._lock = threading.Lock()
+
+    # -- shift management ---------------------------------------------------
+
+    def create_shift(self, shift_info: ShiftInfo) -> ShiftInfo:
+        """Register a new shift.  Returns the stored *ShiftInfo*."""
+        with self._lock:
+            self._shifts[shift_info.shift_id] = shift_info
+        return shift_info
+
+    def get_shift(self, shift_id: str) -> Optional[ShiftInfo]:
+        """Return the *ShiftInfo* for *shift_id*, or ``None``."""
+        return self._shifts.get(shift_id)
+
+    # -- handoff items ------------------------------------------------------
+
+    def add_handoff_item(self, item: HandoffItem) -> HandoffItem:
+        """Add a handoff item to the current pool of open items.
+
+        Validates *category*, *status*, and *priority* before storing.
+        Returns the stored item.
+        """
+        if item.category not in _VALID_CATEGORIES:
+            raise ValueError(
+                f"Invalid category '{item.category}'. "
+                f"Must be one of {sorted(_VALID_CATEGORIES)}."
+            )
+        if item.status not in _VALID_ITEM_STATUSES:
+            raise ValueError(
+                f"Invalid status '{item.status}'. "
+                f"Must be one of {sorted(_VALID_ITEM_STATUSES)}."
+            )
+        if not (1 <= item.priority <= 5):
+            raise ValueError(
+                f"Priority must be between 1 and 5, got {item.priority}."
+            )
+        with self._lock:
+            self._items[item.item_id] = item
+        return item
+
+    def resolve_item(self, item_id: str) -> HandoffItem:
+        """Mark a handoff item as resolved.  Returns the updated item."""
+        with self._lock:
+            if item_id not in self._items:
+                raise KeyError(f"Handoff item '{item_id}' not found.")
+            self._items[item_id].status = 'resolved'
+            return self._items[item_id]
+
+    def get_open_items(self, machine_id: Optional[str] = None) -> List[HandoffItem]:
+        """Return unresolved items, optionally filtered by *machine_id*.
+
+        Items are sorted by priority (1 = highest first).
+        """
+        with self._lock:
+            results = [
+                item
+                for item in self._items.values()
+                if item.status != 'resolved'
+                and (machine_id is None or item.machine_id == machine_id)
+            ]
+        results.sort(key=lambda i: i.priority)
+        return results
+
+    # -- reports ------------------------------------------------------------
+
+    def generate_handoff_report(
+        self,
+        from_shift_id: str,
+        to_shift_id: str,
+        notes: str = '',
+    ) -> HandoffReport:
+        """Generate a handoff report containing all open items.
+
+        Raises ``KeyError`` if either shift id is unknown.
+        """
+        from_shift = self._shifts.get(from_shift_id)
+        if from_shift is None:
+            raise KeyError(f"Shift '{from_shift_id}' not found.")
+        to_shift = self._shifts.get(to_shift_id)
+        if to_shift is None:
+            raise KeyError(f"Shift '{to_shift_id}' not found.")
+
+        open_items = self.get_open_items()
+
+        report = HandoffReport(
+            report_id=str(uuid.uuid4()),
+            from_shift=from_shift,
+            to_shift=to_shift,
+            items=list(open_items),
+            created_at=time.time(),
+            notes=notes,
+        )
+
+        with self._lock:
+            self._reports[report.report_id] = report
+            self._report_history.append(report)
+
+        return report
+
+    def acknowledge_handoff(self, report_id: str, operator: str) -> HandoffReport:
+        """Mark a handoff report as acknowledged by *operator*.
+
+        Also sets all contained items' status to ``'acknowledged'``.
+        """
+        with self._lock:
+            if report_id not in self._reports:
+                raise KeyError(f"Handoff report '{report_id}' not found.")
+            report = self._reports[report_id]
+            report.acknowledged_by = operator
+            for item in report.items:
+                if item.status == 'open':
+                    item.status = 'acknowledged'
+                    # Propagate to the master item store as well.
+                    if item.item_id in self._items:
+                        self._items[item.item_id].status = 'acknowledged'
+        return report
+
+    def get_handoff_history(self, last_n: int = 10) -> List[HandoffReport]:
+        """Return the *last_n* most recent handoff reports (newest first)."""
+        with self._lock:
+            history = list(self._report_history)
+        return list(reversed(history[-last_n:]))
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

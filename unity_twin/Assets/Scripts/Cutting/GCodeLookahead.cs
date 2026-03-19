@@ -3844,4 +3844,245 @@ namespace MiracleTwin.Cutting
             return Mathf.Clamp(saving, 0f, 100f);
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Trochoidal Milling Path Generator
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Parameters describing a trochoidal milling operation.
+    /// </summary>
+    [Serializable]
+    public class TrochoidalParams
+    {
+        /// <summary>Width of the slot to machine (mm).</summary>
+        public float slotWidth;
+
+        /// <summary>Diameter of the cutting tool (mm).</summary>
+        public float toolDiameter;
+
+        /// <summary>Linear advance per trochoidal loop (mm).</summary>
+        public float stepover;
+
+        /// <summary>Radius of each trochoidal circle (mm).</summary>
+        public float trochoidRadius;
+
+        /// <summary>Cutting feed rate (mm/min).</summary>
+        public float feedRate;
+
+        /// <summary>"climb" or "conventional" milling direction.</summary>
+        public string direction = "climb";
+    }
+
+    /// <summary>
+    /// Result of a trochoidal path generation.
+    /// </summary>
+    [Serializable]
+    public class TrochoidalPath
+    {
+        /// <summary>Ordered waypoints of the trochoidal toolpath.</summary>
+        public List<Vector3> points = new();
+
+        /// <summary>Total arc-length of the path (mm).</summary>
+        public float totalLength;
+
+        /// <summary>Number of trochoidal loops in the path.</summary>
+        public int numberOfLoops;
+
+        /// <summary>Estimated machining time (seconds).</summary>
+        public float estimatedTimeSec;
+
+        /// <summary>Maximum tool engagement angle (degrees).</summary>
+        public float maxEngagementDeg;
+    }
+
+    /// <summary>
+    /// Generates trochoidal (circular) milling paths for slot cutting and
+    /// hard-material machining.  Trochoidal milling keeps radial engagement
+    /// low, allowing higher feed rates and reducing tool wear.
+    /// </summary>
+    public class TrochoidalPathGenerator
+    {
+        /// <summary>Number of discrete points per trochoidal circle.</summary>
+        private const int PointsPerLoop = 36;
+
+        // ── Core generation ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Generates a trochoidal toolpath along a straight slot defined by
+        /// <paramref name="startPoint"/> and <paramref name="endPoint"/>.
+        /// </summary>
+        public TrochoidalPath GenerateSlotPath(Vector3 startPoint,
+                                                Vector3 endPoint,
+                                                TrochoidalParams param)
+        {
+            ValidateParams(param);
+
+            var result = new TrochoidalPath();
+            Vector3 slotDir = (endPoint - startPoint);
+            float slotLength = slotDir.magnitude;
+
+            if (slotLength < 1e-6f)
+            {
+                result.points.Add(startPoint);
+                result.totalLength = 0f;
+                result.numberOfLoops = 0;
+                result.estimatedTimeSec = 0f;
+                result.maxEngagementDeg = 0f;
+                return result;
+            }
+
+            Vector3 forward = slotDir.normalized;
+            // Lateral direction perpendicular to slot in XY plane
+            Vector3 lateral = new Vector3(-forward.z, 0f, forward.x);
+            if (lateral.sqrMagnitude < 1e-12f)
+                lateral = new Vector3(-forward.y, forward.x, 0f);
+            lateral = lateral.normalized;
+
+            float radius = param.trochoidRadius;
+            float step = param.stepover;
+            int loopCount = Mathf.Max(1, Mathf.CeilToInt(slotLength / step));
+
+            float totalLen = 0f;
+            Vector3 prev = startPoint;
+            result.points.Add(startPoint);
+
+            bool isClimb = param.direction != "conventional";
+
+            for (int loop = 0; loop < loopCount; loop++)
+            {
+                float baseAdvance = loop * step;
+                Vector3 center = startPoint + forward * Mathf.Min(baseAdvance, slotLength);
+
+                for (int i = 1; i <= PointsPerLoop; i++)
+                {
+                    float t = (float)i / PointsPerLoop;
+                    float angle = t * Mathf.PI * 2f;
+                    if (!isClimb) angle = -angle;
+
+                    // Advance linearly within each loop
+                    float loopAdvance = Mathf.Min(baseAdvance + t * step, slotLength);
+                    Vector3 pt = startPoint
+                                 + forward * loopAdvance
+                                 + lateral * (radius * Mathf.Sin(angle))
+                                 + new Vector3(0f, radius * Mathf.Cos(angle) - radius, 0f) * 0f; // keep Z flat
+
+                    // Apply circular motion on the lateral axis only
+                    pt = startPoint
+                         + forward * loopAdvance
+                         + lateral * (radius * Mathf.Sin(angle));
+                    pt.y = startPoint.y; // maintain constant Z-depth
+
+                    result.points.Add(pt);
+                    totalLen += Vector3.Distance(prev, pt);
+                    prev = pt;
+                }
+            }
+
+            // Final move to end point
+            result.points.Add(endPoint);
+            totalLen += Vector3.Distance(prev, endPoint);
+
+            result.totalLength = totalLen;
+            result.numberOfLoops = loopCount;
+            result.maxEngagementDeg = CalculateMaxEngagement(
+                radius, param.toolDiameter, param.stepover);
+            result.estimatedTimeSec = (param.feedRate > 0f)
+                ? (totalLen / param.feedRate) * 60f
+                : 0f;
+
+            return result;
+        }
+
+        // ── Helpers ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Computes the optimal trochoidal radius so the tool sweeps the
+        /// full slot width:  radius = (slotWidth − toolDiameter) / 2.
+        /// </summary>
+        public float CalculateTrochoidRadius(float slotWidth, float toolDiameter)
+        {
+            if (slotWidth <= 0f)
+                throw new ArgumentException("Slot width must be positive.");
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (toolDiameter >= slotWidth)
+                throw new ArgumentException(
+                    "Tool diameter must be smaller than slot width for trochoidal milling.");
+
+            return (slotWidth - toolDiameter) / 2f;
+        }
+
+        /// <summary>
+        /// Calculates the maximum tool engagement angle (degrees) based on
+        /// the trochoidal radius, tool diameter, and stepover.
+        ///
+        /// Uses the geometric relation:
+        ///   engagement = 2 * asin(stepover / (2 * (trochoidRadius + toolDiameter / 2)))
+        /// clamped to [0, 180].
+        /// </summary>
+        public float CalculateMaxEngagement(float trochoidRadius,
+                                             float toolDiameter,
+                                             float stepover)
+        {
+            if (trochoidRadius <= 0f)
+                throw new ArgumentException("Trochoid radius must be positive.");
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (stepover <= 0f)
+                throw new ArgumentException("Stepover must be positive.");
+
+            float effectiveRadius = trochoidRadius + toolDiameter / 2f;
+            float sinVal = stepover / (2f * effectiveRadius);
+            sinVal = Mathf.Clamp(sinVal, 0f, 1f);
+            float angleDeg = 2f * Mathf.Rad2Deg * Mathf.Asin(sinVal);
+            return Mathf.Clamp(angleDeg, 0f, 180f);
+        }
+
+        /// <summary>
+        /// Estimates the percentage of time saved (or lost) when comparing
+        /// conventional straight-slot machining time to trochoidal time.
+        ///
+        /// A negative value means trochoidal takes longer (typical, but
+        /// offset by tool-life gains and higher allowable feeds in hard
+        /// materials).
+        /// </summary>
+        public float EstimateTimeSaving(float conventionalTimeSec,
+                                         float trochoidalTimeSec)
+        {
+            if (conventionalTimeSec <= 0f)
+                return 0f;
+            // positive = time saved, negative = extra time spent
+            return ((conventionalTimeSec - trochoidalTimeSec) / conventionalTimeSec) * 100f;
+        }
+
+        /// <summary>
+        /// Validates trochoidal parameters.  Throws ArgumentException when
+        /// constraints are violated.
+        /// </summary>
+        public void ValidateParams(TrochoidalParams p)
+        {
+            if (p == null)
+                throw new ArgumentNullException(nameof(p));
+            if (p.slotWidth <= 0f)
+                throw new ArgumentException("Slot width must be positive.");
+            if (p.toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (p.toolDiameter >= p.slotWidth)
+                throw new ArgumentException(
+                    "Tool diameter must be smaller than slot width.");
+            if (p.stepover <= 0f)
+                throw new ArgumentException("Stepover must be positive.");
+            if (p.trochoidRadius <= 0f)
+                throw new ArgumentException("Trochoid radius must be positive.");
+            if (p.stepover >= 2f * p.trochoidRadius)
+                throw new ArgumentException(
+                    "Stepover must be less than the trochoid diameter (2 * radius).");
+            if (p.feedRate <= 0f)
+                throw new ArgumentException("Feed rate must be positive.");
+            if (p.direction != "climb" && p.direction != "conventional")
+                throw new ArgumentException(
+                    "Direction must be 'climb' or 'conventional'.");
+        }
+    }
 }

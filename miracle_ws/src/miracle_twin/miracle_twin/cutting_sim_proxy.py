@@ -5919,3 +5919,229 @@ class CoolantFlowSimulator:
             lubrication_score=round(lubrication_score, 2),
             overall_effectiveness=round(overall, 2),
         )
+
+
+# ---------------------------------------------------------------------------
+# Specific Cutting Energy Model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CuttingEnergyInput:
+    """Input parameters for specific cutting energy calculation."""
+    material: str = 'steel'
+    cutting_speed_m_min: float = 150.0
+    feed_per_tooth_mm: float = 0.10
+    depth_of_cut_mm: float = 2.0
+    width_of_cut_mm: float = 10.0
+    tool_diameter_mm: float = 12.0
+    num_flutes: int = 4
+    rake_angle_deg: float = 6.0
+
+
+@dataclass
+class CuttingEnergyResult:
+    """Results from specific cutting energy calculation."""
+    specific_energy_j_mm3: float = 0.0
+    total_power_kw: float = 0.0
+    mrr_mm3_min: float = 0.0
+    tangential_force_n: float = 0.0
+    torque_nm: float = 0.0
+    efficiency_pct: float = 0.0
+
+
+class SpecificCuttingEnergyModel:
+    """Models specific cutting energy (energy per unit volume of material removed).
+
+    Implements the Kienzle model for specific cutting energy with corrections
+    for chip thickness, rake angle, and tool wear.  Provides methods to
+    calculate power, torque, tangential force, and to compare energy
+    requirements across different workpiece materials.
+    """
+
+    # Base specific energy values in J/mm^3 (kc1.1 reference values at
+    # h=1 mm chip thickness and 0 deg rake angle).
+    _MATERIAL_ENERGY: Dict[str, float] = {
+        'aluminum': 0.7,
+        'steel': 2.5,
+        'stainless': 3.0,
+        'titanium': 4.0,
+        'cast_iron': 1.5,
+        'inconel': 5.0,
+        'brass': 1.0,
+        'copper': 1.2,
+    }
+
+    # Kienzle exponent (1 - mc) per material.  mc typically 0.20-0.40.
+    _KIENZLE_EXPONENT: Dict[str, float] = {
+        'aluminum': 0.70,
+        'steel': 0.74,
+        'stainless': 0.72,
+        'titanium': 0.77,
+        'cast_iron': 0.68,
+        'inconel': 0.78,
+        'brass': 0.72,
+        'copper': 0.73,
+    }
+
+    # Machine / spindle efficiency used when reporting efficiency_pct.
+    _DEFAULT_MACHINE_EFFICIENCY = 0.80
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_material_specific_energy(self, material: str) -> float:
+        """Look up base specific energy (J/mm^3) for *material*.
+
+        Returns the kc1.1 reference value.  Raises ``KeyError`` when the
+        material is not found in the built-in table.
+        """
+        key = material.strip().lower()
+        if key not in self._MATERIAL_ENERGY:
+            raise KeyError(
+                f"Unknown material '{material}'. "
+                f"Available: {', '.join(sorted(self._MATERIAL_ENERGY))}"
+            )
+        return self._MATERIAL_ENERGY[key]
+
+    def apply_corrections(
+        self,
+        base_energy: float,
+        feed: float,
+        rake_angle: float,
+        wear_factor: float = 1.0,
+        material: str = 'steel',
+    ) -> float:
+        """Correct base specific energy for operating conditions.
+
+        Applies the Kienzle chip-thickness correction
+        ``kc = kc1.1 * h^(-mc)`` where *h* is the mean chip thickness
+        (approximated by *feed*), a rake-angle correction, and a
+        multiplicative *wear_factor* (1.0 = sharp tool).
+
+        Parameters
+        ----------
+        base_energy : float
+            Reference specific energy kc1.1 (J/mm^3).
+        feed : float
+            Feed per tooth in mm (used as mean chip thickness *h*).
+        rake_angle : float
+            Actual rake angle in degrees.
+        wear_factor : float
+            Multiplicative wear correction (>= 1.0 for worn tools).
+        material : str
+            Material key used to look up the Kienzle exponent.
+        """
+        # Clamp feed to avoid division-by-zero / extreme blow-up
+        h = max(feed, 0.001)
+
+        # Kienzle chip-thickness correction
+        mc = 1.0 - self._KIENZLE_EXPONENT.get(material.strip().lower(), 0.74)
+        kc = base_energy * (h ** (-mc))
+
+        # Rake-angle correction: ~1.5 % per degree deviation from 0 deg
+        rake_correction = 1.0 - 0.015 * rake_angle
+        rake_correction = max(0.5, min(1.5, rake_correction))
+        kc *= rake_correction
+
+        # Tool wear multiplier (worn tools require more energy)
+        kc *= max(1.0, wear_factor)
+
+        return kc
+
+    def calculate_torque(self, power_kw: float, rpm: float) -> float:
+        """Calculate spindle torque from power and RPM.
+
+        T = P * 9549 / RPM  (P in kW, T in Nm).
+        """
+        if rpm <= 0:
+            return 0.0
+        return power_kw * 9549.0 / rpm
+
+    def calculate(self, inp: 'CuttingEnergyInput') -> CuttingEnergyResult:
+        """Compute specific cutting energy and all derived quantities.
+
+        Parameters
+        ----------
+        inp : CuttingEnergyInput
+            Cutting parameters and material information.
+
+        Returns
+        -------
+        CuttingEnergyResult
+        """
+        # --- Material-specific base energy ---------------------
+        base_energy = self.get_material_specific_energy(inp.material)
+
+        # --- Corrected specific energy -------------------------
+        kc = self.apply_corrections(
+            base_energy=base_energy,
+            feed=inp.feed_per_tooth_mm,
+            rake_angle=inp.rake_angle_deg,
+            wear_factor=1.0,
+            material=inp.material,
+        )
+
+        # --- Material Removal Rate (MRR) ----------------------
+        # MRR = ae * ap * fz * z * n   (mm^3/min)
+        # where n (RPM) = (Vc * 1000) / (pi * D)
+        rpm = (inp.cutting_speed_m_min * 1000.0) / (
+            math.pi * max(inp.tool_diameter_mm, 0.01)
+        )
+        feed_rate_mmpm = inp.feed_per_tooth_mm * inp.num_flutes * rpm
+        mrr = inp.width_of_cut_mm * inp.depth_of_cut_mm * feed_rate_mmpm
+
+        # --- Power (kW) ----------------------------------------
+        # P = kc * MRR / (60 * 1000)   kc in J/mm^3, MRR in mm^3/min
+        power_kw = kc * mrr / 60_000.0
+
+        # --- Tangential force (N) ------------------------------
+        # Ft = P * 60000 / (pi * D * n)   (from P = Ft * Vc)
+        vc_mm_min = inp.cutting_speed_m_min * 1000.0
+        if vc_mm_min > 0:
+            tangential_force = power_kw * 60_000.0 / vc_mm_min
+        else:
+            tangential_force = 0.0
+
+        # --- Torque (Nm) ----------------------------------------
+        torque = self.calculate_torque(power_kw, rpm)
+
+        # --- Efficiency (spindle / machine) ---------------------
+        efficiency_pct = self._DEFAULT_MACHINE_EFFICIENCY * 100.0
+
+        return CuttingEnergyResult(
+            specific_energy_j_mm3=round(kc, 4),
+            total_power_kw=round(power_kw, 4),
+            mrr_mm3_min=round(mrr, 4),
+            tangential_force_n=round(tangential_force, 4),
+            torque_nm=round(torque, 4),
+            efficiency_pct=round(efficiency_pct, 2),
+        )
+
+    def compare_materials(
+        self,
+        materials: List[str],
+        inp: 'CuttingEnergyInput',
+    ) -> Dict[str, CuttingEnergyResult]:
+        """Compare energy requirements across *materials*.
+
+        Runs ``calculate`` for each material in *materials*, keeping all
+        other cutting parameters from *inp* unchanged.
+
+        Returns a dict mapping material name -> ``CuttingEnergyResult``.
+        """
+        results: Dict[str, CuttingEnergyResult] = {}
+        for mat in materials:
+            modified = CuttingEnergyInput(
+                material=mat,
+                cutting_speed_m_min=inp.cutting_speed_m_min,
+                feed_per_tooth_mm=inp.feed_per_tooth_mm,
+                depth_of_cut_mm=inp.depth_of_cut_mm,
+                width_of_cut_mm=inp.width_of_cut_mm,
+                tool_diameter_mm=inp.tool_diameter_mm,
+                num_flutes=inp.num_flutes,
+                rake_angle_deg=inp.rake_angle_deg,
+            )
+            results[mat] = self.calculate(modified)
+        return results

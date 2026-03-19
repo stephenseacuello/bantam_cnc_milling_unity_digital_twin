@@ -3423,6 +3423,232 @@ class ChangeoverOptimizer:
         return recs
 
 
+# ---------------------------------------------------------------------------
+# Capacity Planner
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CapacitySlot:
+    """A time slot of available capacity on a specific machine."""
+
+    machine_id: str
+    start_time: float
+    end_time: float
+    available_hours: float
+    allocated_hours: float = 0.0
+    utilization_pct: float = 0.0
+
+
+@dataclass
+class DemandForecast:
+    """A forecast of manufacturing demand for a specific part."""
+
+    part_number: str
+    quantity: int
+    time_per_part_min: float
+    due_date: float
+    priority: int = 2  # 0=highest, matches Priority enum
+
+
+@dataclass
+class CapacityPlan:
+    """Result of a capacity planning run."""
+
+    slots: List[CapacitySlot] = field(default_factory=list)
+    total_available_hours: float = 0.0
+    total_allocated_hours: float = 0.0
+    overall_utilization_pct: float = 0.0
+    bottleneck_machine: str = ''
+    unmet_demand: List[DemandForecast] = field(default_factory=list)
+    feasible: bool = True
+
+
+class CapacityPlanner:
+    """Plans manufacturing capacity against demand forecasts.
+
+    Registers machines with their daily available hours and accepts demand
+    forecasts.  The ``plan()`` method allocates demand to machines over a
+    planning horizon and identifies bottlenecks and unmet demand.
+    """
+
+    def __init__(self) -> None:
+        self._machines: Dict[str, float] = {}  # machine_id -> hours/day
+        self._demands: List[DemandForecast] = []
+
+    # -- Registration -------------------------------------------------------
+
+    def add_machine(self, machine_id: str, available_hours_per_day: float) -> None:
+        """Register a machine with its daily available hours."""
+        self._machines[machine_id] = available_hours_per_day
+
+    def add_demand(self, forecast: DemandForecast) -> None:
+        """Add a demand forecast to the planning queue."""
+        self._demands.append(forecast)
+
+    # -- Planning -----------------------------------------------------------
+
+    def plan(
+        self,
+        planning_horizon_days: int = 5,
+        start_time: float = 0.0,
+    ) -> CapacityPlan:
+        """Generate a :class:`CapacityPlan` allocating demand to machines.
+
+        Demand is sorted by priority (lower value = higher priority), then by
+        due date (earlier first).  Each demand item is greedily assigned to
+        the machine with the most remaining capacity.
+        """
+        if not self._machines:
+            return CapacityPlan(feasible=len(self._demands) == 0)
+
+        # Build capacity slots — one per machine for the whole horizon.
+        slots: Dict[str, CapacitySlot] = {}
+        for mid, hrs_day in self._machines.items():
+            total_hrs = hrs_day * planning_horizon_days
+            end_time = start_time + planning_horizon_days * 24.0 * 3600.0
+            slots[mid] = CapacitySlot(
+                machine_id=mid,
+                start_time=start_time,
+                end_time=end_time,
+                available_hours=total_hrs,
+                allocated_hours=0.0,
+                utilization_pct=0.0,
+            )
+
+        # Sort demands: priority ascending, then due_date ascending.
+        sorted_demands = sorted(
+            self._demands,
+            key=lambda d: (d.priority, d.due_date),
+        )
+
+        unmet: List[DemandForecast] = []
+
+        for demand in sorted_demands:
+            hours_remaining = (demand.quantity * demand.time_per_part_min) / 60.0
+
+            # Spread demand across machines, filling the least-loaded first.
+            while hours_remaining > 1e-9:
+                best_machine: Optional[str] = None
+                best_cap = -1.0
+                for mid, slot in slots.items():
+                    cap = slot.available_hours - slot.allocated_hours
+                    if cap > best_cap:
+                        best_cap = cap
+                        best_machine = mid
+
+                if best_machine is None or best_cap <= 0:
+                    break
+
+                allocate = min(hours_remaining, best_cap)
+                slots[best_machine].allocated_hours += allocate
+                hours_remaining -= allocate
+
+            if hours_remaining > 1e-9:
+                leftover_qty = math.ceil(
+                    hours_remaining * 60.0 / max(demand.time_per_part_min, 0.001)
+                )
+                if leftover_qty > 0:
+                    unmet.append(
+                        DemandForecast(
+                            part_number=demand.part_number,
+                            quantity=leftover_qty,
+                            time_per_part_min=demand.time_per_part_min,
+                            due_date=demand.due_date,
+                            priority=demand.priority,
+                        )
+                    )
+
+        # Compute utilization percentages.
+        for slot in slots.values():
+            if slot.available_hours > 0:
+                slot.utilization_pct = (
+                    slot.allocated_hours / slot.available_hours
+                ) * 100.0
+
+        total_avail = sum(s.available_hours for s in slots.values())
+        total_alloc = sum(s.allocated_hours for s in slots.values())
+        overall_util = (total_alloc / total_avail * 100.0) if total_avail > 0 else 0.0
+
+        bottleneck = self.identify_bottleneck(slots_override=slots)
+
+        return CapacityPlan(
+            slots=list(slots.values()),
+            total_available_hours=total_avail,
+            total_allocated_hours=total_alloc,
+            overall_utilization_pct=overall_util,
+            bottleneck_machine=bottleneck,
+            unmet_demand=unmet,
+            feasible=len(unmet) == 0,
+        )
+
+    # -- Analysis -----------------------------------------------------------
+
+    def identify_bottleneck(
+        self,
+        slots_override: Optional[Dict[str, CapacitySlot]] = None,
+    ) -> str:
+        """Return the machine_id of the most loaded machine.
+
+        If *slots_override* is provided it is used directly; otherwise a
+        plan is generated with default parameters.
+        """
+        if slots_override is not None:
+            slots = slots_override
+        else:
+            plan = self.plan()
+            slots = {s.machine_id: s for s in plan.slots}
+
+        if not slots:
+            return ''
+
+        return max(slots.values(), key=lambda s: s.utilization_pct).machine_id
+
+    def get_overtime_needed(self, planning_horizon_days: int = 5) -> float:
+        """Calculate extra hours needed if demand exceeds capacity.
+
+        Returns the total overtime hours required to satisfy all demand.
+        """
+        if not self._machines:
+            total_demand_hrs = sum(
+                (d.quantity * d.time_per_part_min) / 60.0 for d in self._demands
+            )
+            return total_demand_hrs
+
+        total_capacity = (
+            sum(self._machines.values()) * planning_horizon_days
+        )
+        total_demand = sum(
+            (d.quantity * d.time_per_part_min) / 60.0 for d in self._demands
+        )
+        overtime = total_demand - total_capacity
+        return max(0.0, overtime)
+
+    def what_if_add_machine(
+        self,
+        machine_id: str,
+        hours: float,
+    ) -> float:
+        """Simulate adding a machine and return the updated overall utilization %.
+
+        The original planner state is **not** modified.
+        """
+        # Temporarily add the machine, plan, then remove it.
+        original_hours = self._machines.get(machine_id)
+        self._machines[machine_id] = hours
+
+        plan = self.plan()
+        utilization = plan.overall_utilization_pct
+
+        # Restore original state.
+        if original_hours is None:
+            del self._machines[machine_id]
+        else:
+            self._machines[machine_id] = original_hours
+
+        return utilization
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

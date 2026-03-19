@@ -3870,3 +3870,296 @@ class OutlierDetectionEngine:
         var = sum((x - mean) ** 2 for x in clean) / n
         std = math.sqrt(var)
         return {'mean': mean, 'std': std}
+
+
+# ====================================================================== #
+#  Multi-Variable Regression Model Manager                                #
+# ====================================================================== #
+
+
+@dataclass
+class RegressionModel:
+    """A fitted OLS regression model for manufacturing process prediction."""
+    model_id: str
+    name: str
+    coefficients: List[float]
+    intercept: float
+    r_squared: float
+    features: List[str]
+    target: str
+    n_samples: int
+
+
+@dataclass
+class PredictionResult:
+    """Result of a regression prediction."""
+    predicted_value: float
+    model_id: str
+    confidence_interval: Tuple[float, float]
+    residual_std: float
+    features_used: Dict[str, float]
+
+
+class RegressionModelManager:
+    """Manage multiple OLS regression models for manufacturing process prediction.
+
+    Uses pure-Python normal-equation solving (no NumPy dependency) so the
+    module remains lightweight inside the ROS 2 workspace.
+    """
+
+    def __init__(self) -> None:
+        self._models: Dict[str, RegressionModel] = {}
+        # Keep training residuals for prediction intervals
+        self._residual_stds: Dict[str, float] = {}
+
+    # ------------------------------------------------------------------ #
+    #  Linear-algebra helpers (pure Python)                               #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _transpose(matrix: List[List[float]]) -> List[List[float]]:
+        """Transpose a 2-D list."""
+        rows = len(matrix)
+        cols = len(matrix[0])
+        return [[matrix[r][c] for r in range(rows)] for c in range(cols)]
+
+    @staticmethod
+    def _mat_mul(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
+        """Multiply two 2-D matrices."""
+        rows_a, cols_a = len(a), len(a[0])
+        cols_b = len(b[0])
+        result = [[0.0] * cols_b for _ in range(rows_a)]
+        for i in range(rows_a):
+            for j in range(cols_b):
+                s = 0.0
+                for k in range(cols_a):
+                    s += a[i][k] * b[k][j]
+                result[i][j] = s
+        return result
+
+    @staticmethod
+    def _mat_vec(a: List[List[float]], v: List[float]) -> List[float]:
+        """Multiply a matrix by a column vector."""
+        return [sum(a[i][k] * v[k] for k in range(len(v))) for i in range(len(a))]
+
+    @staticmethod
+    def _invert(matrix: List[List[float]]) -> List[List[float]]:
+        """Invert a square matrix via Gauss-Jordan elimination."""
+        n = len(matrix)
+        # Augment with identity
+        aug = [row[:] + [1.0 if i == j else 0.0 for j in range(n)] for i, row in enumerate(matrix)]
+        for col in range(n):
+            # Partial pivot
+            max_row = col
+            for row in range(col + 1, n):
+                if abs(aug[row][col]) > abs(aug[max_row][col]):
+                    max_row = row
+            aug[col], aug[max_row] = aug[max_row], aug[col]
+            pivot = aug[col][col]
+            if abs(pivot) < 1e-12:
+                raise ValueError("Singular matrix — cannot invert (features may be collinear).")
+            for j in range(2 * n):
+                aug[col][j] /= pivot
+            for row in range(n):
+                if row == col:
+                    continue
+                factor = aug[row][col]
+                for j in range(2 * n):
+                    aug[row][j] -= factor * aug[col][j]
+        return [row[n:] for row in aug]
+
+    # ------------------------------------------------------------------ #
+    #  Public API                                                         #
+    # ------------------------------------------------------------------ #
+
+    def fit(
+        self,
+        model_id: str,
+        name: str,
+        X_data: Dict[str, List[float]],
+        y_data: List[float],
+        target_name: str,
+    ) -> RegressionModel:
+        """Fit an OLS regression model using the normal equations.
+
+        Parameters
+        ----------
+        model_id : str
+            Unique identifier for this model.
+        name : str
+            Human-readable name for the model.
+        X_data : dict[str, list[float]]
+            Feature name -> list of sample values.
+        y_data : list[float]
+            Target variable observations.
+        target_name : str
+            Name of the target variable.
+
+        Returns
+        -------
+        RegressionModel
+            The newly fitted model (also stored internally).
+        """
+        feature_names = sorted(X_data.keys())
+        n = len(y_data)
+        if n == 0:
+            raise ValueError("y_data must not be empty.")
+        p = len(feature_names)
+
+        # Build design matrix with intercept column
+        X = []
+        for i in range(n):
+            row = [1.0] + [X_data[f][i] for f in feature_names]
+            X.append(row)
+
+        Xt = self._transpose(X)
+        XtX = self._mat_mul(Xt, X)
+        Xty = self._mat_vec(Xt, y_data)
+        XtX_inv = self._invert(XtX)
+        beta = self._mat_vec(XtX_inv, Xty)
+
+        intercept = beta[0]
+        coefficients = beta[1:]
+
+        # Predictions & R²
+        y_pred = [sum(X[i][j] * beta[j] for j in range(p + 1)) for i in range(n)]
+        y_mean = sum(y_data) / n
+        ss_tot = sum((y - y_mean) ** 2 for y in y_data)
+        ss_res = sum((y_data[i] - y_pred[i]) ** 2 for i in range(n))
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        # Residual standard deviation (unbiased, dof = n - p - 1)
+        dof = max(n - p - 1, 1)
+        residual_std = math.sqrt(ss_res / dof)
+
+        model = RegressionModel(
+            model_id=model_id,
+            name=name,
+            coefficients=coefficients,
+            intercept=intercept,
+            r_squared=r_squared,
+            features=feature_names,
+            target=target_name,
+            n_samples=n,
+        )
+        self._models[model_id] = model
+        self._residual_stds[model_id] = residual_std
+        return model
+
+    def predict(
+        self,
+        model_id: str,
+        features: Dict[str, float],
+        confidence_level: float = 0.95,
+    ) -> PredictionResult:
+        """Predict using a previously fitted model.
+
+        Parameters
+        ----------
+        model_id : str
+            Identifier of the fitted model.
+        features : dict[str, float]
+            Feature name -> value for the new observation.
+        confidence_level : float
+            Confidence level for the prediction interval (default 0.95).
+
+        Returns
+        -------
+        PredictionResult
+        """
+        model = self.get_model(model_id)
+        residual_std = self._residual_stds[model_id]
+
+        predicted = model.intercept
+        for i, feat in enumerate(model.features):
+            if feat not in features:
+                raise KeyError(f"Missing feature '{feat}' for model '{model_id}'.")
+            predicted += model.coefficients[i] * features[feat]
+
+        # Approximate prediction interval using z-multiplier
+        z = self._z_multiplier(confidence_level)
+        margin = z * residual_std
+        ci = (predicted - margin, predicted + margin)
+
+        return PredictionResult(
+            predicted_value=predicted,
+            model_id=model_id,
+            confidence_interval=ci,
+            residual_std=residual_std,
+            features_used={f: features[f] for f in model.features},
+        )
+
+    def evaluate(
+        self,
+        model_id: str,
+        X_test: Dict[str, List[float]],
+        y_test: List[float],
+    ) -> Dict[str, float]:
+        """Evaluate a fitted model on held-out test data.
+
+        Returns dict with keys 'r_squared', 'rmse', 'mae'.
+        """
+        model = self.get_model(model_id)
+        n = len(y_test)
+        if n == 0:
+            raise ValueError("y_test must not be empty.")
+
+        y_pred = []
+        for i in range(n):
+            val = model.intercept
+            for j, feat in enumerate(model.features):
+                val += model.coefficients[j] * X_test[feat][i]
+            y_pred.append(val)
+
+        y_mean = sum(y_test) / n
+        ss_tot = sum((y - y_mean) ** 2 for y in y_test)
+        ss_res = sum((y_test[i] - y_pred[i]) ** 2 for i in range(n))
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        rmse = math.sqrt(ss_res / n)
+        mae = sum(abs(y_test[i] - y_pred[i]) for i in range(n)) / n
+
+        return {'r_squared': r_squared, 'rmse': rmse, 'mae': mae}
+
+    def get_model(self, model_id: str) -> RegressionModel:
+        """Return the fitted *RegressionModel* for *model_id*."""
+        if model_id not in self._models:
+            raise KeyError(f"No model found with id '{model_id}'.")
+        return self._models[model_id]
+
+    def get_all_models(self) -> List[RegressionModel]:
+        """Return a list of all fitted models."""
+        return list(self._models.values())
+
+    def get_feature_coefficients(self, model_id: str) -> Dict[str, float]:
+        """Return a mapping of feature name -> coefficient for a fitted model."""
+        model = self.get_model(model_id)
+        return {feat: coeff for feat, coeff in zip(model.features, model.coefficients)}
+
+    def compare_models(self, model_ids: List[str]) -> List[RegressionModel]:
+        """Rank the given models by R² (descending)."""
+        models = [self.get_model(mid) for mid in model_ids]
+        return sorted(models, key=lambda m: m.r_squared, reverse=True)
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _z_multiplier(confidence: float) -> float:
+        """Approximate z-multiplier for common confidence levels."""
+        # Rational approximation (Abramowitz & Stegun 26.2.23) for the
+        # inverse normal CDF is overkill here; use a small lookup table.
+        table = {
+            0.90: 1.645,
+            0.95: 1.960,
+            0.99: 2.576,
+        }
+        if confidence in table:
+            return table[confidence]
+        # Fallback: Beasley-Springer-Moro approximation
+        p = 0.5 + confidence / 2.0
+        t = math.sqrt(-2.0 * math.log(1.0 - p))
+        c0, c1, c2 = 2.515517, 0.802853, 0.010328
+        d1, d2, d3 = 1.432788, 0.189269, 0.001308
+        return t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t)

@@ -3867,3 +3867,207 @@ class ChaosEngineeringRunner:
             return self._experiments[experiment_id]
         except KeyError:
             raise KeyError(f"No experiment with id '{experiment_id}'")
+
+
+# ---------------------------------------------------------------------------
+# SLA Monitor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SLADefinition:
+    """Definition of a Service Level Agreement."""
+    sla_id: str
+    service_id: str
+    metric_name: str
+    target_value: float
+    comparison: str  # 'lt' | 'gt' | 'lte' | 'gte' | 'eq'
+    measurement_window_sec: float
+    min_compliance_pct: float = 99.0
+
+
+@dataclass
+class SLAMeasurement:
+    """A single SLA measurement record."""
+    sla_id: str
+    value: float
+    timestamp: float
+    compliant: bool
+
+
+@dataclass
+class SLAReport:
+    """Compliance report for a single SLA."""
+    sla_id: str
+    compliance_pct: float
+    total_measurements: int
+    violations: int
+    current_status: str   # 'meeting' | 'at_risk' | 'breached'
+    trend: str            # 'improving' | 'stable' | 'degrading'
+
+
+class SLAMonitor:
+    """Monitors service level agreements for system performance.
+
+    Tracks measurements against defined SLA targets, computes compliance
+    percentages, and generates reports with trend analysis.
+    """
+
+    def __init__(self) -> None:
+        self._definitions: Dict[str, SLADefinition] = {}
+        self._measurements: Dict[str, List[SLAMeasurement]] = {}
+
+    # -- public API ---------------------------------------------------------
+
+    def define_sla(self, definition: SLADefinition) -> None:
+        """Register a new SLA definition."""
+        if definition.comparison not in ('lt', 'gt', 'lte', 'gte', 'eq'):
+            raise ValueError(
+                f"Invalid comparison '{definition.comparison}'; "
+                "must be one of 'lt', 'gt', 'lte', 'gte', 'eq'"
+            )
+        self._definitions[definition.sla_id] = definition
+        self._measurements.setdefault(definition.sla_id, [])
+
+    def record_measurement(
+        self, sla_id: str, value: float, timestamp: float
+    ) -> SLAMeasurement:
+        """Record and evaluate a measurement against the SLA target.
+
+        Returns the ``SLAMeasurement`` created (including compliance flag).
+        Raises ``KeyError`` if *sla_id* is not registered.
+        """
+        defn = self._get_definition(sla_id)
+        compliant = self._evaluate(defn, value)
+        measurement = SLAMeasurement(
+            sla_id=sla_id,
+            value=value,
+            timestamp=timestamp,
+            compliant=compliant,
+        )
+        self._measurements[sla_id].append(measurement)
+        return measurement
+
+    def get_compliance(self, sla_id: str) -> float:
+        """Compute current compliance percentage within the measurement window.
+
+        Returns 100.0 when there are no measurements.
+        """
+        measurements = self._window_measurements(sla_id)
+        if not measurements:
+            return 100.0
+        compliant_count = sum(1 for m in measurements if m.compliant)
+        return (compliant_count / len(measurements)) * 100.0
+
+    def get_report(self, sla_id: str) -> SLAReport:
+        """Generate an ``SLAReport`` for the given SLA."""
+        defn = self._get_definition(sla_id)
+        measurements = self._window_measurements(sla_id)
+        total = len(measurements)
+        violations = sum(1 for m in measurements if not m.compliant)
+        compliance = self.get_compliance(sla_id)
+
+        # Determine status
+        if compliance < defn.min_compliance_pct:
+            status = 'breached'
+        elif self.is_at_risk(sla_id):
+            status = 'at_risk'
+        else:
+            status = 'meeting'
+
+        trend = self._compute_trend(sla_id)
+
+        return SLAReport(
+            sla_id=sla_id,
+            compliance_pct=compliance,
+            total_measurements=total,
+            violations=violations,
+            current_status=status,
+            trend=trend,
+        )
+
+    def get_all_reports(self) -> List[SLAReport]:
+        """Generate reports for every registered SLA."""
+        return [self.get_report(sid) for sid in self._definitions]
+
+    def get_violations(
+        self, sla_id: str, last_n: Optional[int] = None
+    ) -> List[SLAMeasurement]:
+        """Return recent violations for *sla_id*.
+
+        If *last_n* is provided, return at most the last *last_n* violations.
+        """
+        self._get_definition(sla_id)  # validate existence
+        violations = [
+            m for m in self._measurements.get(sla_id, []) if not m.compliant
+        ]
+        if last_n is not None:
+            violations = violations[-last_n:]
+        return violations
+
+    def is_at_risk(self, sla_id: str) -> bool:
+        """Return ``True`` if compliance is within 2% of the minimum threshold.
+
+        Specifically, the SLA is at risk when compliance falls below
+        ``min_compliance_pct + 2.0``.  A fully breached SLA (compliance below
+        the minimum) is also considered at risk.
+        """
+        defn = self._get_definition(sla_id)
+        compliance = self.get_compliance(sla_id)
+        return compliance < defn.min_compliance_pct + 2.0
+
+    # -- internals ----------------------------------------------------------
+
+    def _get_definition(self, sla_id: str) -> SLADefinition:
+        try:
+            return self._definitions[sla_id]
+        except KeyError:
+            raise KeyError(f"No SLA defined with id '{sla_id}'")
+
+    @staticmethod
+    def _evaluate(defn: SLADefinition, value: float) -> bool:
+        """Evaluate whether *value* meets the SLA target."""
+        cmp = defn.comparison
+        target = defn.target_value
+        if cmp == 'lt':
+            return value < target
+        if cmp == 'gt':
+            return value > target
+        if cmp == 'lte':
+            return value <= target
+        if cmp == 'gte':
+            return value >= target
+        if cmp == 'eq':
+            return value == target
+        return False  # pragma: no cover
+
+    def _window_measurements(self, sla_id: str) -> List[SLAMeasurement]:
+        """Return measurements within the SLA's measurement window."""
+        defn = self._get_definition(sla_id)
+        all_ms = self._measurements.get(sla_id, [])
+        if not all_ms:
+            return []
+        latest_ts = max(m.timestamp for m in all_ms)
+        cutoff = latest_ts - defn.measurement_window_sec
+        return [m for m in all_ms if m.timestamp >= cutoff]
+
+    def _compute_trend(self, sla_id: str) -> str:
+        """Determine the compliance trend by comparing halves of the window.
+
+        Splits measurements in the window into an older half and a newer half.
+        If compliance improved by more than 1 pp, the trend is ``improving``;
+        if it degraded by more than 1 pp, ``degrading``; otherwise ``stable``.
+        """
+        measurements = self._window_measurements(sla_id)
+        if len(measurements) < 4:
+            return 'stable'
+        mid = len(measurements) // 2
+        older = measurements[:mid]
+        newer = measurements[mid:]
+        older_pct = (sum(1 for m in older if m.compliant) / len(older)) * 100.0
+        newer_pct = (sum(1 for m in newer if m.compliant) / len(newer)) * 100.0
+        diff = newer_pct - older_pct
+        if diff > 1.0:
+            return 'improving'
+        if diff < -1.0:
+            return 'degrading'
+        return 'stable'

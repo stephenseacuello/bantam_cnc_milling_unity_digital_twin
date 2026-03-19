@@ -3610,3 +3610,274 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+# ---------------------------------------------------------------------------
+# Signal Conditioning Pipeline
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FilterConfig:
+    """Configuration for a signal conditioning filter.
+
+    Attributes:
+        filter_type: One of 'moving_average', 'exponential', 'median',
+                     'butterworth_low', or 'high_pass'.
+        window_size: Number of samples in the filter window (used by
+                     moving_average and median filters).
+        alpha: Smoothing factor for exponential filter (0 < alpha <= 1).
+        cutoff_ratio: Normalized cutoff frequency for butterworth_low and
+                      high_pass filters (0 < cutoff_ratio < 1).
+    """
+    filter_type: str = 'moving_average'
+    window_size: int = 5
+    alpha: float = 0.3
+    cutoff_ratio: float = 0.1
+
+
+@dataclass
+class ConditionedSignal:
+    """Result of applying a signal conditioning filter.
+
+    Attributes:
+        raw_values: Original unfiltered sensor readings.
+        filtered_values: Sensor readings after filtering.
+        filter_applied: Name of the filter that was applied.
+        snr_improvement_db: Improvement in signal-to-noise ratio (dB).
+        removed_outliers: Number of outlier samples removed or suppressed.
+    """
+    raw_values: List[float] = field(default_factory=list)
+    filtered_values: List[float] = field(default_factory=list)
+    filter_applied: str = ''
+    snr_improvement_db: float = 0.0
+    removed_outliers: int = 0
+
+
+class SignalConditioner:
+    """Signal conditioning pipeline for sensor data preprocessing.
+
+    Provides a collection of digital filters commonly used in CNC
+    manufacturing to clean sensor signals before they are consumed by
+    KPI calculations, anomaly detectors, or control charts.
+    """
+
+    # ----- moving average ------------------------------------------------
+
+    @staticmethod
+    def apply_moving_average(data: List[float], window: int = 5) -> List[float]:
+        """Simple moving average filter.
+
+        For the first ``window - 1`` samples the average is computed over
+        the available points so the output length matches the input.
+        """
+        if not data:
+            return []
+        window = max(1, window)
+        result: List[float] = []
+        for i in range(len(data)):
+            start = max(0, i - window + 1)
+            segment = data[start:i + 1]
+            result.append(sum(segment) / len(segment))
+        return result
+
+    # ----- exponential smoothing -----------------------------------------
+
+    @staticmethod
+    def apply_exponential_filter(data: List[float], alpha: float = 0.3) -> List[float]:
+        """Exponential smoothing filter.
+
+        ``alpha`` controls responsiveness: values close to 1.0 track the
+        raw signal closely; values close to 0.0 produce heavier smoothing.
+        """
+        if not data:
+            return []
+        alpha = max(0.0, min(1.0, alpha))
+        result: List[float] = [data[0]]
+        for i in range(1, len(data)):
+            smoothed = alpha * data[i] + (1.0 - alpha) * result[-1]
+            result.append(smoothed)
+        return result
+
+    # ----- median filter -------------------------------------------------
+
+    @staticmethod
+    def apply_median_filter(data: List[float], window: int = 5) -> List[float]:
+        """Median filter — effective at removing impulsive spikes.
+
+        Uses a centred window; at the edges the window is truncated.
+        """
+        if not data:
+            return []
+        window = max(1, window)
+        half = window // 2
+        result: List[float] = []
+        for i in range(len(data)):
+            start = max(0, i - half)
+            end = min(len(data), i + half + 1)
+            segment = sorted(data[start:end])
+            mid = len(segment) // 2
+            if len(segment) % 2 == 0:
+                result.append((segment[mid - 1] + segment[mid]) / 2.0)
+            else:
+                result.append(segment[mid])
+        return result
+
+    # ----- butterworth low-pass (IIR approximation) ----------------------
+
+    @staticmethod
+    def apply_butterworth_low(
+        data: List[float],
+        cutoff_ratio: float = 0.1,
+        order: int = 2,
+    ) -> List[float]:
+        """Simplified Butterworth low-pass filter (pure-Python IIR).
+
+        This is a single-pole IIR cascade that approximates a Butterworth
+        response.  ``cutoff_ratio`` is the normalised cutoff frequency
+        (0 < cutoff_ratio < 1 where 1 corresponds to Nyquist).  Higher
+        ``order`` gives a steeper roll-off.
+        """
+        if not data:
+            return []
+        cutoff_ratio = max(0.001, min(0.999, cutoff_ratio))
+        order = max(1, order)
+
+        # Compute the smoothing coefficient from the cutoff ratio.
+        # Using the bilinear-transform approximation for a single RC stage.
+        dt = 1.0
+        rc = dt / (2.0 * math.pi * cutoff_ratio)
+        coeff = dt / (rc + dt)
+
+        # Cascade *order* single-pole stages.
+        result = list(data)
+        for _ in range(order):
+            prev = result[0]
+            filtered: List[float] = [prev]
+            for i in range(1, len(result)):
+                prev = coeff * result[i] + (1.0 - coeff) * prev
+                filtered.append(prev)
+            result = filtered
+        return result
+
+    # ----- high-pass filter ----------------------------------------------
+
+    @staticmethod
+    def apply_high_pass(
+        data: List[float],
+        cutoff_ratio: float = 0.1,
+    ) -> List[float]:
+        """High-pass filter computed as ``data - low_pass(data)``.
+
+        Removes the low-frequency (DC / trend) component and retains
+        high-frequency content such as vibration.
+        """
+        if not data:
+            return []
+        low = SignalConditioner.apply_butterworth_low(data, cutoff_ratio, order=2)
+        return [d - l for d, l in zip(data, low)]
+
+    # ----- SNR calculation -----------------------------------------------
+
+    @staticmethod
+    def calculate_snr(raw: List[float], filtered: List[float]) -> float:
+        """Calculate signal-to-noise ratio improvement in dB.
+
+        SNR is computed as ``10 * log10(P_signal / P_noise)`` where the
+        *signal* is the filtered output and the *noise* is the residual
+        ``raw - filtered``.  Returns 0.0 when the noise power is zero.
+        """
+        if not raw or not filtered or len(raw) != len(filtered):
+            return 0.0
+
+        signal_power = sum(v * v for v in filtered) / len(filtered)
+        noise = [r - f for r, f in zip(raw, filtered)]
+        noise_power = sum(n * n for n in noise) / len(noise)
+
+        if noise_power < 1e-15:
+            return 0.0
+        if signal_power < 1e-15:
+            return 0.0
+        return 10.0 * math.log10(signal_power / noise_power)
+
+    # ----- automatic conditioning ----------------------------------------
+
+    def auto_condition(self, data: List[float]) -> ConditionedSignal:
+        """Automatically select and apply the best filter.
+
+        The heuristic works as follows:
+
+        1. Compute basic statistics (mean, std-dev, median, MAD).
+        2. Count outliers using robust MAD-based detection.
+        3. If spike-like outliers dominate (> 5 % of samples), use
+           a **median** filter — it is the most robust against
+           impulsive noise.
+        4. If the coefficient of variation is high (> 0.5), use an
+           **exponential** filter for aggressive smoothing.
+        5. Otherwise default to a **moving average**.
+
+        Returns a :class:`ConditionedSignal` with diagnostics.
+        """
+        if not data:
+            return ConditionedSignal(
+                raw_values=[],
+                filtered_values=[],
+                filter_applied='none',
+                snr_improvement_db=0.0,
+                removed_outliers=0,
+            )
+
+        n = len(data)
+        mean_val = sum(data) / n
+        variance = sum((x - mean_val) ** 2 for x in data) / max(n - 1, 1)
+        std_val = math.sqrt(variance) if variance > 0 else 0.0
+
+        # Robust outlier detection using median + MAD (median absolute
+        # deviation).  This avoids the problem where large spikes inflate
+        # the standard deviation so much that they no longer appear as
+        # outliers under a 3-sigma rule.
+        sorted_data = sorted(data)
+        median_val = (sorted_data[n // 2] if n % 2 == 1
+                      else (sorted_data[n // 2 - 1] + sorted_data[n // 2]) / 2.0)
+        abs_devs = sorted(abs(x - median_val) for x in data)
+        mad = (abs_devs[n // 2] if n % 2 == 1
+               else (abs_devs[n // 2 - 1] + abs_devs[n // 2]) / 2.0)
+        # Modified Z-score threshold: values with |x - median| > 3.5 * MAD
+        # are considered outliers (Iglewicz & Hoaglin recommendation).
+        mad_threshold = 3.5 * mad if mad > 1e-12 else 3.0 * std_val
+        outlier_count = sum(1 for x in data if abs(x - median_val) > mad_threshold) if mad_threshold > 0 else 0
+        outlier_ratio = outlier_count / n if n > 0 else 0.0
+
+        # Coefficient of variation.
+        cv = std_val / abs(mean_val) if abs(mean_val) > 1e-12 else 0.0
+
+        # Select filter.
+        if outlier_ratio > 0.05:
+            filtered = self.apply_median_filter(data, window=5)
+            filter_name = 'median'
+        elif cv > 0.5:
+            filtered = self.apply_exponential_filter(data, alpha=0.2)
+            filter_name = 'exponential'
+        else:
+            filtered = self.apply_moving_average(data, window=5)
+            filter_name = 'moving_average'
+
+        snr = self.calculate_snr(data, filtered)
+
+        # Count how many outliers the filter suppressed (moved within 2-sigma
+        # of the filtered mean).
+        f_mean = sum(filtered) / len(filtered)
+        f_var = sum((x - f_mean) ** 2 for x in filtered) / max(len(filtered) - 1, 1)
+        f_std = math.sqrt(f_var) if f_var > 0 else 0.0
+        suppressed = 0
+        for raw_v, filt_v in zip(data, filtered):
+            if mad_threshold > 0 and abs(raw_v - median_val) > mad_threshold:
+                if f_std == 0 or abs(filt_v - f_mean) <= 2.0 * f_std:
+                    suppressed += 1
+
+        return ConditionedSignal(
+            raw_values=list(data),
+            filtered_values=filtered,
+            filter_applied=filter_name,
+            snr_improvement_db=snr,
+            removed_outliers=suppressed,
+        )

@@ -1343,6 +1343,255 @@ class AlarmSuppressionRuleManager:
             ]
 
 
+# ---------------------------------------------------------------------------
+# ISA-18.2 Alarm Priority Matrix
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AlarmPriority:
+    """Represents an alarm priority level per ISA-18.2.
+
+    Attributes:
+        priority_level: Numeric priority (1=critical, 2=high, 3=medium, 4=low).
+        name: Human-readable name ('critical', 'high', 'medium', 'low').
+        color: Display colour associated with this priority.
+        response_time_sec: Maximum acceptable response time in seconds.
+        escalation_delay_sec: Delay before escalation to the next tier.
+    """
+    priority_level: int
+    name: str
+    color: str
+    response_time_sec: float
+    escalation_delay_sec: float
+
+
+@dataclass
+class PriorityAssignment:
+    """Records the priority assignment rationale for an alarm type.
+
+    Attributes:
+        alarm_type: Identifier for the alarm type (e.g. 'spindle_overload').
+        consequence: Consequence rating (1=minor … 4=catastrophic).
+        likelihood: Likelihood rating (1=rare … 4=likely).
+        assigned_priority: The resolved :class:`AlarmPriority`.
+        rationale: Free-text justification for the assignment.
+    """
+    alarm_type: str
+    consequence: int
+    likelihood: int
+    assigned_priority: AlarmPriority
+    rationale: str
+
+
+class AlarmPriorityMatrix:
+    """ISA-18.2 alarm priority matrix based on consequence and likelihood.
+
+    The matrix is a 4×4 grid:
+        - Consequence (rows): 1=minor, 2=moderate, 3=serious, 4=catastrophic
+        - Likelihood (columns): 1=rare, 2=unlikely, 3=possible, 4=likely
+
+    Each cell maps to a priority level (1–4) which references an
+    :class:`AlarmPriority` definition.
+    """
+
+    # Default priority definitions ------------------------------------------------
+    _DEFAULT_PRIORITIES: Dict[int, AlarmPriority] = {
+        1: AlarmPriority(
+            priority_level=1,
+            name='critical',
+            color='red',
+            response_time_sec=60.0,
+            escalation_delay_sec=120.0,
+        ),
+        2: AlarmPriority(
+            priority_level=2,
+            name='high',
+            color='orange',
+            response_time_sec=300.0,
+            escalation_delay_sec=600.0,
+        ),
+        3: AlarmPriority(
+            priority_level=3,
+            name='medium',
+            color='yellow',
+            response_time_sec=1800.0,
+            escalation_delay_sec=3600.0,
+        ),
+        4: AlarmPriority(
+            priority_level=4,
+            name='low',
+            color='blue',
+            response_time_sec=7200.0,
+            escalation_delay_sec=14400.0,
+        ),
+    }
+
+    # Default 4×4 matrix (consequence → likelihood → priority_level) -----------
+    # Rows = consequence (1..4), Columns = likelihood (1..4)
+    _DEFAULT_MATRIX: Dict[int, Dict[int, int]] = {
+        # consequence 4 (catastrophic)
+        4: {1: 2, 2: 1, 3: 1, 4: 1},
+        # consequence 3 (serious)
+        3: {1: 3, 2: 2, 3: 2, 4: 2},
+        # consequence 2 (moderate)
+        2: {1: 4, 2: 3, 3: 3, 4: 3},
+        # consequence 1 (minor)
+        1: {1: 4, 2: 4, 3: 4, 4: 3},
+    }
+
+    def __init__(
+        self,
+        priorities: Optional[Dict[int, AlarmPriority]] = None,
+        matrix: Optional[Dict[int, Dict[int, int]]] = None,
+    ) -> None:
+        self._priorities: Dict[int, AlarmPriority] = dict(
+            priorities or self._DEFAULT_PRIORITIES
+        )
+        self._matrix: Dict[int, Dict[int, int]] = {
+            c: dict(row) for c, row in (matrix or self._DEFAULT_MATRIX).items()
+        }
+        self._assignments: Dict[str, PriorityAssignment] = {}
+        self._lock = threading.Lock()
+
+    # --- lookup helpers -------------------------------------------------------
+
+    def get_priority(self, consequence: int, likelihood: int) -> AlarmPriority:
+        """Look up the priority for a given consequence/likelihood pair.
+
+        Args:
+            consequence: 1–4 (minor … catastrophic).
+            likelihood: 1–4 (rare … likely).
+
+        Returns:
+            The matching :class:`AlarmPriority`.
+
+        Raises:
+            ValueError: If consequence or likelihood is out of range or no
+                matching priority exists.
+        """
+        if consequence < 1 or consequence > 4:
+            raise ValueError(
+                f'consequence must be 1–4, got {consequence}'
+            )
+        if likelihood < 1 or likelihood > 4:
+            raise ValueError(
+                f'likelihood must be 1–4, got {likelihood}'
+            )
+        row = self._matrix.get(consequence)
+        if row is None:
+            raise ValueError(f'No matrix row for consequence={consequence}')
+        level = row.get(likelihood)
+        if level is None:
+            raise ValueError(
+                f'No matrix cell for consequence={consequence}, '
+                f'likelihood={likelihood}'
+            )
+        priority = self._priorities.get(level)
+        if priority is None:
+            raise ValueError(f'No priority definition for level={level}')
+        return priority
+
+    # --- assignment management ------------------------------------------------
+
+    def assign_priority(
+        self,
+        alarm_type: str,
+        consequence: int,
+        likelihood: int,
+        rationale: str = '',
+    ) -> PriorityAssignment:
+        """Assign a priority to an alarm type and store the assignment.
+
+        Args:
+            alarm_type: Alarm type identifier.
+            consequence: Consequence rating 1–4.
+            likelihood: Likelihood rating 1–4.
+            rationale: Free-text justification.
+
+        Returns:
+            The created :class:`PriorityAssignment`.
+        """
+        priority = self.get_priority(consequence, likelihood)
+        assignment = PriorityAssignment(
+            alarm_type=alarm_type,
+            consequence=consequence,
+            likelihood=likelihood,
+            assigned_priority=priority,
+            rationale=rationale,
+        )
+        with self._lock:
+            self._assignments[alarm_type] = assignment
+        return assignment
+
+    def get_assignment(self, alarm_type: str) -> Optional[PriorityAssignment]:
+        """Retrieve the priority assignment for an alarm type.
+
+        Returns:
+            The :class:`PriorityAssignment` or ``None`` if not assigned.
+        """
+        with self._lock:
+            return self._assignments.get(alarm_type)
+
+    def get_all_assignments(self) -> List[PriorityAssignment]:
+        """Return all assignments sorted by priority level (most critical first)."""
+        with self._lock:
+            assignments = list(self._assignments.values())
+        assignments.sort(key=lambda a: a.assigned_priority.priority_level)
+        return assignments
+
+    # --- response time --------------------------------------------------------
+
+    def get_response_time(self, priority_level: int) -> float:
+        """Return the required response time in seconds for a priority level.
+
+        Raises:
+            ValueError: If the priority level is not defined.
+        """
+        priority = self._priorities.get(priority_level)
+        if priority is None:
+            raise ValueError(
+                f'No priority definition for level={priority_level}'
+            )
+        return priority.response_time_sec
+
+    # --- rationalization ------------------------------------------------------
+
+    def rationalize(
+        self, assignments: Optional[List[PriorityAssignment]] = None
+    ) -> List[str]:
+        """Check assignments for inconsistencies.
+
+        Currently detects alarm types with the **same consequence** rating but
+        **different** assigned priority levels, which may indicate that the
+        matrix or the individual assignments are not consistent.
+
+        Args:
+            assignments: List to check.  If ``None``, uses the internally
+                stored assignments.
+
+        Returns:
+            List of human-readable inconsistency descriptions (empty if clean).
+        """
+        if assignments is None:
+            assignments = self.get_all_assignments()
+
+        # Group by consequence
+        by_consequence: Dict[int, List[PriorityAssignment]] = {}
+        for a in assignments:
+            by_consequence.setdefault(a.consequence, []).append(a)
+
+        issues: List[str] = []
+        for consequence, group in sorted(by_consequence.items()):
+            levels = {a.assigned_priority.priority_level for a in group}
+            if len(levels) > 1:
+                types = [a.alarm_type for a in group]
+                issues.append(
+                    f'Consequence {consequence}: alarm types {types} have '
+                    f'different priority levels {sorted(levels)}'
+                )
+        return issues
+
+
 class AlarmManagerNode(MiracleLifecycleNode):
     """Centralizes alarm management with ISA-18.2 compliance.
 

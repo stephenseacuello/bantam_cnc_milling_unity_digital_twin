@@ -2079,4 +2079,259 @@ namespace MiracleTwin.Cutting
             return totalTime;
         }
     }
+
+    // ── Pocket Feature Recognition ──────────────────────────────────
+
+    /// <summary>
+    /// Describes a single recognized pocket feature with geometric properties.
+    /// </summary>
+    [Serializable]
+    public class PocketFeature
+    {
+        public string pocketId;
+        public string pocketType;    // rectangular, circular, oblong, irregular
+        public float width;          // mm
+        public float length;         // mm
+        public float depth;          // mm
+        public float cornerRadius;   // mm
+        public float area;           // mm^2 (floor area)
+        public float volume;         // mm^3
+        public int islandCount;
+    }
+
+    /// <summary>
+    /// Aggregate analysis result for a set of recognized pockets.
+    /// </summary>
+    [Serializable]
+    public class PocketAnalysis
+    {
+        public List<PocketFeature> pockets = new List<PocketFeature>();
+        public float totalVolume;          // mm^3
+        public float deepestPocket;        // mm
+        public string recommendedStrategy; // spiral, zigzag, contour, plunge
+    }
+
+    /// <summary>
+    /// Recognizes and classifies pocket features from geometry data,
+    /// recommends machining strategies, and estimates machining time.
+    /// </summary>
+    public class PocketFeatureRecognizer
+    {
+        private int _nextId = 1;
+
+        /// <summary>
+        /// Generate a unique pocket identifier.
+        /// </summary>
+        private string NextPocketId()
+        {
+            return $"PKT-{_nextId++:D4}";
+        }
+
+        // ── Recognition helpers ──────────────────────────────────────
+
+        /// <summary>
+        /// Recognize a rectangular pocket from width, length, depth, and corner radius.
+        /// </summary>
+        public PocketFeature RecognizeRectangular(
+            float width, float length, float depth, float cornerRadius)
+        {
+            if (width <= 0f || length <= 0f || depth <= 0f)
+                return null;
+
+            float cr = Mathf.Max(cornerRadius, 0f);
+            // Floor area: rectangular area minus the four corner squares, plus
+            // the quarter-circle area at each corner.
+            float rectArea = width * length
+                - 4f * cr * cr
+                + Mathf.PI * cr * cr;
+            float vol = rectArea * depth;
+
+            return new PocketFeature
+            {
+                pocketId = NextPocketId(),
+                pocketType = "rectangular",
+                width = width,
+                length = length,
+                depth = depth,
+                cornerRadius = cr,
+                area = rectArea,
+                volume = vol,
+                islandCount = 0,
+            };
+        }
+
+        /// <summary>
+        /// Recognize a circular pocket from diameter and depth.
+        /// </summary>
+        public PocketFeature RecognizeCircular(float diameter, float depth)
+        {
+            if (diameter <= 0f || depth <= 0f)
+                return null;
+
+            float radius = diameter / 2f;
+            float circArea = Mathf.PI * radius * radius;
+            float vol = circArea * depth;
+
+            return new PocketFeature
+            {
+                pocketId = NextPocketId(),
+                pocketType = "circular",
+                width = diameter,
+                length = diameter,
+                depth = depth,
+                cornerRadius = radius,
+                area = circArea,
+                volume = vol,
+                islandCount = 0,
+            };
+        }
+
+        // ── Classification ───────────────────────────────────────────
+
+        /// <summary>
+        /// Classify a pocket as shallow, deep, or narrow based on aspect ratios.
+        /// depth / min(width, length) &gt; 3  =&gt; deep
+        /// depth / min(width, length) &lt; 0.25 =&gt; shallow
+        /// min(width, length) / max(width, length) &lt; 0.25 =&gt; narrow
+        /// Otherwise =&gt; standard
+        /// </summary>
+        public string ClassifyPocket(float width, float length, float depth)
+        {
+            if (width <= 0f || length <= 0f || depth <= 0f)
+                return "invalid";
+
+            float minDim = Mathf.Min(width, length);
+            float maxDim = Mathf.Max(width, length);
+            float depthRatio = depth / minDim;
+            float slotRatio = minDim / maxDim;
+
+            if (depthRatio > 3f)
+                return "deep";
+            if (slotRatio < 0.25f)
+                return "narrow";
+            if (depthRatio < 0.25f)
+                return "shallow";
+
+            return "standard";
+        }
+
+        // ── Strategy recommendation ──────────────────────────────────
+
+        /// <summary>
+        /// Suggest a machining strategy for the given pocket feature.
+        /// </summary>
+        public string RecommendStrategy(PocketFeature pocket)
+        {
+            if (pocket == null)
+                return "unknown";
+
+            string classification = ClassifyPocket(pocket.width, pocket.length, pocket.depth);
+
+            if (classification == "deep")
+                return "plunge";
+            if (classification == "narrow")
+                return "zigzag";
+
+            if (pocket.pocketType == "circular")
+                return "spiral";
+
+            if (pocket.islandCount > 0)
+                return "contour";
+
+            // Default for rectangular / oblong standard / shallow pockets
+            return "spiral";
+        }
+
+        // ── Machining time estimation ────────────────────────────────
+
+        /// <summary>
+        /// Rough estimate of machining time in minutes.
+        /// Calculates number of passes from area, stepover, and tool diameter,
+        /// then divides total path length by feed rate.
+        /// </summary>
+        public float EstimateMachiningTime(
+            PocketFeature pocket, float feedRate, float stepover, float toolDia)
+        {
+            if (pocket == null)
+                return 0f;
+            if (feedRate <= 0f || stepover <= 0f || toolDia <= 0f)
+                return 0f;
+
+            // Number of Z-levels
+            float depthPerPass = toolDia;  // axial depth = tool diameter heuristic
+            int zPasses = Mathf.Max(1, Mathf.CeilToInt(pocket.depth / depthPerPass));
+
+            // Passes per layer based on stepover across the width
+            float effectiveWidth = pocket.width;
+            int lateralPasses = Mathf.Max(1, Mathf.CeilToInt(effectiveWidth / stepover));
+
+            // Each lateral pass traverses the pocket length
+            float pathPerLayer = lateralPasses * pocket.length;
+
+            // Total path length across all Z-levels
+            float totalPath = pathPerLayer * zPasses;
+
+            // Time = distance / feed rate (minutes)
+            return totalPath / feedRate;
+        }
+
+        // ── Optimal tool diameter ────────────────────────────────────
+
+        /// <summary>
+        /// Suggest an optimal tool diameter based on pocket geometry.
+        /// The tool must fit the corner radius (diameter &lt;= 2 * cornerRadius)
+        /// and should not exceed 80% of the pocket's narrowest dimension.
+        /// Returns the smaller of those two constraints.
+        /// </summary>
+        public float GetOptimalToolDiameter(PocketFeature pocket)
+        {
+            if (pocket == null)
+                return 0f;
+
+            float minDim = Mathf.Min(pocket.width, pocket.length);
+            // Tool should be at most 80% of narrowest dimension
+            float dimLimit = minDim * 0.8f;
+
+            if (pocket.cornerRadius > 0f)
+            {
+                // Must be able to machine the corner radius
+                float cornerLimit = pocket.cornerRadius * 2f;
+                return Mathf.Min(dimLimit, cornerLimit);
+            }
+
+            return dimLimit;
+        }
+
+        // ── Full analysis helper ─────────────────────────────────────
+
+        /// <summary>
+        /// Build a PocketAnalysis from a list of pocket features.
+        /// </summary>
+        public PocketAnalysis Analyze(List<PocketFeature> pockets)
+        {
+            PocketAnalysis analysis = new PocketAnalysis();
+
+            if (pockets == null || pockets.Count == 0)
+                return analysis;
+
+            analysis.pockets = new List<PocketFeature>(pockets);
+            float totalVol = 0f;
+            float maxDepth = 0f;
+
+            foreach (PocketFeature p in pockets)
+            {
+                totalVol += p.volume;
+                if (p.depth > maxDepth)
+                    maxDepth = p.depth;
+            }
+
+            analysis.totalVolume = totalVol;
+            analysis.deepestPocket = maxDepth;
+
+            // Use the first pocket to determine the overall recommended strategy
+            analysis.recommendedStrategy = RecommendStrategy(pockets[0]);
+
+            return analysis;
+        }
+    }
 }

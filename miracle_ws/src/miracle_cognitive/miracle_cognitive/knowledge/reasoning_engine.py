@@ -2297,6 +2297,297 @@ class FMEARiskCalculator:
         }
 
 
+# ---------------------------------------------------------------------------
+# K-Means Clustering Analyzer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClusterResult:
+    """Result for a single cluster produced by k-means."""
+    cluster_id: int
+    centroid: List[float]
+    member_count: int
+    members: List[int]
+    inertia: float
+
+
+@dataclass
+class ClusteringReport:
+    """Full report from a k-means clustering run."""
+    clusters: List[ClusterResult]
+    k: int
+    total_inertia: float
+    silhouette_score: float
+    iterations: int
+    converged: bool
+
+
+class KMeansClusteringAnalyzer:
+    """Pure-Python k-means clustering for manufacturing pattern discovery.
+
+    Implements Euclidean-distance k-means with random initialisation,
+    iterative centroid updates, silhouette scoring, the elbow method for
+    optimal *k*, per-cluster statistics, and nearest-neighbour queries.
+    """
+
+    def __init__(self) -> None:
+        self._data: List[List[float]] = []
+        self._assignments: List[int] = []
+        self._centroids: List[List[float]] = []
+        self._report: Optional[ClusteringReport] = None
+        self._rng_state: int = 42
+
+    # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _euclidean(a: List[float], b: List[float]) -> float:
+        return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b)))
+
+    def _simple_random(self) -> float:
+        """Deterministic LCG so results are reproducible without *random*."""
+        self._rng_state = (self._rng_state * 1103515245 + 12345) & 0x7FFFFFFF
+        return self._rng_state / 0x7FFFFFFF
+
+    def _random_indices(self, n: int, k: int) -> List[int]:
+        """Select *k* distinct indices from 0..n-1 using the internal RNG."""
+        indices: List[int] = []
+        seen: set = set()
+        while len(indices) < k:
+            idx = int(self._simple_random() * n) % n
+            if idx not in seen:
+                seen.add(idx)
+                indices.append(idx)
+        return indices
+
+    # -- core algorithm ------------------------------------------------------
+
+    def fit(
+        self,
+        data: List[List[float]],
+        k: int = 3,
+        max_iterations: int = 300,
+        tolerance: float = 1e-4,
+    ) -> ClusteringReport:
+        """Run k-means on *data* and return a :class:`ClusteringReport`."""
+        if not data:
+            raise ValueError("data must not be empty")
+        if k < 1:
+            raise ValueError("k must be >= 1")
+        if k > len(data):
+            raise ValueError("k must be <= number of data points")
+
+        n = len(data)
+        dim = len(data[0])
+        self._data = [list(row) for row in data]
+
+        # Initialise centroids via random selection
+        init_idx = self._random_indices(n, k)
+        centroids = [list(self._data[i]) for i in init_idx]
+
+        assignments = [0] * n
+        converged = False
+        iterations = 0
+
+        for iteration in range(1, max_iterations + 1):
+            iterations = iteration
+
+            # Assignment step
+            new_assignments = []
+            for point in self._data:
+                dists = [self._euclidean(point, c) for c in centroids]
+                new_assignments.append(int(dists.index(min(dists))))
+            # Update step
+            new_centroids: List[List[float]] = []
+            for ci in range(k):
+                members = [
+                    self._data[j] for j in range(n) if new_assignments[j] == ci
+                ]
+                if members:
+                    centroid = [
+                        sum(m[d] for m in members) / len(members)
+                        for d in range(dim)
+                    ]
+                else:
+                    centroid = list(centroids[ci])
+                new_centroids.append(centroid)
+
+            # Check convergence
+            shift = max(
+                self._euclidean(new_centroids[ci], centroids[ci])
+                for ci in range(k)
+            )
+            assignments = new_assignments
+            centroids = new_centroids
+            if shift <= tolerance:
+                converged = True
+                break
+
+        self._centroids = centroids
+        self._assignments = assignments
+
+        # Build cluster results
+        cluster_results: List[ClusterResult] = []
+        total_inertia = 0.0
+        for ci in range(k):
+            members = [j for j in range(n) if assignments[j] == ci]
+            inertia = sum(
+                self._euclidean(self._data[j], centroids[ci]) ** 2
+                for j in members
+            )
+            total_inertia += inertia
+            cluster_results.append(
+                ClusterResult(
+                    cluster_id=ci,
+                    centroid=centroids[ci],
+                    member_count=len(members),
+                    members=members,
+                    inertia=inertia,
+                )
+            )
+
+        sil = self._silhouette(assignments, k)
+
+        self._report = ClusteringReport(
+            clusters=cluster_results,
+            k=k,
+            total_inertia=total_inertia,
+            silhouette_score=sil,
+            iterations=iterations,
+            converged=converged,
+        )
+        return self._report
+
+    # -- prediction ----------------------------------------------------------
+
+    def predict(self, point: List[float]) -> int:
+        """Assign *point* to the nearest existing cluster centroid."""
+        if not self._centroids:
+            raise RuntimeError("Must call fit() before predict()")
+        dists = [self._euclidean(point, c) for c in self._centroids]
+        return int(dists.index(min(dists)))
+
+    # -- optimal k (elbow method) -------------------------------------------
+
+    def find_optimal_k(
+        self, data: List[List[float]], max_k: int = 10
+    ) -> int:
+        """Return the best *k* using the elbow method (largest inertia drop)."""
+        if max_k < 2:
+            raise ValueError("max_k must be >= 2")
+        max_k = min(max_k, len(data))
+        inertias: List[float] = []
+        saved_state = self._rng_state
+        for k in range(1, max_k + 1):
+            self._rng_state = saved_state  # consistent seed per run
+            report = self.fit(data, k=k)
+            inertias.append(report.total_inertia)
+        # Largest relative drop
+        drops = [
+            inertias[i - 1] - inertias[i]
+            for i in range(1, len(inertias))
+        ]
+        best_k = int(drops.index(max(drops))) + 2  # +2 because drops[0] is k=2
+        # Re-fit at best k
+        self._rng_state = saved_state
+        self.fit(data, k=best_k)
+        return best_k
+
+    # -- cluster statistics --------------------------------------------------
+
+    def get_cluster_statistics(
+        self, cluster_id: int
+    ) -> Dict[str, List[float]]:
+        """Per-feature mean, std, min, max for the given cluster.
+
+        Returns a dict with keys ``'mean'``, ``'std'``, ``'min'``, ``'max'``,
+        each mapping to a list of length *dim*.
+        """
+        if self._report is None:
+            raise RuntimeError("Must call fit() before get_cluster_statistics()")
+        cluster = None
+        for c in self._report.clusters:
+            if c.cluster_id == cluster_id:
+                cluster = c
+                break
+        if cluster is None:
+            raise KeyError(f"Unknown cluster_id: {cluster_id}")
+        if not cluster.members:
+            raise ValueError(f"Cluster {cluster_id} has no members")
+
+        dim = len(self._data[0])
+        means: List[float] = []
+        stds: List[float] = []
+        mins: List[float] = []
+        maxs: List[float] = []
+        for d in range(dim):
+            vals = [self._data[j][d] for j in cluster.members]
+            mn = sum(vals) / len(vals)
+            means.append(mn)
+            var = sum((v - mn) ** 2 for v in vals) / len(vals)
+            stds.append(math.sqrt(var))
+            mins.append(min(vals))
+            maxs.append(max(vals))
+        return {'mean': means, 'std': stds, 'min': mins, 'max': maxs}
+
+    # -- nearest neighbours --------------------------------------------------
+
+    def get_nearest_neighbors(
+        self, point: List[float], n: int = 5
+    ) -> List[Tuple[int, float]]:
+        """Return the *n* closest data points as ``(index, distance)`` pairs."""
+        if not self._data:
+            raise RuntimeError("Must call fit() before get_nearest_neighbors()")
+        dists = [
+            (i, self._euclidean(point, self._data[i]))
+            for i in range(len(self._data))
+        ]
+        dists.sort(key=lambda x: x[1])
+        return dists[:n]
+
+    # -- silhouette ----------------------------------------------------------
+
+    def _silhouette(self, assignments: List[int], k: int) -> float:
+        """Compute mean silhouette score across all points."""
+        n = len(self._data)
+        if k < 2 or n < 2:
+            return 0.0
+
+        scores: List[float] = []
+        for i in range(n):
+            own_cluster = assignments[i]
+            # a(i): mean distance to same-cluster points
+            same = [
+                j for j in range(n) if assignments[j] == own_cluster and j != i
+            ]
+            if not same:
+                scores.append(0.0)
+                continue
+            a_i = sum(self._euclidean(self._data[i], self._data[j]) for j in same) / len(same)
+
+            # b(i): smallest mean distance to any other cluster
+            b_i = float('inf')
+            for ci in range(k):
+                if ci == own_cluster:
+                    continue
+                other = [j for j in range(n) if assignments[j] == ci]
+                if not other:
+                    continue
+                mean_d = sum(
+                    self._euclidean(self._data[i], self._data[j]) for j in other
+                ) / len(other)
+                if mean_d < b_i:
+                    b_i = mean_d
+
+            if b_i == float('inf'):
+                scores.append(0.0)
+            else:
+                s_i = (b_i - a_i) / max(a_i, b_i) if max(a_i, b_i) > 0 else 0.0
+                scores.append(s_i)
+
+        return sum(scores) / len(scores) if scores else 0.0
+
+
 def main(args=None):
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

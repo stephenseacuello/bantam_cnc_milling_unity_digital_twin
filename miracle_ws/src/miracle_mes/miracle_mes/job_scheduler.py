@@ -3649,6 +3649,175 @@ class CapacityPlanner:
         return utilization
 
 
+# ---------------------------------------------------------------------------
+# Tool Crib Manager
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCribItem:
+    """Represents a tool stored in the tool crib."""
+    tool_id: str
+    tool_type: str
+    description: str
+    quantity: int
+    min_quantity: int
+    location: str = 'crib'        # 'crib' | 'machine' | 'regrind' | 'scrap'
+    condition: str = 'new'        # 'new' | 'used' | 'worn' | 'damaged'
+    last_checked_out: Optional[float] = None
+    checked_out_by: str = ''
+
+
+@dataclass
+class ToolTransaction:
+    """Records a single tool crib transaction."""
+    transaction_id: str
+    tool_id: str
+    action: str       # 'check_out' | 'check_in' | 'regrind' | 'scrap' | 'receive'
+    operator: str
+    machine_id: str
+    timestamp: float
+    notes: str
+
+
+class ToolCribManager:
+    """Manages tool inventory in the tool crib with check-in/check-out tracking.
+
+    Provides lifecycle management for cutting tools including inventory control,
+    check-out / check-in workflows, regrind tracking, scrap disposition, and
+    reorder alerting.
+    """
+
+    def __init__(self) -> None:
+        self._tools: Dict[str, ToolCribItem] = {}
+        self._transactions: List[ToolTransaction] = []
+
+    # -- inventory management ------------------------------------------------
+
+    def add_tool(self, item: ToolCribItem) -> None:
+        """Add or replace a tool in the crib inventory."""
+        self._tools[item.tool_id] = item
+        self._record('receive', item.tool_id, '', '', f'Added to crib: {item.description}')
+
+    def get_tool(self, tool_id: str) -> Optional[ToolCribItem]:
+        """Return a tool by its id, or ``None`` if not found."""
+        return self._tools.get(tool_id)
+
+    def get_all_tools(self) -> List[ToolCribItem]:
+        """Return a list of every tool in the inventory."""
+        return list(self._tools.values())
+
+    # -- check-out / check-in -----------------------------------------------
+
+    def check_out(self, tool_id: str, operator: str, machine_id: str) -> bool:
+        """Check out a tool to an operator / machine.
+
+        Returns ``True`` on success, ``False`` if the tool is unavailable.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            return False
+        if tool.location != 'crib':
+            return False
+        if tool.quantity <= 0:
+            return False
+
+        tool.location = 'machine'
+        tool.last_checked_out = time.time()
+        tool.checked_out_by = operator
+        tool.quantity -= 1
+        self._record('check_out', tool_id, operator, machine_id,
+                      f'Checked out to {machine_id}')
+        return True
+
+    def check_in(self, tool_id: str, operator: str, condition: str) -> bool:
+        """Return a tool to the crib with an updated condition.
+
+        Returns ``True`` on success, ``False`` if the tool is unknown.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            return False
+
+        tool.location = 'crib'
+        tool.condition = condition
+        tool.quantity += 1
+        tool.checked_out_by = ''
+        self._record('check_in', tool_id, operator, '',
+                      f'Checked in with condition: {condition}')
+        return True
+
+    # -- regrind / scrap -----------------------------------------------------
+
+    def send_to_regrind(self, tool_id: str) -> bool:
+        """Send a worn tool for regrinding.
+
+        Returns ``True`` on success, ``False`` if the tool is unknown or not
+        in the crib.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            return False
+        if tool.location != 'crib':
+            return False
+
+        tool.location = 'regrind'
+        tool.quantity -= 1
+        self._record('regrind', tool_id, '', '', 'Sent to regrind')
+        return True
+
+    def scrap_tool(self, tool_id: str, reason: str) -> bool:
+        """Scrap a damaged tool.
+
+        Returns ``True`` on success, ``False`` if the tool is unknown.
+        """
+        tool = self._tools.get(tool_id)
+        if tool is None:
+            return False
+
+        tool.location = 'scrap'
+        tool.condition = 'damaged'
+        tool.quantity = max(tool.quantity - 1, 0)
+        self._record('scrap', tool_id, '', '', f'Scrapped: {reason}')
+        return True
+
+    # -- queries -------------------------------------------------------------
+
+    def get_reorder_alerts(self) -> List[ToolCribItem]:
+        """Return tools whose quantity is at or below their minimum."""
+        return [t for t in self._tools.values() if t.quantity <= t.min_quantity]
+
+    def get_tool_history(self, tool_id: str) -> List[ToolTransaction]:
+        """Return the full transaction history for a given tool."""
+        return [tx for tx in self._transactions if tx.tool_id == tool_id]
+
+    def get_tools_on_machine(self, machine_id: str) -> List[ToolTransaction]:
+        """Return the most recent check-out transactions for a machine that
+        have not yet been checked back in."""
+        checked_out: Dict[str, ToolTransaction] = {}
+        for tx in self._transactions:
+            if tx.action == 'check_out' and tx.machine_id == machine_id:
+                checked_out[tx.tool_id] = tx
+            elif tx.action == 'check_in' and tx.tool_id in checked_out:
+                checked_out.pop(tx.tool_id, None)
+        return list(checked_out.values())
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _record(self, action: str, tool_id: str, operator: str,
+                machine_id: str, notes: str) -> None:
+        tx = ToolTransaction(
+            transaction_id=str(uuid.uuid4()),
+            tool_id=tool_id,
+            action=action,
+            operator=operator,
+            machine_id=machine_id,
+            timestamp=time.time(),
+            notes=notes,
+        )
+        self._transactions.append(tx)
+
+
 def main(args=None):
     """Entry point for the job scheduler node."""
     import rclpy

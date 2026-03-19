@@ -6145,3 +6145,222 @@ class SpecificCuttingEnergyModel:
             )
             results[mat] = self.calculate(modified)
         return results
+
+
+# ---------------------------------------------------------------------------
+# Geometric Error Model — ISO 230-2 machine accuracy analysis
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GeometricError:
+    """A single geometric error measurement on a CNC machine axis."""
+    error_type: str  # 'squareness' | 'straightness' | 'positioning' | 'angular' | 'parallelism'
+    axis: str        # e.g. 'X', 'Y', 'Z', 'XY', 'XZ', 'YZ'
+    magnitude_um: float  # error magnitude in micrometres
+    direction: str   # e.g. 'positive', 'negative', 'bidirectional'
+    measured_at: float  # position (mm) along the axis where measured
+
+
+@dataclass
+class ErrorCompensation:
+    """Compensation value to apply at a specific axis position."""
+    axis: str
+    position_mm: float
+    compensation_um: float
+    error_type: str
+
+
+@dataclass
+class MachineAccuracyReport:
+    """Summary report of machine geometric accuracy."""
+    errors: List['GeometricError'] = field(default_factory=list)
+    total_volumetric_error_um: float = 0.0
+    worst_axis: str = ''
+    calibration_needed: bool = False
+    iso_grade: str = ''
+
+
+class GeometricErrorModel:
+    """Models and predicts geometric errors in CNC machining.
+
+    Tracks squareness, straightness, positioning, angular, and parallelism
+    errors across all machine axes. Provides interpolation of positioning
+    errors, volumetric error calculation (RSS), compensation table
+    generation, and ISO 230-2 grade classification.
+    """
+
+    # ISO 230-2 accuracy grades: max positioning accuracy (um) per grade
+    _ISO_GRADES: List[Tuple[str, float]] = [
+        ('1', 3.0),
+        ('2', 5.0),
+        ('3', 8.0),
+        ('4', 12.0),
+        ('5', 20.0),
+        ('6', 30.0),
+        ('7', 50.0),
+        ('8', 80.0),
+        ('9', 120.0),
+        ('10', 200.0),
+    ]
+
+    # Threshold (um) above which calibration is recommended
+    _CALIBRATION_THRESHOLD_UM: float = 15.0
+
+    def __init__(self) -> None:
+        self._errors: List[GeometricError] = []
+
+    # ── recording ────────────────────────────────────────────────────
+
+    def record_error(self, error: GeometricError) -> None:
+        """Store a geometric error measurement."""
+        self._errors.append(error)
+
+    # ── queries ──────────────────────────────────────────────────────
+
+    def get_positioning_error(self, axis: str, position_mm: float) -> float:
+        """Interpolate positioning error (um) at *position_mm* on *axis*.
+
+        Uses linear interpolation between the two nearest recorded
+        positioning-error measurements on the requested axis.  If only one
+        measurement exists the value is returned directly; if none exist
+        ``0.0`` is returned.
+        """
+        pts = sorted(
+            [
+                (e.measured_at, e.magnitude_um)
+                for e in self._errors
+                if e.error_type == 'positioning' and e.axis == axis
+            ],
+            key=lambda p: p[0],
+        )
+        if not pts:
+            return 0.0
+        if len(pts) == 1:
+            return pts[0][1]
+
+        # Clamp to range
+        if position_mm <= pts[0][0]:
+            return pts[0][1]
+        if position_mm >= pts[-1][0]:
+            return pts[-1][1]
+
+        # Find bracketing pair and interpolate
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            if x0 <= position_mm <= x1:
+                t = (position_mm - x0) / (x1 - x0) if x1 != x0 else 0.0
+                return y0 + t * (y1 - y0)
+
+        return pts[-1][1]  # pragma: no cover – defensive fallback
+
+    def calculate_volumetric_error(
+        self, x: float, y: float, z: float,
+    ) -> float:
+        """RSS of all error contributions at point (*x*, *y*, *z*).
+
+        For each recorded error the contribution is estimated as follows:
+
+        * **positioning** — interpolated positioning error on the relevant
+          axis at the given coordinate.
+        * **squareness / straightness / angular / parallelism** — the
+          recorded magnitude is used directly (conservative assumption:
+          the error applies uniformly).
+
+        Returns the root-sum-of-squares (um).
+        """
+        contributions: List[float] = []
+        axis_pos = {'X': x, 'Y': y, 'Z': z}
+
+        # Collect unique error types per axis to avoid double-counting.
+        # For positioning errors, get_positioning_error already considers
+        # all recorded data points for interpolation, so we only call it
+        # once per axis.
+        seen: set = set()
+        for err in self._errors:
+            key = (err.error_type, err.axis)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if err.error_type == 'positioning':
+                pos = axis_pos.get(err.axis, 0.0)
+                contributions.append(self.get_positioning_error(err.axis, pos))
+            else:
+                contributions.append(err.magnitude_um)
+
+        if not contributions:
+            return 0.0
+        return math.sqrt(sum(c * c for c in contributions))
+
+    # ── compensation ─────────────────────────────────────────────────
+
+    def generate_compensation_table(
+        self, axis: str, positions: List[float],
+    ) -> List[ErrorCompensation]:
+        """Generate compensation values for *positions* along *axis*.
+
+        The compensation value is the negated interpolated positioning
+        error so that applying it cancels the measured error.
+        """
+        table: List[ErrorCompensation] = []
+        for pos in positions:
+            err_um = self.get_positioning_error(axis, pos)
+            table.append(
+                ErrorCompensation(
+                    axis=axis,
+                    position_mm=pos,
+                    compensation_um=-err_um,
+                    error_type='positioning',
+                )
+            )
+        return table
+
+    # ── reporting ────────────────────────────────────────────────────
+
+    def get_accuracy_report(self) -> MachineAccuracyReport:
+        """Generate a :class:`MachineAccuracyReport` from recorded errors."""
+        if not self._errors:
+            return MachineAccuracyReport(
+                errors=[],
+                total_volumetric_error_um=0.0,
+                worst_axis='',
+                calibration_needed=False,
+                iso_grade=self.classify_iso_grade(0.0),
+            )
+
+        # Volumetric error at origin (representative point)
+        vol_err = self.calculate_volumetric_error(0.0, 0.0, 0.0)
+
+        # Determine worst axis by largest single error magnitude
+        axis_max: Dict[str, float] = {}
+        for err in self._errors:
+            cur = axis_max.get(err.axis, 0.0)
+            if err.magnitude_um > cur:
+                axis_max[err.axis] = err.magnitude_um
+        worst_axis = max(axis_max, key=axis_max.get) if axis_max else ''  # type: ignore[arg-type]
+
+        calibration_needed = vol_err > self._CALIBRATION_THRESHOLD_UM
+
+        return MachineAccuracyReport(
+            errors=list(self._errors),
+            total_volumetric_error_um=round(vol_err, 4),
+            worst_axis=worst_axis,
+            calibration_needed=calibration_needed,
+            iso_grade=self.classify_iso_grade(vol_err),
+        )
+
+    # ── ISO 230-2 classification ─────────────────────────────────────
+
+    @staticmethod
+    def classify_iso_grade(volumetric_error_um: float) -> str:
+        """Return the ISO 230-2 accuracy grade for a given volumetric error.
+
+        Grades range from ``'1'`` (best, <= 3 um) to ``'10'`` (<=200 um).
+        Errors exceeding grade 10 are labelled ``'ungraded'``.
+        """
+        for grade, limit in GeometricErrorModel._ISO_GRADES:
+            if volumetric_error_um <= limit:
+                return grade
+        return 'ungraded'

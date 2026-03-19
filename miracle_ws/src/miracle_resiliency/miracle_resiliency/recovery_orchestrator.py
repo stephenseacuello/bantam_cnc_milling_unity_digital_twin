@@ -4071,3 +4071,211 @@ class SLAMonitor:
         if diff < -1.0:
             return 'degrading'
         return 'stable'
+
+
+# ---------------------------------------------------------------------------
+# Load Shedding Manager
+# ---------------------------------------------------------------------------
+
+class LoadLevel(Enum):
+    """System load classification levels."""
+    NORMAL = 'NORMAL'
+    ELEVATED = 'ELEVATED'
+    HIGH = 'HIGH'
+    CRITICAL = 'CRITICAL'
+    EMERGENCY = 'EMERGENCY'
+
+
+@dataclass
+class SheddableService:
+    """A service that can participate in load shedding."""
+    service_id: str
+    priority: int          # 1 (lowest) to 10 (essential)
+    current_load_pct: float
+    can_shed: bool
+    shed_amount_pct: float  # how much load can be shed (percentage points)
+
+
+@dataclass
+class SheddingDecision:
+    """Record of a load-shedding decision."""
+    services_to_shed: List[str]
+    total_load_reduction_pct: float
+    new_level: LoadLevel
+    reason: str
+    timestamp: float
+
+
+class LoadSheddingManager:
+    """Manages load shedding to protect the system during overload conditions.
+
+    Services are registered with a priority (1-10, where 10 is essential) and
+    a flag indicating whether they are sheddable.  When the system load reaches
+    the HIGH level or above the manager can evaluate which services to shed,
+    choosing the lowest-priority sheddable services first.
+    """
+
+    # Load-level thresholds (upper-exclusive except EMERGENCY)
+    _LEVEL_THRESHOLDS: List[Tuple[float, LoadLevel]] = [
+        (60.0, LoadLevel.NORMAL),
+        (75.0, LoadLevel.ELEVATED),
+        (85.0, LoadLevel.HIGH),
+        (95.0, LoadLevel.CRITICAL),
+    ]
+
+    def __init__(self) -> None:
+        self._services: Dict[str, SheddableService] = {}
+        self._shed_services: Dict[str, float] = {}  # service_id -> original load before shed
+        self._history: List[SheddingDecision] = []
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Registration & updates
+    # ------------------------------------------------------------------
+
+    def register_service(self, service: SheddableService) -> None:
+        """Register a service with its priority and sheddability."""
+        if not 1 <= service.priority <= 10:
+            raise ValueError(f"Priority must be 1-10, got {service.priority}")
+        with self._lock:
+            self._services[service.service_id] = service
+
+    def update_load(self, service_id: str, load_pct: float) -> None:
+        """Update the current load percentage for a registered service."""
+        with self._lock:
+            if service_id not in self._services:
+                raise KeyError(f"Service '{service_id}' is not registered")
+            self._services[service_id].current_load_pct = load_pct
+
+    # ------------------------------------------------------------------
+    # Load queries
+    # ------------------------------------------------------------------
+
+    def get_system_load(self) -> float:
+        """Return the weighted average load across all registered services.
+
+        Each service's load is weighted by its priority so that essential
+        services contribute more to the aggregate metric.
+        """
+        with self._lock:
+            return self._compute_system_load()
+
+    def _compute_system_load(self) -> float:
+        """Unlocked helper – compute weighted average load."""
+        if not self._services:
+            return 0.0
+        total_weight = sum(s.priority for s in self._services.values())
+        if total_weight == 0:
+            return 0.0
+        weighted = sum(
+            s.current_load_pct * s.priority for s in self._services.values()
+        )
+        return weighted / total_weight
+
+    def get_load_level(self) -> LoadLevel:
+        """Classify the current system load into a :class:`LoadLevel`."""
+        load = self.get_system_load()
+        return self._classify_load(load)
+
+    @staticmethod
+    def _classify_load(load: float) -> LoadLevel:
+        """Return the LoadLevel for a given numeric load percentage."""
+        if load < 60.0:
+            return LoadLevel.NORMAL
+        if load < 75.0:
+            return LoadLevel.ELEVATED
+        if load < 85.0:
+            return LoadLevel.HIGH
+        if load < 95.0:
+            return LoadLevel.CRITICAL
+        return LoadLevel.EMERGENCY
+
+    # ------------------------------------------------------------------
+    # Shedding logic
+    # ------------------------------------------------------------------
+
+    def evaluate_shedding(self) -> Optional[SheddingDecision]:
+        """Evaluate whether load shedding is needed and decide what to shed.
+
+        Shedding is considered only when the load level is HIGH or above.
+        Services are shed in order of ascending priority (lowest first),
+        skipping services that are not sheddable or have priority 10
+        (essential).  Shedding continues until the projected load drops
+        below the HIGH threshold (85 %) or no more services can be shed.
+        """
+        with self._lock:
+            current_load = self._compute_system_load()
+            level = self._classify_load(current_load)
+
+            if level not in (LoadLevel.HIGH, LoadLevel.CRITICAL, LoadLevel.EMERGENCY):
+                return None
+
+            # Determine candidates sorted by priority ascending (shed cheapest first)
+            candidates = sorted(
+                [
+                    s for s in self._services.values()
+                    if s.can_shed and s.priority < 10
+                    and s.service_id not in self._shed_services
+                ],
+                key=lambda s: s.priority,
+            )
+
+            if not candidates:
+                return None
+
+            services_to_shed: List[str] = []
+            simulated_load = current_load
+            total_reduction = 0.0
+            total_weight = sum(s.priority for s in self._services.values()) or 1.0
+
+            for svc in candidates:
+                # The contribution of shedding this service's shed_amount_pct
+                reduction = (svc.shed_amount_pct * svc.priority) / total_weight
+                services_to_shed.append(svc.service_id)
+                simulated_load -= reduction
+                total_reduction += reduction
+
+                if simulated_load < 85.0:
+                    break
+
+            new_level = self._classify_load(simulated_load)
+            decision = SheddingDecision(
+                services_to_shed=services_to_shed,
+                total_load_reduction_pct=round(total_reduction, 4),
+                new_level=new_level,
+                reason=f"System load at {current_load:.1f}% ({level.value}); "
+                       f"shedding {len(services_to_shed)} service(s) to reach "
+                       f"{simulated_load:.1f}% ({new_level.value})",
+                timestamp=time.time(),
+            )
+            self._history.append(decision)
+            return decision
+
+    def shed(self, service_id: str, amount_pct: float) -> None:
+        """Reduce a service's reported load by *amount_pct* percentage points."""
+        with self._lock:
+            if service_id not in self._services:
+                raise KeyError(f"Service '{service_id}' is not registered")
+            svc = self._services[service_id]
+            if service_id not in self._shed_services:
+                self._shed_services[service_id] = svc.current_load_pct
+            svc.current_load_pct = max(0.0, svc.current_load_pct - amount_pct)
+
+    def restore(self, service_id: str) -> None:
+        """Restore a previously shed service to its original load."""
+        with self._lock:
+            if service_id not in self._services:
+                raise KeyError(f"Service '{service_id}' is not registered")
+            if service_id in self._shed_services:
+                self._services[service_id].current_load_pct = self._shed_services.pop(
+                    service_id
+                )
+
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    def get_shedding_history(self) -> List[SheddingDecision]:
+        """Return the list of past shedding decisions."""
+        with self._lock:
+            return list(self._history)

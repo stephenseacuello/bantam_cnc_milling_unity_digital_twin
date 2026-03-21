@@ -2357,6 +2357,195 @@ class MachineUtilizationTracker:
         return metrics
 
 
+# ------------------------------------------------------------------
+# Preventive Maintenance Scheduler
+# ------------------------------------------------------------------
+
+@dataclass
+class MaintenanceTask:
+    """A single preventive-maintenance task definition."""
+
+    task_id: str
+    name: str
+    description: str
+    frequency_hours: float
+    frequency_parts: int
+    last_performed: float          # epoch timestamp
+    next_due: float                # epoch timestamp
+    machine_id: str
+    priority: int                  # 1 (highest) – 5 (lowest)
+    estimated_duration_min: float
+    parts_needed: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MaintenanceSchedule:
+    """Aggregate schedule view for one machine."""
+
+    machine_id: str
+    tasks: List[MaintenanceTask] = field(default_factory=list)
+    overdue_count: int = 0
+    upcoming_count: int = 0
+    compliance_pct: float = 100.0
+
+
+@dataclass
+class _CompletionRecord:
+    """Internal record of a single task completion."""
+
+    task_id: str
+    timestamp: float
+    notes: str
+
+
+class PreventiveMaintenanceScheduler:
+    """Schedules preventive maintenance based on time and usage triggers.
+
+    Tasks are registered per machine and tracked via time-based
+    frequency.  Completions are logged and used to derive compliance
+    metrics and downtime forecasts.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: Dict[str, MaintenanceTask] = {}        # task_id -> task
+        self._completions: List[_CompletionRecord] = []      # history
+        self._lock = threading.Lock()
+
+    # -- task management ---------------------------------------------------
+
+    def add_task(self, task: MaintenanceTask) -> None:
+        """Register a new maintenance task."""
+        with self._lock:
+            self._tasks[task.task_id] = task
+
+    def complete_task(
+        self,
+        task_id: str,
+        timestamp: float,
+        notes: str = '',
+    ) -> None:
+        """Mark a task as completed and compute the next due date."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.last_performed = timestamp
+            task.next_due = timestamp + task.frequency_hours * 3600.0
+            self._completions.append(
+                _CompletionRecord(
+                    task_id=task_id,
+                    timestamp=timestamp,
+                    notes=notes,
+                )
+            )
+
+    # -- queries -----------------------------------------------------------
+
+    def get_due_tasks(
+        self,
+        machine_id: str,
+        current_time: float,
+    ) -> List[MaintenanceTask]:
+        """Return tasks that are due or overdue for *machine_id*."""
+        with self._lock:
+            return [
+                t for t in self._tasks.values()
+                if t.machine_id == machine_id and t.next_due <= current_time
+            ]
+
+    def get_overdue_tasks(self, current_time: float) -> List[MaintenanceTask]:
+        """Return all overdue tasks across every machine."""
+        with self._lock:
+            return [
+                t for t in self._tasks.values()
+                if t.next_due < current_time
+            ]
+
+    def get_schedule(self, machine_id: str) -> MaintenanceSchedule:
+        """Build the full :class:`MaintenanceSchedule` for a machine."""
+        now = time.time()
+        with self._lock:
+            machine_tasks = [
+                t for t in self._tasks.values()
+                if t.machine_id == machine_id
+            ]
+            overdue = sum(1 for t in machine_tasks if t.next_due < now)
+            upcoming = sum(1 for t in machine_tasks if t.next_due >= now)
+            total = len(machine_tasks)
+            compliance = (
+                ((total - overdue) / total * 100.0) if total else 100.0
+            )
+            return MaintenanceSchedule(
+                machine_id=machine_id,
+                tasks=list(machine_tasks),
+                overdue_count=overdue,
+                upcoming_count=upcoming,
+                compliance_pct=compliance,
+            )
+
+    # -- analytics ---------------------------------------------------------
+
+    def calculate_compliance(
+        self,
+        machine_id: str,
+        period_start: float,
+        period_end: float,
+    ) -> float:
+        """Return the maintenance-compliance percentage for *machine_id*.
+
+        Compliance is defined as the proportion of tasks that were
+        completed at least once within *[period_start, period_end]*
+        out of all tasks registered for the machine.
+        """
+        with self._lock:
+            machine_tasks = [
+                t for t in self._tasks.values()
+                if t.machine_id == machine_id
+            ]
+            if not machine_tasks:
+                return 100.0
+            task_ids = {t.task_id for t in machine_tasks}
+            completed_ids = {
+                c.task_id
+                for c in self._completions
+                if c.task_id in task_ids
+                and period_start <= c.timestamp <= period_end
+            }
+            return len(completed_ids) / len(task_ids) * 100.0
+
+    def forecast_downtime(
+        self,
+        machine_id: str,
+        horizon_days: float,
+    ) -> float:
+        """Estimate total maintenance downtime (minutes) over *horizon_days*.
+
+        Walks each task registered for the machine and counts how many
+        occurrences fall within the forecast window, then sums
+        ``estimated_duration_min`` for each occurrence.
+        """
+        now = time.time()
+        horizon_sec = horizon_days * 86400.0
+        window_end = now + horizon_sec
+        total_min = 0.0
+
+        with self._lock:
+            for task in self._tasks.values():
+                if task.machine_id != machine_id:
+                    continue
+                # Walk forward from next_due in frequency_hours steps
+                t = task.next_due
+                interval = task.frequency_hours * 3600.0
+                if interval <= 0:
+                    continue
+                while t <= window_end:
+                    if t >= now:
+                        total_min += task.estimated_duration_min
+                    t += interval
+
+        return total_min
+
+
 def main(args=None):
     """Entry point for the digital thread node."""
     import rclpy

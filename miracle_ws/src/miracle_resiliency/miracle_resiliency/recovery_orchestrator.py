@@ -4279,3 +4279,235 @@ class LoadSheddingManager:
         """Return the list of past shedding decisions."""
         with self._lock:
             return list(self._history)
+
+
+# ============================================================================
+# Observability Trace Manager
+# ============================================================================
+
+
+@dataclass
+class TraceSpan:
+    """A single span within a distributed trace."""
+    trace_id: str
+    span_id: str
+    parent_span_id: Optional[str]
+    service_name: str
+    operation_name: str
+    start_time: float
+    end_time: Optional[float] = None
+    duration_ms: Optional[float] = None
+    status: str = 'ok'          # 'ok' | 'error' | 'timeout'
+    tags: Dict[str, Any] = field(default_factory=dict)
+    events: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class Trace:
+    """A complete distributed trace made up of one or more spans."""
+    trace_id: str
+    spans: List[TraceSpan] = field(default_factory=list)
+    total_duration_ms: float = 0.0
+    service_count: int = 0
+    error_count: int = 0
+
+
+class ObservabilityTraceManager:
+    """Manages distributed tracing spans for observability across MIRACLE services.
+
+    Provides facilities to create, enrich, and query traces that propagate
+    across the MIRACLE service topology.  Each trace is identified by a
+    *trace_id* and may contain multiple *TraceSpan* entries representing
+    work performed by individual services.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # span_id -> TraceSpan
+        self._spans: Dict[str, TraceSpan] = {}
+        # trace_id -> list of span_ids
+        self._traces: Dict[str, List[str]] = {}
+
+    # ------------------------------------------------------------------
+    # Span lifecycle
+    # ------------------------------------------------------------------
+
+    def start_span(
+        self,
+        trace_id: str,
+        service_name: str,
+        operation_name: str,
+        parent_span_id: Optional[str] = None,
+    ) -> TraceSpan:
+        """Begin a new span and associate it with *trace_id*.
+
+        Returns the newly created :class:`TraceSpan`.
+        """
+        span_id = str(uuid.uuid4())
+        span = TraceSpan(
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            service_name=service_name,
+            operation_name=operation_name,
+            start_time=time.time(),
+        )
+        with self._lock:
+            self._spans[span_id] = span
+            self._traces.setdefault(trace_id, []).append(span_id)
+        return span
+
+    def end_span(self, span_id: str, status: str = 'ok') -> TraceSpan:
+        """Complete a span, recording its *status* and computing duration.
+
+        Parameters
+        ----------
+        span_id:
+            The identifier of the span to end.
+        status:
+            One of ``'ok'``, ``'error'``, or ``'timeout'``.
+
+        Returns
+        -------
+        TraceSpan
+            The updated span.
+
+        Raises
+        ------
+        KeyError
+            If *span_id* is not found.
+        ValueError
+            If *status* is not one of the allowed values.
+        """
+        allowed = {'ok', 'error', 'timeout'}
+        if status not in allowed:
+            raise ValueError(
+                f"Invalid status '{status}'; must be one of {allowed}"
+            )
+        with self._lock:
+            if span_id not in self._spans:
+                raise KeyError(f"Span '{span_id}' not found")
+            span = self._spans[span_id]
+            span.end_time = time.time()
+            span.duration_ms = (span.end_time - span.start_time) * 1000.0
+            span.status = status
+            return span
+
+    # ------------------------------------------------------------------
+    # Enrichment
+    # ------------------------------------------------------------------
+
+    def add_event(
+        self, span_id: str, event_name: str, data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Append a timestamped event/log entry to *span_id*.
+
+        Raises
+        ------
+        KeyError
+            If the span does not exist.
+        """
+        with self._lock:
+            if span_id not in self._spans:
+                raise KeyError(f"Span '{span_id}' not found")
+            self._spans[span_id].events.append({
+                'name': event_name,
+                'timestamp': time.time(),
+                'data': data or {},
+            })
+
+    def add_tag(self, span_id: str, key: str, value: Any) -> None:
+        """Attach a key/value tag to *span_id*.
+
+        Raises
+        ------
+        KeyError
+            If the span does not exist.
+        """
+        with self._lock:
+            if span_id not in self._spans:
+                raise KeyError(f"Span '{span_id}' not found")
+            self._spans[span_id].tags[key] = value
+
+    # ------------------------------------------------------------------
+    # Querying
+    # ------------------------------------------------------------------
+
+    def get_trace(self, trace_id: str) -> Trace:
+        """Reconstruct and return the full :class:`Trace` for *trace_id*.
+
+        Raises
+        ------
+        KeyError
+            If *trace_id* is unknown.
+        """
+        with self._lock:
+            if trace_id not in self._traces:
+                raise KeyError(f"Trace '{trace_id}' not found")
+            span_ids = self._traces[trace_id]
+            spans = [self._spans[sid] for sid in span_ids]
+
+        services = set()
+        error_count = 0
+        min_start: Optional[float] = None
+        max_end: Optional[float] = None
+
+        for s in spans:
+            services.add(s.service_name)
+            if s.status == 'error':
+                error_count += 1
+            if min_start is None or s.start_time < min_start:
+                min_start = s.start_time
+            if s.end_time is not None:
+                if max_end is None or s.end_time > max_end:
+                    max_end = s.end_time
+
+        total_ms = 0.0
+        if min_start is not None and max_end is not None:
+            total_ms = (max_end - min_start) * 1000.0
+
+        return Trace(
+            trace_id=trace_id,
+            spans=list(spans),
+            total_duration_ms=total_ms,
+            service_count=len(services),
+            error_count=error_count,
+        )
+
+    def get_slow_traces(self, threshold_ms: float) -> List[Trace]:
+        """Return all traces whose total duration exceeds *threshold_ms*."""
+        with self._lock:
+            trace_ids = list(self._traces.keys())
+        result: List[Trace] = []
+        for tid in trace_ids:
+            trace = self.get_trace(tid)
+            if trace.total_duration_ms > threshold_ms:
+                result.append(trace)
+        return result
+
+    def get_error_traces(self) -> List[Trace]:
+        """Return all traces that contain at least one span with ``'error'`` status."""
+        with self._lock:
+            trace_ids = list(self._traces.keys())
+        result: List[Trace] = []
+        for tid in trace_ids:
+            trace = self.get_trace(tid)
+            if trace.error_count > 0:
+                result.append(trace)
+        return result
+
+    def get_service_latency(self, service_name: str) -> float:
+        """Return the average span duration (ms) for *service_name*.
+
+        Only completed spans (those with a non-``None`` ``duration_ms``) are
+        considered.  Returns ``0.0`` if no matching spans exist.
+        """
+        with self._lock:
+            durations = [
+                s.duration_ms
+                for s in self._spans.values()
+                if s.service_name == service_name and s.duration_ms is not None
+            ]
+        if not durations:
+            return 0.0
+        return sum(durations) / len(durations)

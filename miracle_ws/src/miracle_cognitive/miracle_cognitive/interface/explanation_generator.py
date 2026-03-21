@@ -4163,3 +4163,245 @@ class RegressionModelManager:
         c0, c1, c2 = 2.515517, 0.802853, 0.010328
         d1, d2, d3 = 1.432788, 0.189269, 0.001308
         return t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t)
+
+
+# ====================================================================== #
+#  Moving Average Crossover Detector                                      #
+# ====================================================================== #
+
+
+@dataclass
+class CrossoverEvent:
+    """Records a single crossover between fast and slow moving averages."""
+    index: int
+    timestamp: float
+    crossover_type: str  # 'golden_cross' | 'death_cross'
+    fast_value: float
+    slow_value: float
+    signal_strength: float
+
+
+@dataclass
+class TrendAnalysis:
+    """Complete trend analysis result from moving average crossover detection."""
+    current_trend: str  # 'bullish' | 'bearish' | 'neutral'
+    crossover_events: List[CrossoverEvent]
+    fast_ma: List[float]
+    slow_ma: List[float]
+    divergence: List[float]
+
+
+class MovingAverageCrossoverDetector:
+    """Detects crossovers between fast and slow moving averages for trend
+    change detection in manufacturing metrics.
+
+    A *golden cross* occurs when the fast moving average crosses *above* the
+    slow moving average, signalling an improving trend.  A *death cross* is
+    the opposite — the fast MA crosses *below* the slow MA, indicating a
+    degrading trend.
+    """
+
+    # -- Moving-average calculations ----------------------------------- #
+
+    @staticmethod
+    def calculate_sma(data: List[float], window: int) -> List[float]:
+        """Compute the Simple Moving Average (SMA) of *data*.
+
+        Returns a list the same length as *data*.  The first ``window - 1``
+        entries are ``float('nan')`` because there are not enough points to
+        fill the window.
+        """
+        if window <= 0:
+            raise ValueError("window must be a positive integer")
+        result: List[float] = []
+        for i in range(len(data)):
+            if i < window - 1:
+                result.append(float('nan'))
+            else:
+                segment = data[i - window + 1: i + 1]
+                result.append(sum(segment) / window)
+        return result
+
+    @staticmethod
+    def calculate_ema(data: List[float], span: int) -> List[float]:
+        """Compute the Exponential Moving Average (EMA) of *data*.
+
+        Uses multiplier ``k = 2 / (span + 1)``.  The first value is seeded
+        with ``data[0]``.
+        """
+        if span <= 0:
+            raise ValueError("span must be a positive integer")
+        if not data:
+            return []
+        k = 2.0 / (span + 1)
+        ema: List[float] = [data[0]]
+        for i in range(1, len(data)):
+            ema.append(data[i] * k + ema[-1] * (1.0 - k))
+        return ema
+
+    # -- Signal strength ------------------------------------------------ #
+
+    @staticmethod
+    def get_signal_strength(fast_ma: List[float], slow_ma: List[float],
+                            index: int) -> float:
+        """Rate of divergence between fast and slow MAs at *index*.
+
+        Returns the absolute percentage difference normalised by the slow MA
+        value.  If the slow MA is zero, returns ``0.0``.
+        """
+        if index < 0 or index >= len(fast_ma) or index >= len(slow_ma):
+            return 0.0
+        slow_val = slow_ma[index]
+        if slow_val == 0.0:
+            return 0.0
+        return abs(fast_ma[index] - slow_val) / abs(slow_val)
+
+    # -- Crossover detection ------------------------------------------- #
+
+    def detect_crossovers(
+        self,
+        data: List[float],
+        fast_window: int = 5,
+        slow_window: int = 20,
+        timestamps: Optional[List[float]] = None,
+    ) -> List[CrossoverEvent]:
+        """Find all crossover points between the fast and slow SMAs.
+
+        Parameters
+        ----------
+        data : list of float
+            Raw time-series values (e.g. spindle load, temperature).
+        fast_window : int
+            Window size for the fast (short-period) SMA.
+        slow_window : int
+            Window size for the slow (long-period) SMA.
+        timestamps : list of float, optional
+            Timestamps aligned with *data*.  If ``None``, indices are used.
+
+        Returns
+        -------
+        list of CrossoverEvent
+        """
+        if fast_window >= slow_window:
+            raise ValueError("fast_window must be smaller than slow_window")
+
+        fast_ma = self.calculate_sma(data, fast_window)
+        slow_ma = self.calculate_sma(data, slow_window)
+
+        if timestamps is None:
+            timestamps = [float(i) for i in range(len(data))]
+
+        events: List[CrossoverEvent] = []
+        start = slow_window  # first index where both MAs are valid
+        for i in range(start, len(data)):
+            prev_diff = fast_ma[i - 1] - slow_ma[i - 1]
+            curr_diff = fast_ma[i] - slow_ma[i]
+
+            # Skip if either previous value is NaN
+            if math.isnan(prev_diff) or math.isnan(curr_diff):
+                continue
+
+            if prev_diff <= 0.0 < curr_diff:
+                cross_type = 'golden_cross'
+            elif prev_diff >= 0.0 > curr_diff:
+                cross_type = 'death_cross'
+            else:
+                continue
+
+            strength = self.get_signal_strength(fast_ma, slow_ma, i)
+            events.append(CrossoverEvent(
+                index=i,
+                timestamp=timestamps[i],
+                crossover_type=cross_type,
+                fast_value=fast_ma[i],
+                slow_value=slow_ma[i],
+                signal_strength=strength,
+            ))
+
+        return events
+
+    # -- Full trend analysis ------------------------------------------- #
+
+    def get_trend_analysis(
+        self,
+        data: List[float],
+        fast_window: int = 5,
+        slow_window: int = 20,
+        timestamps: Optional[List[float]] = None,
+    ) -> TrendAnalysis:
+        """Return a complete :class:`TrendAnalysis` for the given series."""
+        fast_ma = self.calculate_sma(data, fast_window)
+        slow_ma = self.calculate_sma(data, slow_window)
+        events = self.detect_crossovers(data, fast_window, slow_window,
+                                        timestamps)
+
+        divergence = [
+            f - s if not (math.isnan(f) or math.isnan(s)) else 0.0
+            for f, s in zip(fast_ma, slow_ma)
+        ]
+
+        if events:
+            last_event = events[-1]
+            if last_event.crossover_type == 'golden_cross':
+                current_trend = 'bullish'
+            else:
+                current_trend = 'bearish'
+        else:
+            # No crossover detected — determine from latest valid values
+            valid_pairs = [
+                (f, s) for f, s in zip(fast_ma, slow_ma)
+                if not (math.isnan(f) or math.isnan(s))
+            ]
+            if valid_pairs:
+                last_f, last_s = valid_pairs[-1]
+                if last_f > last_s:
+                    current_trend = 'bullish'
+                elif last_f < last_s:
+                    current_trend = 'bearish'
+                else:
+                    current_trend = 'neutral'
+            else:
+                current_trend = 'neutral'
+
+        return TrendAnalysis(
+            current_trend=current_trend,
+            crossover_events=events,
+            fast_ma=fast_ma,
+            slow_ma=slow_ma,
+            divergence=divergence,
+        )
+
+    # -- MACD ---------------------------------------------------------- #
+
+    def calculate_macd(
+        self,
+        data: List[float],
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+    ) -> Tuple[List[float], List[float], List[float]]:
+        """Compute the MACD line, signal line, and histogram.
+
+        Parameters
+        ----------
+        data : list of float
+        fast : int
+            Span for the fast EMA (default 12).
+        slow : int
+            Span for the slow EMA (default 26).
+        signal : int
+            Span for the signal-line EMA (default 9).
+
+        Returns
+        -------
+        (macd_line, signal_line, histogram) — each a list of float the same
+        length as *data*.
+        """
+        fast_ema = self.calculate_ema(data, fast)
+        slow_ema = self.calculate_ema(data, slow)
+
+        macd_line = [f - s for f, s in zip(fast_ema, slow_ema)]
+        signal_line = self.calculate_ema(macd_line, signal)
+        histogram = [m - s for m, s in zip(macd_line, signal_line)]
+
+        return macd_line, signal_line, histogram

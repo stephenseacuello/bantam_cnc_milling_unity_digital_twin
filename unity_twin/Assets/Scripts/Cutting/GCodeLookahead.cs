@@ -4085,4 +4085,300 @@ namespace MiracleTwin.Cutting
                     "Direction must be 'climb' or 'conventional'.");
         }
     }
+
+    // ----------------------------------------------------------------
+    // Thread Milling Calculator
+    // ----------------------------------------------------------------
+
+    /// <summary>
+    /// Specifies the geometry and classification of a thread to be milled.
+    /// </summary>
+    [Serializable]
+    public class ThreadSpec
+    {
+        /// <summary>Nominal (major) diameter in mm.</summary>
+        public float nominalDiameter;
+        /// <summary>Thread pitch in mm.</summary>
+        public float pitch;
+        /// <summary>Thread standard: "metric", "unc", or "unf".</summary>
+        public string threadType = "metric";
+        /// <summary>True for internal (nut) threads, false for external (bolt) threads.</summary>
+        public bool isInternal = true;
+        /// <summary>Thread tolerance class, e.g. "6H" (internal) or "6g" (external).</summary>
+        public string threadClass = "6H";
+        /// <summary>Engaged thread length in mm.</summary>
+        public float length = 10f;
+    }
+
+    /// <summary>
+    /// Result of a thread milling calculation including helical toolpath.
+    /// </summary>
+    [Serializable]
+    public class ThreadMillResult
+    {
+        /// <summary>Diameter of the helical cutter path centre-line in mm.</summary>
+        public float helicalDiameter;
+        /// <summary>Radial depth of cut (thread height) in mm.</summary>
+        public float radialDepth;
+        /// <summary>Number of radial passes required.</summary>
+        public int numberOfPasses;
+        /// <summary>Axial feed rate in mm/min.</summary>
+        public float feedRate;
+        /// <summary>Spindle speed in RPM.</summary>
+        public int spindleSpeed;
+        /// <summary>Estimated cycle time in seconds.</summary>
+        public float cycleTime;
+        /// <summary>Helical toolpath points.</summary>
+        public List<Vector3> threadPath = new();
+    }
+
+    /// <summary>
+    /// Tolerance band for a thread expressed as min/max major and minor diameters.
+    /// </summary>
+    [Serializable]
+    public class ThreadTolerances
+    {
+        public float majorDiameterMin;
+        public float majorDiameterMax;
+        public float minorDiameterMin;
+        public float minorDiameterMax;
+    }
+
+    /// <summary>
+    /// Calculates thread milling parameters and generates helical toolpaths
+    /// for both internal and external metric / unified threads.
+    /// </summary>
+    public class ThreadMillingCalculator
+    {
+        /// <summary>Thread depth factor for 60-degree metric/unified threads.</summary>
+        private const float THREAD_DEPTH_FACTOR = 0.6134f;
+
+        /// <summary>Default maximum radial depth per pass in mm.</summary>
+        private const float MAX_RADIAL_DEPTH_PER_PASS = 0.15f;
+
+        /// <summary>Default number of points generated per helical revolution.</summary>
+        public const int DEFAULT_POINTS_PER_REV = 72;
+
+        // ---- public API ----
+
+        /// <summary>
+        /// Calculates the centre-line diameter of the helical toolpath.
+        /// For internal threads the cutter orbits inside the bore:
+        ///     helicalDiameter = nominalDiameter - toolDiameter
+        /// For external threads the cutter orbits outside the workpiece:
+        ///     helicalDiameter = nominalDiameter + toolDiameter
+        /// </summary>
+        public float CalculateHelicalDiameter(ThreadSpec spec, float toolDiameter)
+        {
+            if (spec == null)
+                throw new ArgumentNullException(nameof(spec));
+            if (toolDiameter <= 0f)
+                throw new ArgumentException("Tool diameter must be positive.");
+            if (spec.nominalDiameter <= 0f)
+                throw new ArgumentException("Nominal diameter must be positive.");
+
+            if (spec.isInternal)
+            {
+                float d = spec.nominalDiameter - toolDiameter;
+                if (d <= 0f)
+                    throw new ArgumentException(
+                        "Tool diameter must be smaller than nominal diameter for internal threads.");
+                return d;
+            }
+            else
+            {
+                return spec.nominalDiameter + toolDiameter;
+            }
+        }
+
+        /// <summary>
+        /// Calculates the theoretical thread depth (radial depth) for a
+        /// 60-degree thread form: depth = 0.6134 * pitch.
+        /// </summary>
+        public float CalculateRadialDepth(float pitch)
+        {
+            if (pitch <= 0f)
+                throw new ArgumentException("Pitch must be positive.");
+            return THREAD_DEPTH_FACTOR * pitch;
+        }
+
+        /// <summary>
+        /// Generates a helical toolpath around <paramref name="center"/>
+        /// with the given diameter, pitch, and thread length.
+        /// The helix advances along the Y axis (spindle axis in Unity).
+        /// </summary>
+        public List<Vector3> GenerateHelicalPath(Vector3 center, float diameter,
+                                                  float pitch, float length,
+                                                  int pointsPerRev = 0)
+        {
+            if (diameter <= 0f)
+                throw new ArgumentException("Diameter must be positive.");
+            if (pitch <= 0f)
+                throw new ArgumentException("Pitch must be positive.");
+            if (length <= 0f)
+                throw new ArgumentException("Length must be positive.");
+
+            if (pointsPerRev <= 0)
+                pointsPerRev = DEFAULT_POINTS_PER_REV;
+
+            float radius = diameter / 2f;
+            float totalRevolutions = length / pitch;
+            int totalPoints = Mathf.Max(1, Mathf.CeilToInt(totalRevolutions * pointsPerRev));
+
+            var path = new List<Vector3>(totalPoints + 1);
+
+            for (int i = 0; i <= totalPoints; i++)
+            {
+                float t = (float)i / totalPoints;           // 0..1
+                float angle = t * totalRevolutions * 2f * Mathf.PI;
+                float y = center.y + t * length;
+                float x = center.x + radius * Mathf.Cos(angle);
+                float z = center.z + radius * Mathf.Sin(angle);
+                path.Add(new Vector3(x, y, z));
+            }
+
+            return path;
+        }
+
+        /// <summary>
+        /// Single-point threading feed rate: feed (mm/min) = pitch * spindleSpeed.
+        /// </summary>
+        public float CalculateFeedRate(float pitch, int spindleSpeed)
+        {
+            if (pitch <= 0f)
+                throw new ArgumentException("Pitch must be positive.");
+            if (spindleSpeed <= 0)
+                throw new ArgumentException("Spindle speed must be positive.");
+            return pitch * spindleSpeed;
+        }
+
+        /// <summary>
+        /// Returns major/minor diameter tolerances for the given thread spec
+        /// based on its thread class.  Supports common ISO metric classes
+        /// (6H, 6g, 4H5H) and unified classes (2B, 2A).
+        /// </summary>
+        public ThreadTolerances GetThreadTolerances(ThreadSpec spec)
+        {
+            if (spec == null)
+                throw new ArgumentNullException(nameof(spec));
+
+            float d = spec.nominalDiameter;
+            float p = spec.pitch;
+            float threadDepth = CalculateRadialDepth(p);
+
+            var tol = new ThreadTolerances();
+
+            // Basic minor diameter for 60-deg threads
+            float minorDiameterBasic = d - 2f * threadDepth;
+
+            switch (spec.threadClass)
+            {
+                case "6H":  // medium-fit internal
+                    tol.majorDiameterMin = d;
+                    tol.majorDiameterMax = d + 0.050f;
+                    tol.minorDiameterMin = minorDiameterBasic;
+                    tol.minorDiameterMax = minorDiameterBasic + 0.060f;
+                    break;
+
+                case "4H5H":  // fine-fit internal
+                    tol.majorDiameterMin = d;
+                    tol.majorDiameterMax = d + 0.032f;
+                    tol.minorDiameterMin = minorDiameterBasic;
+                    tol.minorDiameterMax = minorDiameterBasic + 0.040f;
+                    break;
+
+                case "6g":  // medium-fit external
+                    tol.majorDiameterMin = d - 0.060f;
+                    tol.majorDiameterMax = d;
+                    tol.minorDiameterMin = minorDiameterBasic - 0.060f;
+                    tol.minorDiameterMax = minorDiameterBasic;
+                    break;
+
+                case "2B":  // unified internal class 2
+                    tol.majorDiameterMin = d;
+                    tol.majorDiameterMax = d + 0.048f;
+                    tol.minorDiameterMin = minorDiameterBasic;
+                    tol.minorDiameterMax = minorDiameterBasic + 0.055f;
+                    break;
+
+                case "2A":  // unified external class 2
+                    tol.majorDiameterMin = d - 0.055f;
+                    tol.majorDiameterMax = d;
+                    tol.minorDiameterMin = minorDiameterBasic - 0.055f;
+                    tol.minorDiameterMax = minorDiameterBasic;
+                    break;
+
+                default:
+                    // Fall back to generous general-purpose tolerances
+                    tol.majorDiameterMin = d - 0.050f;
+                    tol.majorDiameterMax = d + 0.050f;
+                    tol.minorDiameterMin = minorDiameterBasic - 0.050f;
+                    tol.minorDiameterMax = minorDiameterBasic + 0.050f;
+                    break;
+            }
+
+            return tol;
+        }
+
+        /// <summary>
+        /// Estimates total thread-milling cycle time in seconds.
+        /// Accounts for multiple radial passes when the full thread depth
+        /// exceeds the maximum per-pass depth.
+        /// </summary>
+        public float EstimateCycleTime(ThreadSpec spec, float feedRate)
+        {
+            if (spec == null)
+                throw new ArgumentNullException(nameof(spec));
+            if (feedRate <= 0f)
+                throw new ArgumentException("Feed rate must be positive.");
+            if (spec.pitch <= 0f)
+                throw new ArgumentException("Pitch must be positive.");
+            if (spec.nominalDiameter <= 0f)
+                throw new ArgumentException("Nominal diameter must be positive.");
+            if (spec.length <= 0f)
+                throw new ArgumentException("Thread length must be positive.");
+
+            float totalRadialDepth = CalculateRadialDepth(spec.pitch);
+            int passes = Mathf.Max(1,
+                Mathf.CeilToInt(totalRadialDepth / MAX_RADIAL_DEPTH_PER_PASS));
+
+            // Approximate helical path length per pass
+            float helicalCircumference = Mathf.PI * spec.nominalDiameter;
+            float revolutions = spec.length / spec.pitch;
+            float pathLengthPerPass = revolutions * helicalCircumference;
+
+            float totalPathLength = pathLengthPerPass * passes;
+
+            // Time in seconds  (feedRate is mm/min)
+            return (totalPathLength / feedRate) * 60f;
+        }
+
+        /// <summary>
+        /// Convenience method: calculates all thread-milling parameters and
+        /// generates the helical toolpath in a single call.
+        /// </summary>
+        public ThreadMillResult Calculate(ThreadSpec spec, float toolDiameter,
+                                          int spindleSpeed,
+                                          int pointsPerRev = 0)
+        {
+            if (spec == null)
+                throw new ArgumentNullException(nameof(spec));
+
+            var result = new ThreadMillResult();
+
+            result.helicalDiameter = CalculateHelicalDiameter(spec, toolDiameter);
+            result.radialDepth = CalculateRadialDepth(spec.pitch);
+            result.numberOfPasses = Mathf.Max(1,
+                Mathf.CeilToInt(result.radialDepth / MAX_RADIAL_DEPTH_PER_PASS));
+            result.spindleSpeed = spindleSpeed;
+            result.feedRate = CalculateFeedRate(spec.pitch, spindleSpeed);
+            result.cycleTime = EstimateCycleTime(spec, result.feedRate);
+            result.threadPath = GenerateHelicalPath(
+                Vector3.zero, result.helicalDiameter,
+                spec.pitch, spec.length,
+                pointsPerRev);
+
+            return result;
+        }
+    }
 }

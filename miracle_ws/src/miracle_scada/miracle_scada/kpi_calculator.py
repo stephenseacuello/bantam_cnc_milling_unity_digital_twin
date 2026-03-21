@@ -3881,3 +3881,202 @@ class SignalConditioner:
             snr_improvement_db=snr,
             removed_outliers=suppressed,
         )
+
+
+# ---------------------------------------------------------------------------
+# Sensor Fusion Engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SensorReading:
+    """A single reading from a sensor."""
+    sensor_id: str
+    value: float
+    uncertainty: float
+    timestamp: float
+    sensor_type: str
+
+
+@dataclass
+class FusedEstimate:
+    """Result of fusing multiple sensor readings."""
+    value: float
+    uncertainty: float
+    confidence: float
+    contributing_sensors: List[str]
+    timestamp: float
+
+
+@dataclass
+class SensorConfig:
+    """Configuration for a registered sensor."""
+    sensor_id: str
+    sensor_type: str
+    weight: float
+    max_uncertainty: float
+    calibration_offset: float
+
+
+class SensorFusionEngine:
+    """Fuses data from multiple sensors for improved accuracy.
+
+    Uses inverse-variance weighting and Kalman-like updates to combine
+    readings from heterogeneous sensors of the same type into a single
+    fused estimate with reduced uncertainty.
+    """
+
+    def __init__(self) -> None:
+        self._configs: Dict[str, SensorConfig] = {}
+        self._readings: Dict[str, List[SensorReading]] = {}  # sensor_id -> readings
+        self._reliability_history: Dict[str, List[float]] = {}  # sensor_id -> error history
+
+    # -- registration -------------------------------------------------------
+
+    def register_sensor(self, config: SensorConfig) -> None:
+        """Register a sensor with its configuration."""
+        self._configs[config.sensor_id] = config
+        self._readings.setdefault(config.sensor_id, [])
+        self._reliability_history.setdefault(config.sensor_id, [])
+
+    # -- ingestion ----------------------------------------------------------
+
+    def submit_reading(self, reading: SensorReading) -> None:
+        """Submit a sensor reading.
+
+        Applies the calibration offset from the sensor's configuration (if
+        registered) and rejects readings whose uncertainty exceeds the
+        configured *max_uncertainty*.
+        """
+        config = self._configs.get(reading.sensor_id)
+        if config is not None:
+            if reading.uncertainty > config.max_uncertainty:
+                return  # reject noisy reading
+            # Apply calibration offset
+            reading = SensorReading(
+                sensor_id=reading.sensor_id,
+                value=reading.value + config.calibration_offset,
+                uncertainty=reading.uncertainty,
+                timestamp=reading.timestamp,
+                sensor_type=reading.sensor_type,
+            )
+        self._readings.setdefault(reading.sensor_id, []).append(reading)
+
+    # -- fusion -------------------------------------------------------------
+
+    def get_fused_estimate(self, sensor_type: str) -> Optional[FusedEstimate]:
+        """Fuse all recent readings of *sensor_type* using inverse-variance weighting.
+
+        Each sensor contributes its latest reading.  The fused value is the
+        weighted mean where weights are ``config.weight / uncertainty**2``.
+        The fused uncertainty is ``1 / sqrt(sum_of_weights)``.
+        Confidence is clamped to [0, 1] and grows with the number of
+        contributing sensors and shrinks with fused uncertainty.
+        """
+        latest: Dict[str, SensorReading] = {}
+        for sid, readings in self._readings.items():
+            for r in reversed(readings):
+                if r.sensor_type == sensor_type:
+                    latest[sid] = r
+                    break
+
+        if not latest:
+            return None
+
+        # Inverse-variance weighting (scaled by config weight if available).
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for sid, r in latest.items():
+            cfg = self._configs.get(sid)
+            w = (cfg.weight if cfg else 1.0) / max(r.uncertainty ** 2, 1e-12)
+            weighted_sum += w * r.value
+            total_weight += w
+
+        if total_weight <= 0:
+            return None
+
+        fused_value = weighted_sum / total_weight
+        fused_uncertainty = 1.0 / math.sqrt(total_weight)
+
+        # Update reliability history for each contributor.
+        for sid, r in latest.items():
+            error = abs(r.value - fused_value)
+            self._reliability_history.setdefault(sid, []).append(error)
+
+        # Confidence heuristic: more sensors and lower uncertainty -> higher.
+        n = len(latest)
+        confidence = min(1.0, n * 0.25) * max(0.0, 1.0 - fused_uncertainty)
+        confidence = max(0.0, min(1.0, confidence))
+
+        ts = max(r.timestamp for r in latest.values())
+
+        return FusedEstimate(
+            value=fused_value,
+            uncertainty=fused_uncertainty,
+            confidence=confidence,
+            contributing_sensors=sorted(latest.keys()),
+            timestamp=ts,
+        )
+
+    # -- disagreement detection ---------------------------------------------
+
+    def detect_sensor_disagreement(
+        self, sensor_type: str, threshold: float = 2.0
+    ) -> List[Dict[str, Any]]:
+        """Detect sensors whose latest reading disagrees with the fused estimate.
+
+        A sensor *disagrees* when ``|reading - fused| > threshold * fused_uncertainty``.
+        Returns a list of dicts with keys: sensor_id, deviation, reading_value,
+        fused_value.
+        """
+        estimate = self.get_fused_estimate(sensor_type)
+        if estimate is None:
+            return []
+
+        disagreements: List[Dict[str, Any]] = []
+        for sid in estimate.contributing_sensors:
+            readings = self._readings.get(sid, [])
+            for r in reversed(readings):
+                if r.sensor_type == sensor_type:
+                    deviation = abs(r.value - estimate.value)
+                    if deviation > threshold * max(estimate.uncertainty, 1e-12):
+                        disagreements.append({
+                            'sensor_id': sid,
+                            'deviation': deviation,
+                            'reading_value': r.value,
+                            'fused_value': estimate.value,
+                        })
+                    break
+
+        return disagreements
+
+    # -- reliability --------------------------------------------------------
+
+    def get_sensor_reliability(self, sensor_id: str) -> float:
+        """Return a reliability score in [0, 1] based on historical agreement.
+
+        A perfectly agreeing sensor scores 1.0.  Score decays exponentially
+        with average absolute deviation from fused estimates.
+        """
+        errors = self._reliability_history.get(sensor_id, [])
+        if not errors:
+            return 1.0
+        avg_error = sum(errors) / len(errors)
+        return math.exp(-avg_error)
+
+    # -- calibration --------------------------------------------------------
+
+    def calibrate_sensor(self, sensor_id: str, offset: float) -> None:
+        """Apply a calibration *offset* to a registered sensor.
+
+        Future readings (and the stored configuration) are updated.
+        """
+        config = self._configs.get(sensor_id)
+        if config is None:
+            raise ValueError(f"Sensor '{sensor_id}' is not registered.")
+        self._configs[sensor_id] = SensorConfig(
+            sensor_id=config.sensor_id,
+            sensor_type=config.sensor_type,
+            weight=config.weight,
+            max_uncertainty=config.max_uncertainty,
+            calibration_offset=config.calibration_offset + offset,
+        )

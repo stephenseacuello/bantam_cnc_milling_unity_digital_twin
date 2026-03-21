@@ -6364,3 +6364,317 @@ class GeometricErrorModel:
             if volumetric_error_um <= limit:
                 return grade
         return 'ungraded'
+
+
+# =====================================================================
+# Ball Screw Compensation Model
+# =====================================================================
+
+
+@dataclass
+class PitchErrorPoint:
+    """A single pitch-error measurement at a given position along the screw."""
+    position_mm: float
+    error_um: float  # micrometres
+    direction: str  # 'forward' | 'reverse'
+
+
+@dataclass
+class BallScrewProfile:
+    """Characterises one ball screw axis."""
+    axis: str
+    screw_length_mm: float
+    nominal_pitch_mm: float
+    thermal_coefficient: float  # um/°C per mm of screw length
+    pitch_errors_forward: List[PitchErrorPoint] = field(default_factory=list)
+    pitch_errors_reverse: List[PitchErrorPoint] = field(default_factory=list)
+
+
+@dataclass
+class CompensationResult:
+    """Computed compensation for a single query point."""
+    axis: str
+    position_mm: float
+    pitch_comp_um: float
+    thermal_comp_um: float
+    total_comp_um: float
+    backlash_um: float
+
+
+class BallScrewCompensationModel:
+    """Models ball screw pitch error and thermal growth compensation.
+
+    Supports per-axis forward/reverse pitch-error maps, linear
+    interpolation between calibration points, thermal-growth
+    calculation from a linear coefficient, backlash analysis, and
+    health assessment.
+    """
+
+    def __init__(self) -> None:
+        self._profiles: Dict[str, BallScrewProfile] = {}
+
+    # ── profile management ────────────────────────────────────────────
+
+    def create_profile(
+        self,
+        axis: str,
+        length: float,
+        pitch: float,
+        thermal_coefficient: float = 0.012,
+    ) -> BallScrewProfile:
+        """Initialise a ball screw profile for *axis*.
+
+        Parameters
+        ----------
+        axis:
+            Axis name (e.g. ``'X'``, ``'Y'``, ``'Z'``).
+        length:
+            Total screw length in mm.
+        pitch:
+            Nominal lead/pitch in mm.
+        thermal_coefficient:
+            Thermal growth coefficient in um per degree-C per mm of
+            screw length.  Default ``0.012`` (typical steel).
+        """
+        profile = BallScrewProfile(
+            axis=axis,
+            screw_length_mm=length,
+            nominal_pitch_mm=pitch,
+            thermal_coefficient=thermal_coefficient,
+        )
+        self._profiles[axis] = profile
+        return profile
+
+    # ── pitch-error recording ─────────────────────────────────────────
+
+    def add_pitch_error(
+        self,
+        axis: str,
+        position: float,
+        error: float,
+        direction: str = 'forward',
+    ) -> None:
+        """Record a pitch-error measurement.
+
+        Parameters
+        ----------
+        axis:
+            Axis name.
+        position:
+            Position along the screw in mm.
+        error:
+            Measured error in um.
+        direction:
+            ``'forward'`` or ``'reverse'``.
+        """
+        if axis not in self._profiles:
+            raise KeyError(f"No profile registered for axis '{axis}'")
+        if direction not in ('forward', 'reverse'):
+            raise ValueError(f"direction must be 'forward' or 'reverse', got '{direction}'")
+
+        point = PitchErrorPoint(position_mm=position, error_um=error, direction=direction)
+        profile = self._profiles[axis]
+        if direction == 'forward':
+            profile.pitch_errors_forward.append(point)
+            profile.pitch_errors_forward.sort(key=lambda p: p.position_mm)
+        else:
+            profile.pitch_errors_reverse.append(point)
+            profile.pitch_errors_reverse.sort(key=lambda p: p.position_mm)
+
+    # ── interpolation helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _interpolate(points: List[PitchErrorPoint], position: float) -> float:
+        """Linearly interpolate error at *position* from sorted *points*.
+
+        If *position* is outside the calibrated range the nearest
+        endpoint value is returned (clamped extrapolation).  Returns
+        ``0.0`` when the list is empty.
+        """
+        if not points:
+            return 0.0
+        if len(points) == 1:
+            return points[0].error_um
+        if position <= points[0].position_mm:
+            return points[0].error_um
+        if position >= points[-1].position_mm:
+            return points[-1].error_um
+
+        # Binary-ish walk — list is small so linear is fine.
+        for i in range(len(points) - 1):
+            p0, p1 = points[i], points[i + 1]
+            if p0.position_mm <= position <= p1.position_mm:
+                span = p1.position_mm - p0.position_mm
+                if span == 0:
+                    return p0.error_um
+                t = (position - p0.position_mm) / span
+                return p0.error_um + t * (p1.error_um - p0.error_um)
+
+        return points[-1].error_um  # pragma: no cover
+
+    # ── compensation query ────────────────────────────────────────────
+
+    def get_compensation(
+        self,
+        axis: str,
+        position: float,
+        direction: str = 'forward',
+        temperature_delta: float = 0.0,
+    ) -> CompensationResult:
+        """Return interpolated pitch-error + thermal-growth compensation.
+
+        Parameters
+        ----------
+        axis:
+            Axis name.
+        position:
+            Position along the screw in mm.
+        direction:
+            Travel direction (``'forward'`` or ``'reverse'``).
+        temperature_delta:
+            Temperature difference from reference in °C.
+        """
+        if axis not in self._profiles:
+            raise KeyError(f"No profile registered for axis '{axis}'")
+
+        profile = self._profiles[axis]
+
+        # Pitch error interpolation
+        if direction == 'forward':
+            pitch_comp = self._interpolate(profile.pitch_errors_forward, position)
+        else:
+            pitch_comp = self._interpolate(profile.pitch_errors_reverse, position)
+
+        # Thermal growth: linear model  comp = coeff * dT * position
+        thermal_comp = profile.thermal_coefficient * temperature_delta * (position / profile.screw_length_mm) * profile.screw_length_mm
+        # Simplifies to: coeff * dT * position
+        thermal_comp = profile.thermal_coefficient * temperature_delta * position
+
+        # Backlash at this position
+        backlash = self.get_backlash(axis, position)
+
+        total_comp = pitch_comp + thermal_comp
+
+        return CompensationResult(
+            axis=axis,
+            position_mm=round(position, 4),
+            pitch_comp_um=round(pitch_comp, 4),
+            thermal_comp_um=round(thermal_comp, 4),
+            total_comp_um=round(total_comp, 4),
+            backlash_um=round(backlash, 4),
+        )
+
+    # ── backlash ──────────────────────────────────────────────────────
+
+    def get_backlash(self, axis: str, position: float) -> float:
+        """Return the backlash (um) at *position* — absolute difference
+        between forward and reverse interpolated errors."""
+        if axis not in self._profiles:
+            raise KeyError(f"No profile registered for axis '{axis}'")
+
+        profile = self._profiles[axis]
+        fwd = self._interpolate(profile.pitch_errors_forward, position)
+        rev = self._interpolate(profile.pitch_errors_reverse, position)
+        return abs(fwd - rev)
+
+    # ── compensation table ────────────────────────────────────────────
+
+    def generate_comp_table(
+        self,
+        axis: str,
+        interval_mm: float = 10.0,
+        direction: str = 'forward',
+        temperature_delta: float = 0.0,
+    ) -> List[CompensationResult]:
+        """Generate a full compensation table at regular intervals.
+
+        Parameters
+        ----------
+        axis:
+            Axis name.
+        interval_mm:
+            Spacing between table entries in mm.
+        direction:
+            Travel direction.
+        temperature_delta:
+            Temperature difference from reference in °C.
+        """
+        if axis not in self._profiles:
+            raise KeyError(f"No profile registered for axis '{axis}'")
+
+        profile = self._profiles[axis]
+        table: List[CompensationResult] = []
+        pos = 0.0
+        while pos <= profile.screw_length_mm:
+            table.append(self.get_compensation(axis, pos, direction, temperature_delta))
+            pos += interval_mm
+        # Ensure the endpoint is included even if it doesn't land on
+        # an exact multiple of *interval_mm*.
+        if table and table[-1].position_mm < profile.screw_length_mm:
+            table.append(
+                self.get_compensation(axis, profile.screw_length_mm, direction, temperature_delta)
+            )
+        return table
+
+    # ── health assessment ─────────────────────────────────────────────
+
+    def get_screw_health(self, axis: str) -> Dict:
+        """Assess ball-screw condition for *axis*.
+
+        Returns a dict with:
+        * ``max_error_um`` — largest absolute pitch error (any direction).
+        * ``mean_error_um`` — mean absolute error across all points.
+        * ``max_backlash_um`` — worst backlash along the screw.
+        * ``error_std_um`` — standard deviation of all errors.
+        * ``grade`` — qualitative grade: ``'good'``, ``'fair'``,
+          ``'worn'``, or ``'critical'``.
+        """
+        if axis not in self._profiles:
+            raise KeyError(f"No profile registered for axis '{axis}'")
+
+        profile = self._profiles[axis]
+        all_errors = [abs(p.error_um) for p in profile.pitch_errors_forward + profile.pitch_errors_reverse]
+
+        if not all_errors:
+            return {
+                'axis': axis,
+                'max_error_um': 0.0,
+                'mean_error_um': 0.0,
+                'max_backlash_um': 0.0,
+                'error_std_um': 0.0,
+                'grade': 'good',
+            }
+
+        max_err = max(all_errors)
+        mean_err = sum(all_errors) / len(all_errors)
+        variance = sum((e - mean_err) ** 2 for e in all_errors) / len(all_errors)
+        std_err = math.sqrt(variance)
+
+        # Compute backlash at each forward-error position
+        fwd_positions = [p.position_mm for p in profile.pitch_errors_forward]
+        rev_positions = [p.position_mm for p in profile.pitch_errors_reverse]
+        all_positions = sorted(set(fwd_positions + rev_positions))
+        max_backlash = 0.0
+        for pos in all_positions:
+            bl = self.get_backlash(axis, pos)
+            if bl > max_backlash:
+                max_backlash = bl
+
+        # Grade thresholds (um)
+        if max_err <= 5.0 and max_backlash <= 3.0:
+            grade = 'good'
+        elif max_err <= 15.0 and max_backlash <= 8.0:
+            grade = 'fair'
+        elif max_err <= 30.0 and max_backlash <= 15.0:
+            grade = 'worn'
+        else:
+            grade = 'critical'
+
+        return {
+            'axis': axis,
+            'max_error_um': round(max_err, 4),
+            'mean_error_um': round(mean_err, 4),
+            'max_backlash_um': round(max_backlash, 4),
+            'error_std_um': round(std_err, 4),
+            'grade': grade,
+        }

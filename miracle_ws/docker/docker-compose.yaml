@@ -275,8 +275,8 @@ services:
     ports:
       - "10001:10001"
     volumes:
-      - ./security/certs:/etc/stunnel/certs:ro
-      - ./docker/stunnel.conf:/etc/stunnel/stunnel.conf:ro
+      - ../security/certs:/etc/stunnel/certs:ro
+      - ./stunnel.conf:/etc/stunnel/stunnel.conf:ro
     profiles:
       - tls
     restart: unless-stopped
@@ -291,7 +291,7 @@ services:
     ports:
       - "9190:9090"
     volumes:
-      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:
       - miracle_net
     depends_on:
@@ -323,8 +323,8 @@ services:
       - "3001:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks:
       - miracle_net
     depends_on:
@@ -352,7 +352,7 @@ services:
     ports:
       - "3100:3100"
     volumes:
-      - ./docker/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki_data:/loki
     command: -config.file=/etc/loki/local-config.yaml
     networks:
@@ -372,7 +372,7 @@ services:
     container_name: miracle_promtail
     hostname: miracle-promtail
     volumes:
-      - ./docker/promtail/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     command: -config.file=/etc/promtail/config.yml
     networks:
